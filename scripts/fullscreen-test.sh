@@ -73,6 +73,9 @@ gcc -std=c11 -O2 -Wall -Wextra -Wno-unused-parameter "${cflags[@]}" \
     "$repository/tests/layer-probe.c" "${libs[@]}" -o "$output/layer-probe"
 ln -s -- "$repository/lua/cosmic" "$output/config/cosmic"
 ln -s -- "$plugin" "$output/config/cosmic.so"
+# The plugin manager keys configured plugins by the requested lexical path, not
+# realpath. Use the same symlink path Cosmic's module requested for IPC unload.
+loaded_plugin="$output/config/cosmic.so"
 write_config() {
     local include_cosmic=$1 name
     sed '/-- Cosmic module below/,$d' "$repository/tests/fullscreen.lua" > "$output/config/hyprland.lua"
@@ -252,9 +255,9 @@ done
 for ((round=1; round<=unload_rounds; ++round)); do
     preview
     capture "direct-active-$round" hidden
-    [[ $(ctl plugin unload "$plugin") == ok ]] || { printf 'Direct plugin unload failed.\n' >&2; exit 1; }
+    [[ $(ctl plugin unload "$loaded_plugin") == ok ]] || { printf 'Direct plugin unload failed.\n' >&2; exit 1; }
     check_alive "direct-unloaded-$round"
-    [[ $(ctl plugin load "$plugin") == ok ]] || { printf 'Direct plugin reload failed.\n' >&2; exit 1; }
+    [[ $(ctl plugin load "$loaded_plugin") == ok ]] || { printf 'Direct plugin reload failed.\n' >&2; exit 1; }
     eval_lua 'require("cosmic").setup({enabled=true})'
 done
 for ((round=1; round<=3; ++round)); do
