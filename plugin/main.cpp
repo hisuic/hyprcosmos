@@ -90,6 +90,15 @@ class Cosmic {
         auto p = g_pInputManager->getMouseCoordsInternal();
         return {p.x, p.y};
     }
+    int viewedRegion() const {
+        const auto p = cursor();
+        for (const auto& monitor : State::monitorState()->monitors()) {
+            if (p.x >= monitor->m_position.x && p.x < monitor->m_position.x + monitor->m_size.x &&
+                p.y >= monitor->m_position.y && p.y < monitor->m_position.y + monitor->m_size.y)
+                return static_cast<int>(monitor->m_id) + (alternateRegion ? 1000000 : 0);
+        }
+        return universe.regions().empty() ? 0 : universe.regions().front().id;
+    }
     void damage() {
         for (const auto& m : State::monitorState()->monitors())
             if (m->m_dpmsStatus) g_pHyprRenderer->damageMonitor(m);
@@ -347,15 +356,11 @@ class Cosmic {
         if (name == "preview") { if (active) stop("preview ended"); else start(true); return; }
         if (!active) return;
         if (name == "gravity") universe.cycleGravity();
-        else if (name == "black_hole") universe.startBlackHole(cursor());
+        else if (name == "black_hole") universe.startBlackHole(cursor(), viewedRegion());
         else if (name == "rewind") universe.setRewinding(!universe.rewinding());
         else if (name == "region") alternateRegion = !alternateRegion;
         else if (name == "supernova") {
-            int region = 0;
-            for (const auto& r : universe.regions()) {
-                auto c = cursor();
-                if (c.x >= r.x && c.x < r.x + r.width && c.y >= r.y && c.y < r.y + r.height) { region = r.id; break; }
-            }
+            const int region = viewedRegion();
             universe.supernova(universe.screenToWorld(cursor(), region), region);
         }
         damage();
