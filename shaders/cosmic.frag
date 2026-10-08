@@ -42,6 +42,8 @@ float skyRandom(uint value) {
 // No font lookup, texture upload, per-star draw call or neighbor-cell search.
 float asciiGlyph(vec2 offset, int glyph, float inkSize) {
     vec2 ink = offset / inkSize + vec2(2.5, 3.5);
+    // Derivatives must be evaluated before glyph-specific early returns.
+    vec2 antialias = max(fwidth(ink) * 0.65, vec2(0.001));
     ivec2 cell = ivec2(floor(ink));
     if (cell.x < 0 || cell.x >= 5 || cell.y < 0 || cell.y >= 7) return 0.0;
     uint row = 0u;
@@ -58,7 +60,7 @@ float asciiGlyph(vec2 offset, int glyph, float inkSize) {
     }
     if ((row & (1u << uint(cell.x))) == 0u) return 0.0;
     vec2 edge = min(fract(ink), 1.0 - fract(ink));
-    vec2 coverage = smoothstep(vec2(0.0), max(fwidth(ink) * 0.65, vec2(0.001)), edge);
+    vec2 coverage = smoothstep(vec2(0.0), antialias, edge);
     return coverage.x * coverage.y;
 }
 
