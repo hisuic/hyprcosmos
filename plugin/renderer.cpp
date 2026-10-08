@@ -315,7 +315,7 @@ void CosmicRenderer::executeDraw(PHLMONITOR monitor, const Universe& universe,
     glUniform2f(impl.resolution, monitorSize.x, monitorSize.y);
     const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - impl.start).count();
     // An exact multiple of the meteor period avoids a broken epoch at wrapping.
-    glUniform1f(impl.time, std::fmod(seconds, 12288.0));
+    glUniform1f(impl.time, std::fmod(seconds, 73728.0));
     glUniform1f(impl.stars, impl.starCount);
     glUniform1f(impl.background, impl.backgroundAlpha);
     glUniform4f(impl.skyViewport, 0, 0, monitorSize.x, monitorSize.y);
