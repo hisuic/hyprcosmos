@@ -169,10 +169,11 @@ struct CosmicRenderer::Impl {
     GLint angle = -1, stretch = -1, twist = -1, bend = -1, crop = -1;
     GLint mode = -1, color = -1, time = -1, radius = -1, phase = -1;
     GLint stars = -1, background = -1;
+    GLint skyViewport = -1, pixelScale = -1, seed = -1;
     GLint clip = -1;
     SP<Render::ITexture> peerLabel;
-    std::size_t starCount = 180;
-    float backgroundAlpha = 0.96F;
+    std::size_t starCount = 240;
+    float backgroundAlpha = 1.0F;
     GLsizei gridVertices = 0;
     bool attempted = false;
     std::string error;
@@ -234,6 +235,8 @@ bool CosmicRenderer::initialize() {
         impl.color = uniform("uColor"); impl.time = uniform("uTime");
         impl.radius = uniform("uRadius"); impl.phase = uniform("uPhase");
         impl.stars = uniform("uStars"); impl.background = uniform("uBackground");
+        impl.skyViewport = uniform("uSkyViewport"); impl.pixelScale = uniform("uPixelScale");
+        impl.seed = uniform("uSeed");
         impl.clip = uniform("uClip");
 
         std::vector<float> vertices;
@@ -276,8 +279,12 @@ void CosmicRenderer::draw(PHLMONITOR monitor, const Universe& universe,
     g_pHyprRenderer->addPassElement(pass(monitor, universe, snapshots, alternateRegion));
 }
 
+void CosmicRenderer::beginScene() {
+    m_impl->start = std::chrono::steady_clock::now();
+}
+
 void CosmicRenderer::configure(std::size_t stars, double background) {
-    m_impl->starCount = std::min<std::size_t>(stars, 4096);
+    m_impl->starCount = std::min<std::size_t>(stars, 1024);
     m_impl->backgroundAlpha = std::clamp(background, 0.0, 1.0);
 }
 
@@ -307,9 +314,15 @@ void CosmicRenderer::executeDraw(PHLMONITOR monitor, const Universe& universe,
     const Vec2 monitorSize{monitor->m_transformedSize.x, monitor->m_transformedSize.y};
     glUniform2f(impl.resolution, monitorSize.x, monitorSize.y);
     const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - impl.start).count();
-    glUniform1f(impl.time, std::fmod(seconds, 10000.0));
+    // An exact multiple of the meteor period avoids a broken epoch at wrapping.
+    glUniform1f(impl.time, std::fmod(seconds, 12288.0));
     glUniform1f(impl.stars, impl.starCount);
     glUniform1f(impl.background, impl.backgroundAlpha);
+    glUniform4f(impl.skyViewport, 0, 0, monitorSize.x, monitorSize.y);
+    glUniform1f(impl.pixelScale, pixelScale);
+    const auto skySeed = static_cast<GLuint>(universe.config().seed) ^
+                         static_cast<GLuint>(monitor->m_id) ^ (alternateRegion ? 0x554e4956U : 0U);
+    glUniform1ui(impl.seed, skySeed);
     glUniform4f(impl.clip, -1, -1, monitorSize.x + 1, monitorSize.y + 1);
     glUniform4f(impl.crop, 0, 0, 1, 1);
     impl.quad(monitorSize * 0.5, monitorSize, 0, {1, 1, 1, 1});
@@ -466,7 +479,14 @@ void CosmicRenderer::executeDraw(PHLMONITOR monitor, const Universe& universe,
         const auto content = panelPixel(inset->contentOrigin);
         const auto contentSize = inset->contentSize * pixelScale;
         glUniform4f(impl.clip, content.x, content.y, content.x + contentSize.x, content.y + contentSize.y);
-        impl.quad(content + contentSize * 0.5, contentSize, 4, {0.008F, 0.010F, 0.026F, 1.0F});
+        // The counterpart has its own local sky rather than reusing the whole
+        // output's coordinates. Keep glyphs readable; density follows area.
+        glUniform4f(impl.skyViewport, content.x, content.y, contentSize.x, contentSize.y);
+        glUniform1ui(impl.seed, skySeed ^ 0x50454552U);
+        glUniform1f(impl.stars, impl.starCount * contentSize.x * contentSize.y / (monitorSize.x * monitorSize.y));
+        glUniform1f(impl.background, 1.0F);
+        impl.quad(content + contentSize * 0.5, contentSize, 0, {1, 1, 1, 1});
+        glUniform1f(impl.background, impl.backgroundAlpha);
         const auto peerPixel = [&](Vec2 world) {
             return panelPixel(inset->fromRegionScreen(universe.worldToScreen(world, inset->region.id)));
         };
