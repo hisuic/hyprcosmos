@@ -181,7 +181,7 @@ function M.action(action)
 end
 
 function M.status()
-    local result = initialized and not stopped and call("status") or nil
+    local result = native() and call("status") or nil
     if type(result) ~= "table" then result = { enabled = false, active = false } end
     result.available = native() ~= nil
     result.module_initialized = initialized and not stopped
