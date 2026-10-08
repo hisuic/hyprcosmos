@@ -86,7 +86,10 @@ printf 'Nested PID: %s\nInstance: %s\nWayland socket: %s\n' "$compositor_pid" "$
 ctl() { hyprctl -i "$instance" "$@"; }
 eval_lua() {
     local result
-    result=$(ctl eval "$1")
+    if ! result=$(ctl eval "$1" 2>&1); then
+        printf 'Lua command failed: %s\n%s\n' "$1" "$result" >&2
+        exit 1
+    fi
     [[ "$result" == ok ]] || { printf 'Lua check failed: %s\n%s\n' "$1" "$result" >&2; exit 1; }
 }
 status() { ctl repl 'local s=require("cosmic").status(); for _,k in ipairs({"enabled","initialized","active","bodies","stored","snapshots","snapshot_bytes","history_frames","physics_steps","last_reason"}) do print(k .. "=" .. tostring(s[k])) end'; }
@@ -119,6 +122,7 @@ ctl -j clients > "$output/normal-clients.json"
 capture normal
 eval_lua 'assert(require("cosmic").enable()); assert(require("cosmic")==require("cosmic"))'
 wait_active
+sleep 0.4
 status > "$output/idle-status.txt"
 capture universe
 
@@ -168,7 +172,7 @@ python3 -c 'import json,sys; a=json.load(open(sys.argv[1])); b=json.load(open(sy
 eval_lua 'require("cosmic").setup({enabled=true}); require("cosmic").setup({enabled=true}); assert(require("cosmic").status().initialized)'
 wait_active
 eval_lua 'require("cosmic").action("supernova"); require("cosmic").action("gravity")'
-sleep 0.3
+sleep 0.5
 capture supernova
 eval_lua 'require("cosmic").action("rewind"); assert(require("cosmic").status().rewinding)'
 sleep 0.2
