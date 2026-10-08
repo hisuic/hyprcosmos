@@ -166,6 +166,7 @@ function M.normalize(options, previous)
                 return nil, "cosmic: controls." .. action .. " duplicates controls." .. used[canonical]
             end
             used[canonical] = action
+            result.controls[action] = canonical
         end
     end
     return result
