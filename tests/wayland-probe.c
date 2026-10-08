@@ -25,6 +25,8 @@ static struct xdg_wm_base* shell;
 static struct zwp_virtual_keyboard_manager_v1* keyboard_manager;
 static struct zwlr_virtual_pointer_manager_v1* pointer_manager;
 static struct wl_surface* surface;
+static struct wl_keyboard* receiving_keyboard;
+static struct wl_pointer* receiving_pointer;
 static int width = 640, height = 400, running = 1, configured = 0, variant = 0;
 static unsigned tick = 0;
 
@@ -114,8 +116,14 @@ static const struct wl_pointer_listener pointer_listener = {
     .axis_discrete = axis_discrete,
 };
 static void capabilities(void* d, struct wl_seat* s, uint32_t caps) {
-    if (caps & WL_SEAT_CAPABILITY_KEYBOARD) wl_keyboard_add_listener(wl_seat_get_keyboard(s), &keyboard_listener, NULL);
-    if (caps & WL_SEAT_CAPABILITY_POINTER) wl_pointer_add_listener(wl_seat_get_pointer(s), &pointer_listener, NULL);
+    if ((caps & WL_SEAT_CAPABILITY_KEYBOARD) && !receiving_keyboard) {
+        receiving_keyboard = wl_seat_get_keyboard(s);
+        wl_keyboard_add_listener(receiving_keyboard, &keyboard_listener, NULL);
+    }
+    if ((caps & WL_SEAT_CAPABILITY_POINTER) && !receiving_pointer) {
+        receiving_pointer = wl_seat_get_pointer(s);
+        wl_pointer_add_listener(receiving_pointer, &pointer_listener, NULL);
+    }
 }
 static void seat_name(void* d, struct wl_seat* s, const char* name) {}
 static const struct wl_seat_listener seat_listener = {capabilities, seat_name};
