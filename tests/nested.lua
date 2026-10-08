@@ -10,6 +10,7 @@ hl.config({
     animations = { enabled = false },
     input = { follow_mouse = 1 },
     misc = { disable_hyprland_logo = true, force_default_wallpaper = 0,
+             background_color = "rgb(682345)",
              enable_anr_dialog = false },
     debug = { disable_logs = false },
 })
@@ -21,5 +22,6 @@ require("cosmic").setup({
     -- grim is itself a real screenshare client. Test rendering with this one
     -- exclusion disabled; production defaults keep sharing excluded.
     exclusions = { screenshare = false },
-    rendering = { background = 0.95, stars = 180 },
+    -- Keep the production opaque ASCII-sky defaults. The vivid normal desktop
+    -- above makes an accidental wallpaper leak visible in the real capture.
 })
