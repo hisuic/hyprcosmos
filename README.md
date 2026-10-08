@@ -167,7 +167,10 @@ hyprctl reload
 Cosmicだけを停止し、一度通知します。ファイルを直してreloadしてください。
 通常のHyprland設定の評価は止めません。
 ファイルは最大1 MiBのテキストLuaで、通常のLua権限で実行します。
-信頼できる自分の設定を置いてください。常時監視はせず、require／reload時に読みます。
+信頼できる自分の設定を置いてください。通常ファイルへのシンボリックリンクも使えますが、
+FIFO・ソケット・ディレクトリー・リンク切れなどはエラーとして拒否します。
+常時監視はせず、require／reloadごとに読みます。起動直後は安全なネイティブ読み込みAPIが
+使えるまで待ち、その間に書かれた `setup()` も専用ファイルより優先します。
 
 有効な明示 `setup()` でファイルエラーから復旧することもできます。
 `status()` の `config_file`・`config_file_loaded`・`config_file_error` で
@@ -275,7 +278,7 @@ ctest --test-dir build --output-on-failure
 親セッションの設定や有効状態は変更しません。既存の宇宙現象・入力・共有回帰は
 `scripts/nested-test.sh` で確認できます。
 専用設定の実検証は `scripts/user-config-test.sh` で、独立した子セッションだけの
-ファイル作成・編集・reload・無効設定からの復帰と、require削除を確認します。
+ファイル作成・編集・reload・無効設定からの復帰と、特殊ファイルの拒否、require削除を確認します。
 
 [実環境とAPI調査](docs/environment.md)、[設計](docs/architecture.md)、
 [実際の検証結果](docs/validation.md) に、確認範囲と制約を記録します。
