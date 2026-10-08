@@ -108,4 +108,27 @@ uninstall_fixture
 expect_failure install_fixture --reload
 check cmp -s "$actual" "$sandbox/original"
 check test ! -e "$state/installation"
+
+# Changes made after installation remain user-owned, including replaced links
+# and a config symlink pointing somewhere different from the recorded target.
+install_fixture
+cp -- "$actual" "$sandbox/before-retarget"
+rm -- "$config_dir/cosmic"
+ln -s -- "$sandbox/foreign-module" "$config_dir/cosmic"
+expect_failure uninstall_fixture
+check test "$(readlink -- "$config_dir/cosmic")" = "$sandbox/foreign-module"
+check cmp -s "$actual" "$sandbox/before-retarget"
+rm -- "$config_dir/cosmic"
+ln -s -- "$repository/lua/cosmic" "$config_dir/cosmic"
+printf -- '-- new configuration target; preserve me\n' > "$sandbox/new-target.lua"
+cp -- "$sandbox/new-target.lua" "$sandbox/new-target-original"
+rm -- "$config"
+ln -s -- "$sandbox/new-target.lua" "$config"
+expect_failure uninstall_fixture
+check cmp -s "$sandbox/new-target.lua" "$sandbox/new-target-original"
+check cmp -s "$actual" "$sandbox/before-retarget"
+rm -- "$config"
+ln -s -- "$actual" "$config"
+uninstall_fixture
+check cmp -s "$actual" "$sandbox/original"
 printf 'Installer lifecycle: %s checks passed (isolated fixtures; no session contacted)\n' "$checks"
