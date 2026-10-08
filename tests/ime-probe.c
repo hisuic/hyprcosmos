@@ -11,9 +11,14 @@
 static struct wl_seat* seat;
 static struct zwp_input_method_manager_v2* manager;
 static void fail(const char* message) { fprintf(stderr, "%s\n", message); exit(1); }
+static void capabilities(void* data, struct wl_seat* seat, uint32_t capabilities) {}
+static const struct wl_seat_listener seat_listener = {.capabilities = capabilities};
 
 static void registry(void* data, struct wl_registry* registry, uint32_t name, const char* interface, uint32_t version) {
-    if (!strcmp(interface, "wl_seat")) seat = wl_registry_bind(registry, name, &wl_seat_interface, 1);
+    if (!strcmp(interface, "wl_seat")) {
+        seat = wl_registry_bind(registry, name, &wl_seat_interface, 1);
+        wl_seat_add_listener(seat, &seat_listener, NULL);
+    }
     if (!strcmp(interface, "zwp_input_method_manager_v2"))
         manager = wl_registry_bind(registry, name, &zwp_input_method_manager_v2_interface, 1);
 }
