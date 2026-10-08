@@ -307,7 +307,7 @@ sleep 1.4
 capture ascii-after-meteor
 check_distinct_captures ascii-sky ascii-meteor
 check_distinct_captures ascii-meteor ascii-after-meteor
-probe key 30
+probe key 31
 eval_lua 'assert(not require("cosmic").status().active); require("cosmic").disable()'
 capture sky-restored
 stop_portal_recording
