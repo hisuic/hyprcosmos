@@ -351,6 +351,26 @@ check(deferred_conflict.setups == 0 and deferred_conflict.notifications == 1 and
     "a control conflict between deferred setup and file values fails closed with an actionable error")
 delayed_conflict.shutdown()
 
+local early_controls, deferred_controls = mock("delayed", "return {controls={gravity=false}}")
+check(early_controls.setup({controls={preview="F6"}}) == early_controls,
+    "early setup may reuse a default chord disabled by the eventual user file")
+check(not early_controls.setup({controls={preview="F9",emergency="F9"}}),
+    "early setup still immediately rejects duplicate chords within its own patch")
+check(not early_controls.setup({idle_timeout=0}) and not early_controls.setup({controls={preview=42}}),
+    "deferred conflict checking does not relax field types or numeric ranges")
+deferred_controls.fire("config.reloaded")
+deferred_controls.publish_native()
+deferred_controls.fire_timers()
+check(deferred_controls.options.controls.gravity == false and deferred_controls.options.controls.preview == "F6" and
+    deferred_controls.setups == 1 and deferred_controls.notifications == 0,
+    "disabled file controls and reassigned early setup controls merge correctly at actual startup")
+early_controls.shutdown()
+local reload_controls, existing_controls = mock("success", "return {controls={gravity=false}}")
+check(reload_controls.setup({controls={preview="F6"}}) == reload_controls and
+    existing_controls.options.controls.gravity == false and existing_controls.options.controls.preview == "F6",
+    "startup and reload accept the same file-dependent partial control override")
+reload_controls.shutdown()
+
 local obsolete, obsolete_state = mock("old-api", "return {idle_timeout=91}")
 obsolete_state.fire("config.reloaded")
 check(obsolete_state.config_opens == 0 and obsolete_state.setups == 0 and obsolete_state.live_bindings() == 0 and
