@@ -25,8 +25,8 @@ local function fixture(source)
     assert(file:close())
     return path
 end
-local function rejected(path, expected_stage)
-    local options, message, found = UserConfig.load(path)
+local function rejected(path, expected_stage, reader)
+    local options, message, found = UserConfig.load(path, reader)
     check(options == nil and type(message) == "string" and found == true,
         "a malformed existing configuration is rejected without default fallback")
     check(message:find(path, 1, true) ~= nil, "configuration errors identify their exact file path")
@@ -147,6 +147,55 @@ return { idle_timeout = math.floor(20.9), rendering = { stars = 7, hide_desktop_
     local ok, normalization_error = pcall(function() rejected(path, "validation failed") end)
     Config.normalize = normalize
     assert(ok, normalization_error)
+
+    with_open(function() error("a native-reader request must never fall back to Lua io.open") end, function()
+        local requests = 0
+        local native_options, native_error, native_found = UserConfig.load(mock_path, function(given)
+            requests = requests + 1
+            check(given == mock_path, "the native reader receives the exact requested path")
+            return "assert(_G == _ENV); return { idle_timeout = 20 }", nil, true
+        end)
+        check(native_options and native_options.idle_timeout == 20 and native_options.effects.orbit and
+            native_error == nil and native_found and requests == 1,
+            "native-reader source follows the same trusted compilation and normalization path exactly once")
+        local native_defaults, missing_error, missing_found = UserConfig.load(mock_path, function()
+            return nil, nil, false
+        end)
+        check(native_defaults and native_defaults.idle_timeout == Config.defaults.idle_timeout and
+            missing_error == nil and missing_found == false,
+            "a native missing-file result returns normalized defaults without Lua I/O")
+        for _, failure in ipairs({
+            function() return nil, "native permission denied", true end,
+            function() return nil, "native nonregular FIFO rejected", true end,
+            function() error("native reader exception") end,
+            function() return nil, nil, true end,
+            function() return "return {}", "native close failure", true end,
+            function() return nil, "native error despite missing flag", false end,
+        }) do rejected(mock_path, "read failed", failure) end
+        for _, invalid_result in ipairs({
+            function() return false, nil, true end,
+            function() return {}, nil, true end,
+            function() return "return {}", nil, false end,
+            function() return "return {}", nil, nil end,
+            function() return nil, 23, true end,
+        }) do rejected(mock_path, "invalid reader result", invalid_result) end
+        rejected(mock_path, "invalid reader", false)
+        rejected(mock_path, "invalid reader", {})
+        rejected(mock_path, "syntax error", function() return "return {", nil, true end)
+        rejected(mock_path, "execution failed", function() return "error('native source fixture')", nil, true end)
+        rejected(mock_path, "invalid return value", function() return "", nil, true end)
+        rejected(mock_path, "invalid configuration", function() return "return {idle_timeout=0}", nil, true end)
+        rejected(mock_path, "syntax error", function()
+            return string.dump(function() return {} end), nil, true
+        end)
+        rejected(mock_path, "file too large", function() return string.rep("x", limit + 1), nil, true end)
+        Config.normalize = function() error("native unexpected normalization exception") end
+        local succeeded, native_normalization_error = pcall(function()
+            rejected(mock_path, "validation failed", function() return "return {}", nil, true end)
+        end)
+        Config.normalize = normalize
+        assert(succeeded, native_normalization_error)
+    end)
     for _, invalid_path in ipairs({false, 23, {}, ""}) do
         local options, error_message, present = UserConfig.load(invalid_path)
         check(options == nil and type(error_message) == "string" and present == true,
