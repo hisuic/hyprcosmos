@@ -58,6 +58,31 @@ struct Body {
     double sink_duration = 0.0;      // May extend an impossible duration/speed combination.
     Vec2 sink_camera_center;
     double sink_camera_zoom = 1.0;
+    // Automatic wormholes have two visible legs, not an instant teleport.
+    // All seeds belong to the body so bounded history can replay both legs.
+    double portal_progress = 0.0;   // 0: idle, (0, 1): entry then emergence.
+    bool portal_emerging = false;   // Region switches at an invisible midpoint.
+    int portal_source_region = 0;
+    int portal_destination_region = 0;
+    Vec2 portal_entry_center;
+    Vec2 portal_exit_center;
+    Vec2 portal_start_offset;
+    Vec2 portal_entry_axis{1.0, 0.0};
+    Vec2 portal_exit_offset;
+    Vec2 portal_start_velocity;
+    double portal_arc = 0.0;
+    double portal_start_angle = 0.0;
+    double portal_start_scale = 0.42;
+    double portal_start_stretch = 1.0;
+    double portal_start_twist = 0.0;
+    double portal_turn = 0.0;
+    double portal_turn_sign = 1.0;
+    double portal_entry_duration = 1.68;
+    double portal_exit_duration = 0.75;
+    Vec2 portal_source_camera_center;
+    Vec2 portal_destination_camera_center;
+    double portal_source_camera_zoom = 1.0;
+    double portal_destination_camera_zoom = 1.0;
 };
 
 struct Particle {
@@ -188,6 +213,9 @@ class Universe {
     void integrate(double dt);
     void updateCameras(double dt);
     void createWormholes();
+    void beginPortal(Body& body, const Wormhole& entrance, const Wormhole& exit, Vec2 position);
+    void advancePortal(Body& body, double dt);
+    void cancelPortal(Body& body);
     void recordFrame();
     void restoreFrame(const Frame& frame);
     void resizeHistory();
