@@ -60,7 +60,6 @@ local function bind_controls()
 end
 
 local function resolve_plugin()
-    if options.plugin_path then return options.plugin_path end
     local module_file = package.searchpath and package.searchpath("cosmic", package.path)
     if not module_file and debug and debug.getinfo then
         local source = debug.getinfo(1, "S").source
@@ -112,9 +111,6 @@ end
 function M.setup(update)
     local validated, message = Config.normalize(update, options)
     if not validated then return nil, message end
-    if initialized and validated.plugin_path ~= options.plugin_path then
-        return nil, "cosmic: changing plugin_path requires a configuration reload"
-    end
     if initialized then
         local ok
         ok, message = call("setup", Config.copy(validated))
@@ -128,7 +124,6 @@ function M.setup(update)
         ok, message = bind_controls()
         if not ok then call("disable"); warn(message); return nil, message end
     else
-        local previous_path = options.plugin_path
         options = validated
         if stopped then
             stopped = false
@@ -136,15 +131,6 @@ function M.setup(update)
                 local ok
                 ok, message = initialize()
                 if not ok then return nil, message end
-            end
-        elseif options.plugin_path ~= previous_path and type(hl) == "table" and hl.plugin then
-            plugin_path = resolve_plugin()
-            local file = io.open(plugin_path, "rb")
-            if file then
-                file:close()
-                local ok
-                ok, message = pcall(hl.plugin.load, plugin_path)
-                if not ok then warn(message); return nil, message end
             end
         end
         if not initialized and configuration_ready and native() then
