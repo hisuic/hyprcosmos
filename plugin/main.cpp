@@ -112,9 +112,9 @@ Clock::time_point lastInput = Clock::now(), lastTick = lastInput, lastCapture = 
             if (m->m_dpmsStatus) g_pHyprRenderer->damageMonitor(m);
     }
     void fail(const std::string& message, bool notify = true) {
-        reason = message;
         options.enabled = false;
-        stop(message);
+        shutdown();
+        reason = message;
         if (notify && !notified) {
             notified = true;
             HyprlandAPI::addNotification(pluginHandle, "Cosmic: " + message + ". Run scripts/build.sh and reinstall for Hyprland 0.56.2.", CHyprColor(1, .4, .2, 1), 8000);
