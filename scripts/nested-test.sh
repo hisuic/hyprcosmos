@@ -419,9 +419,12 @@ read -r portal_x portal_y portal_source <<< "$(ctl repl 'local s=require("cosmic
 [[ "$portal_x" =~ ^[0-9]+$ && "$portal_y" =~ ^[0-9]+$ ]] || { printf 'Could not resolve the actual source portal screen coordinates.\n' >&2; exit 1; }
 eval_lua 'require("cosmic").disable()'
 portal_window=$(ctl -j clients | python3 -c 'import json,sys; print(next(c["address"] for c in json.load(sys.stdin) if c.get("title")=="Cosmic probe A"))')
-ctl dispatch setfloating "address:$portal_window" > "$output/portal-setfloating.txt"
-ctl dispatch resizewindowpixel "exact 360 240,address:$portal_window" > "$output/portal-resize.txt"
-ctl dispatch movewindowpixel "exact $((portal_x - 180)) $((portal_y - 120)),address:$portal_window" > "$output/portal-position.txt"
+[[ "$portal_window" =~ ^0x[0-9a-fA-F]+$ ]] || { printf 'Invalid dedicated test window address.\n' >&2; exit 1; }
+# Lua configurations use the official dispatcher objects, not the legacy
+# `hyprctl dispatch setfloating/resizewindowpixel/movewindowpixel` strings.
+eval_lua "hl.dispatch(hl.dsp.window.float({action='enable',window='address:$portal_window'}))"
+eval_lua "hl.dispatch(hl.dsp.window.resize({x=360,y=240,window='address:$portal_window'}))"
+eval_lua "hl.dispatch(hl.dsp.window.move({x=$((portal_x - 180)),y=$((portal_y - 120)),window='address:$portal_window'}))"
 sleep 0.2
 ctl -j clients > "$output/portal-normal-baseline.json"
 ctl -j activewindow > "$output/portal-normal-focus.json"
@@ -467,7 +470,7 @@ python3 -c 'import json,sys; a=json.load(open(sys.argv[1])); b=json.load(open(sy
 capture portal-restored
 stop_portal_recording
 eval_lua 'require("cosmic").disable()'
-ctl dispatch settiled "address:$portal_window" > "$output/portal-settiled.txt"
+eval_lua "hl.dispatch(hl.dsp.window.float({action='disable',window='address:$portal_window'}))"
 printf 'PASS: automatic permanent-hole entry, visible ingress, virtual destination emergence, replay, unchanged normal geometry/workspace/focus; no F7 or black_hole action used.\n' | tee "$output/automatic-portal-result.txt"
 
 # Actual window creation emits a shockwave; closing it removes every historical
