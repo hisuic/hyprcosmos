@@ -350,7 +350,7 @@ void CosmicRenderer::executeDraw(PHLMONITOR monitor, const Universe& universe,
         const auto palette = hue(particle.hue);
         impl.quad(position, {diameter, diameter}, 3, {palette[0], palette[1], palette[2], alpha});
     }
-    if (universe.gravityMode() == GravityMode::Cursor && !alternateRegion) {
+    if (universe.config().cursor_gravity && universe.gravityMode() == GravityMode::Cursor) {
         const auto cursor = g_pInputManager->getMouseCoordsInternal();
         impl.quad({(cursor.x - monitor->m_position.x) * pixelScale,
                    (cursor.y - monitor->m_position.y) * pixelScale},
