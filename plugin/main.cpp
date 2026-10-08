@@ -372,6 +372,11 @@ Clock::time_point lastInput = Clock::now(), lastTick = lastInput, lastCapture = 
         auto monitor = window->m_monitor.lock();
         if (!monitor) return;
         const auto oldBytes = static_cast<std::size_t>(old.framebuffer->m_size.x * old.framebuffer->m_size.y * 4);
+        // An executed CosmicPass still owns copies of the snapshots until the
+        // next frame begins. Release those references outside drawing, before
+        // allocating a replacement, so the old framebuffer really is freed.
+        g_pHyprRenderer->glBackend()->makeEGLCurrent();
+        g_pHyprRenderer->m_renderPass.removeAllOfType("CosmicUniverse");
         // Drop the previous framebuffer before allocating its replacement, so
         // both logical and peak GPU allocations obey the configured budget.
         old.framebuffer.reset();
