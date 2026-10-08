@@ -709,12 +709,19 @@ int action(lua_State* L) { instance->action(luaL_checkstring(L, 1)); lua_pushboo
 int read_user_config(lua_State* L) {
     std::size_t length = 0;
     const char* path = luaL_checklstring(L, 1, &length);
-    const auto result = cosmic::readUserConfig(std::string_view(path, length));
-    if (result.source) lua_pushlstring(L, result.source->data(), result.source->size());
-    else lua_pushnil(L);
-    if (result.error.empty()) lua_pushnil(L);
-    else lua_pushlstring(L, result.error.data(), result.error.size());
-    lua_pushboolean(L, result.found);
+    try {
+        const auto result = cosmic::readUserConfig(std::string_view(path, length));
+        if (result.source) lua_pushlstring(L, result.source->data(), result.source->size());
+        else lua_pushnil(L);
+        if (result.error.empty()) lua_pushnil(L);
+        else lua_pushlstring(L, result.error.data(), result.error.size());
+        lua_pushboolean(L, result.found);
+        return 3;
+    } catch (const std::exception& error) {
+        lua_pushnil(L);
+        lua_pushstring(L, error.what());
+    }
+    lua_pushboolean(L, true);
     return 3;
 }
 int status(lua_State* L) {
