@@ -3,7 +3,7 @@ local M = {}
 
 M.defaults = {
     enabled = true,
-    idle_timeout = 20,
+    idle_timeout = 60,
     preset = "calm",
     seed = 0xC05C1C,
     max_windows = 24,
