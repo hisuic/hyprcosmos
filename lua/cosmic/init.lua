@@ -195,7 +195,7 @@ local function attach()
 end
 
 function M.setup(update)
-    local validated, message = Config.normalize(update, options)
+    local validated, message = Config.normalize(update, options, not config_read)
     if not validated then return nil, message end
     if not config_read then pending_updates[#pending_updates + 1] = Config.copy(update or {}) end
     -- A valid explicit setup can recover from a file error. It remains the
