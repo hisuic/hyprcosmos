@@ -207,6 +207,7 @@ reserved > "$output/reserved-before.json"
 ctl -j monitors | python3 -c 'import json,sys; m=json.load(sys.stdin)[0]; assert max(m["reserved"])>=48,m'
 capture normal visible
 eval_lua 'require("cosmic").enable()'
+if "$unload_only"; then eval_lua 'require("cosmic").setup({rendering={hide_desktop_ui=false}})'; fi
 if ! "$unload_only"; then
 preview
 eval_lua 'assert(require("cosmic").status().desktop_ui_hidden)'
