@@ -14,7 +14,7 @@ while (($#)); do
         *) printf 'Unknown argument: %s\n' "$1" >&2; exit 2 ;;
     esac
 done
-for command in Hyprland hyprctl gcc wayland-scanner pkg-config python3; do
+for command in Hyprland hyprctl gcc wayland-scanner pkg-config python3 rg; do
     command -v "$command" >/dev/null || { printf 'Missing dependency: %s\n' "$command" >&2; exit 1; }
 done
 [[ -f "$plugin" ]] || { printf 'Build the Cosmic plugin first: %s\n' "$plugin" >&2; exit 1; }
@@ -23,6 +23,7 @@ if [[ -z "$output" ]]; then output=$(mktemp -d /tmp/hyprcosmos-test.XXXXXXXX); e
 output=$(realpath -- "$output")
 plugin=$(realpath -- "$plugin")
 socket="hyprcosmos-test-$$"
+native_socket=""
 instance=""
 compositor_pid=""
 client_a=""
@@ -32,6 +33,9 @@ cleanup() {
     for pid in "$held_input" "$client_a" "$client_b" "$compositor_pid"; do
         if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then kill -TERM "$pid" 2>/dev/null || true; fi
     done
+    if [[ -n "$native_socket" && -L "$XDG_RUNTIME_DIR/$socket" && $(readlink -- "$XDG_RUNTIME_DIR/$socket") == "$native_socket" ]]; then
+        rm -- "$XDG_RUNTIME_DIR/$socket"
+    fi
     printf 'Nested test logs retained: %s\n' "$output"
 }
 trap cleanup EXIT
@@ -61,18 +65,23 @@ ln -s -- "$repository/lua/cosmic" "$output/config/cosmic"
 ln -s -- "$plugin" "$output/config/cosmic.so"
 
 # Keep the parent WAYLAND_DISPLAY for the Aquamarine nested Wayland backend.
-# Explicit socket and every subsequent IPC target prevent session confusion.
+# Select the new compositor by its exact child PID. --socket is a handover API
+# requiring --wayland-fd in this version, so let Hyprland create its own socket.
 env -u HYPRLAND_INSTANCE_SIGNATURE HYPRLAND_NO_SD_VARS=1 HYPRLAND_NO_SD_NOTIFY=1 \
-    HYPRLAND_NO_CRASHREPORTER=1 Hyprland --config "$output/config/hyprland.lua" --socket "$socket" \
+    HYPRLAND_NO_CRASHREPORTER=1 Hyprland --config "$output/config/hyprland.lua" \
     > "$output/compositor.log" 2>&1 &
 compositor_pid=$!
 for ((attempt=0; attempt<200; ++attempt)); do
     kill -0 "$compositor_pid" 2>/dev/null || { tail -n 50 "$output/compositor.log"; exit 1; }
-    instance=$(hyprctl -j instances | python3 -c 'import json,sys; print(next((x["instance"] for x in json.load(sys.stdin) if x.get("wl_socket")==sys.argv[1]), ""))' "$socket")
-    if [[ -n "$instance" && -S "$XDG_RUNTIME_DIR/$socket" ]]; then break; fi
+    read -r instance native_socket <<< "$(hyprctl -j instances | python3 -c 'import json,sys; x=next((x for x in json.load(sys.stdin) if x.get("pid")==int(sys.argv[1])), {}); print(x.get("instance", ""), x.get("wl_socket", ""))' "$compositor_pid")"
+    if [[ -n "$instance" && -S "$XDG_RUNTIME_DIR/$native_socket" ]]; then break; fi
     sleep 0.1
 done
 [[ -n "$instance" ]] || { printf 'Nested instance did not become ready.\n' >&2; exit 1; }
+# The alias both makes probe's safety guard auditable and avoids depending on
+# numeric wayland-N names that might otherwise refer to the working session.
+[[ ! -e "$XDG_RUNTIME_DIR/$socket" && ! -L "$XDG_RUNTIME_DIR/$socket" ]] || { printf 'Test socket alias already exists.\n' >&2; exit 1; }
+ln -s -- "$native_socket" "$XDG_RUNTIME_DIR/$socket"
 printf 'Nested PID: %s\nInstance: %s\nWayland socket: %s\n' "$compositor_pid" "$instance" "$socket" | tee "$output/session.txt"
 ctl() { hyprctl -i "$instance" "$@"; }
 eval_lua() {
