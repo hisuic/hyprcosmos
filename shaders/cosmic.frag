@@ -13,7 +13,11 @@ uniform float uPhase;
 uniform float uStars;
 uniform float uBackground;
 uniform vec2 uResolution;
-out vec4 fragColor;
+layout(location = 0) out vec4 fragColor;
+// Hyprland attaches an unmodified mirror at COLOR_ATTACHMENT1 for screencopy
+// and mirrored outputs. Leaving it unwritten produces stale/undefined captures.
+// Without a mirror attachment the second output is safely discarded by GLES.
+layout(location = 1) out vec4 mirrorColor;
 
 float hash(vec2 p) {
     return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
@@ -62,4 +66,5 @@ void main() {
         float alpha = exp(-r * r * 5.0) * uColor.a;
         fragColor = vec4(uColor.rgb * alpha, alpha);
     }
+    mirrorColor = fragColor;
 }
