@@ -37,11 +37,12 @@ client_pid=""
 top_pid=""
 overlay_pid=""
 extra_pid=""
+ime_pid=""
 capture_pid=""
 disabled_outputs=()
 cleanup() {
     local pid
-    for pid in "$capture_pid" "$extra_pid" "$top_pid" "$overlay_pid" "$client_pid" "$compositor_pid"; do
+    for pid in "$capture_pid" "$ime_pid" "$extra_pid" "$top_pid" "$overlay_pid" "$client_pid" "$compositor_pid"; do
         if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then kill -TERM "$pid" 2>/dev/null || true; fi
     done
     if [[ -n "$native_socket" && -L "$XDG_RUNTIME_DIR/$socket" && $(readlink -- "$XDG_RUNTIME_DIR/$socket") == "$native_socket" ]]; then
@@ -59,11 +60,12 @@ trap 'exit 130' INT TERM
 
 mkdir -p -- "$output/protocols" "$output/config"
 xdg_xml="$(pkg-config --variable=pkgdatadir wayland-protocols)/stable/xdg-shell/xdg-shell.xml"
-for protocol in xdg-shell virtual-keyboard virtual-pointer; do
+for protocol in xdg-shell virtual-keyboard virtual-pointer input-method; do
     case "$protocol" in
         xdg-shell) xml="$xdg_xml" ;;
         virtual-keyboard) xml="$repository/tests/protocols/virtual-keyboard-unstable-v1.xml" ;;
         virtual-pointer) xml="$repository/tests/protocols/wlr-virtual-pointer-unstable-v1.xml" ;;
+        input-method) xml="$repository/tests/protocols/input-method-unstable-v2.xml" ;;
     esac
     wayland-scanner client-header "$xml" "$output/protocols/$protocol-client-protocol.h"
     wayland-scanner private-code "$xml" "$output/protocols/$protocol-protocol.c"
@@ -74,6 +76,8 @@ gcc -std=c11 -O2 -Wall -Wextra -Wno-unused-parameter -I"$output/protocols" "${cf
     "$repository/tests/wayland-probe.c" "$output/protocols/xdg-shell-protocol.c" \
     "$output/protocols/virtual-keyboard-protocol.c" "$output/protocols/virtual-pointer-protocol.c" \
     "${libs[@]}" -o "$output/wayland-probe"
+gcc -std=c11 -O2 -Wall -Wextra -Wno-unused-parameter -I"$output/protocols" "${cflags[@]}" \
+    "$repository/tests/ime-probe.c" "$output/protocols/input-method-protocol.c" "${libs[@]}" -o "$output/ime-probe"
 read -r -a cflags <<< "$(pkg-config --cflags gtk-layer-shell-0 gtk+-3.0 libpng)"
 read -r -a libs <<< "$(pkg-config --libs gtk-layer-shell-0 gtk+-3.0 libpng)"
 gcc -std=c11 -O2 -Wall -Wextra -Wno-unused-parameter "${cflags[@]}" \
@@ -319,16 +323,32 @@ if "$unload_only"; then
 fi
 
 eval_lua 'require("cosmic").setup({idle_timeout=require("cosmic.config").defaults.idle_timeout}); assert(require("cosmic").status().config.idle_timeout==20)'
+# Persistent keyboard grabs are normal for fcitx and are not composition. Keep
+# a genuine grab throughout idle entry and deliver the restoration key to that
+# same IME exactly once. This fixture never launches/replaces the user's daemon.
+env -u HYPRLAND_INSTANCE_SIGNATURE WAYLAND_DISPLAY="$socket" "$output/ime-probe" > "$output/ime.jsonl" 2>&1 &
+ime_pid=$!
+for ((attempt=0; attempt<80; ++attempt)); do
+    kill -0 "$ime_pid" 2>/dev/null || { sed -n '1,15p' "$output/ime.jsonl" >&2; exit 1; }
+    if [[ $(event_count '"event":"grab_ready"' "$output/ime.jsonl") -ge 1 ]]; then break; fi
+    sleep .05
+done
+eval_lua 'local s=require("cosmic").status(); assert(s.ime_keyboard_grab and not s.ime_composing and not s.entry_blocked)'
 probe move 640 360 1280 720
 printf 'idle_start_monotonic=%s\n' "$(awk '{print $1}' /proc/uptime)" > "$output/idle-timing.txt"
 sleep 5
 eval_lua 'assert(not require("cosmic").status().active)'
 printf 'inactive_at_5s_monotonic=%s\n' "$(awk '{print $1}' /proc/uptime)" >> "$output/idle-timing.txt"
 sleep 16
-eval_lua 'local s=require("cosmic").status(); assert(s.active and s.last_reason=="idle" and s.desktop_ui_hidden)'
+eval_lua 'local s=require("cosmic").status(); assert(s.active and s.last_reason=="idle" and s.desktop_ui_hidden and s.ime_keyboard_grab and not s.ime_composing)'
 printf 'active_at_21s_monotonic=%s\n' "$(awk '{print $1}' /proc/uptime)" >> "$output/idle-timing.txt"
 capture idle-21s hidden
+before_ime_key=$(event_count '"event":"key","key":30,"state":1' "$output/ime.jsonl")
+before_ime_release=$(event_count '"event":"key","key":30,"state":0' "$output/ime.jsonl")
 probe key 30
 wait_lua 'not require("cosmic").status().active'
+sleep .1
+[[ $(event_count '"event":"key","key":30,"state":1' "$output/ime.jsonl") -eq $((before_ime_key+1)) ]] || { printf 'IME restoration key press was lost or duplicated.\n' >&2; exit 1; }
+[[ $(event_count '"event":"key","key":30,"state":0' "$output/ime.jsonl") -eq $((before_ime_release+1)) ]] || { printf 'IME restoration key release was lost or duplicated.\n' >&2; exit 1; }
 capture idle-restored visible
-printf 'PASS: real TOP/OVERLAY suppression and unmap fadeout, exclusive-zone and geometry preservation, first panel click once, protected/interactive layer safety, optional UI visibility, %s active direct unloads, 3 active require removals, and default 20 s idle activation. Parent session was never changed.\n' "$unload_rounds" | tee "$output/result.txt"
+printf 'PASS: real TOP/OVERLAY suppression and unmap fadeout, exclusive-zone and geometry preservation, first panel click once, protected/interactive layer safety, optional UI visibility, %s active direct unloads, 3 active require removals, and default 20 s idle activation with a persistent real IME grab and its first key delivered once. Parent session was never changed.\n' "$unload_rounds" | tee "$output/result.txt"
