@@ -5,6 +5,7 @@
 #include <hyprland/src/render/Framebuffer.hpp>
 #include <hyprland/src/render/pass/PassElement.hpp>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -20,6 +21,22 @@ struct Snapshot {
     Vector2D monitorPosition;
     float monitorScale = 1.0F;
 };
+
+// Absolute logical coordinates shared by presentation and dedicated controls.
+// Ordinary pointer input still restores Hyprland's normal layout first.
+struct PeerViewLayout {
+    Region region;
+    Vec2 origin;
+    Vec2 size;
+    Vec2 contentOrigin;
+    Vec2 contentSize;
+    double scale = 1.0;
+    bool contains(Vec2 point) const;
+    bool containsContent(Vec2 point) const;
+    Vec2 toRegionScreen(Vec2 point) const;
+    Vec2 fromRegionScreen(Vec2 point) const;
+};
+std::optional<PeerViewLayout> peerViewLayout(const Universe& universe, int mainRegion);
 
 class CosmicRenderer {
   public:
