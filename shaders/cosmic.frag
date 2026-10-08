@@ -13,6 +13,7 @@ uniform float uPhase;
 uniform float uStars;
 uniform float uBackground;
 uniform vec2 uResolution;
+uniform vec4 uClip;
 layout(location = 0) out vec4 fragColor;
 // Hyprland attaches an unmodified mirror at COLOR_ATTACHMENT1 for screencopy
 // and mirrored outputs. Leaving it unwritten produces stale/undefined captures.
@@ -24,6 +25,8 @@ float hash(vec2 p) {
 }
 
 void main() {
+    vec2 pixel = vScreen * uResolution;
+    if (any(lessThan(pixel, uClip.xy)) || any(greaterThan(pixel, uClip.zw))) discard;
     if (uMode == 0) {
         vec2 p = vScreen;
         float aspect = uResolution.x / max(uResolution.y, 1.0);
@@ -61,6 +64,8 @@ void main() {
         vec3 color = uColor.rgb * alpha;
         alpha = max(alpha, core * 0.88 * uColor.a);
         fragColor = vec4(color, alpha);
+    } else if (uMode == 4) {
+        fragColor = vec4(uColor.rgb * uColor.a, uColor.a);
     } else {
         float r = length(vLocal) * 2.0;
         float alpha = exp(-r * r * 5.0) * uColor.a;
