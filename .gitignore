@@ -1,0 +1,6 @@
+PROMPT.md
+/build/
+/artifacts/
+*.so
+*.o
+*.log
