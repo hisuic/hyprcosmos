@@ -6,6 +6,7 @@
 #include <hyprland/src/managers/input/InputManager.hpp>
 #include <hyprland/src/managers/SeatManager.hpp>
 #include <hyprland/src/managers/SessionLockManager.hpp>
+#include <hyprland/src/managers/screenshare/ScreenshareManager.hpp>
 #include <hyprland/src/managers/fullscreen/FullscreenController.hpp>
 #include <hyprland/src/managers/eventLoop/EventLoopManager.hpp>
 #include <hyprland/src/render/Renderer.hpp>
@@ -70,6 +71,7 @@ class Cosmic {
     SP<CEventLoopTimer> timer;
     CFunctionHook* hook = nullptr;
     bool initialized = false, active = false, capturing = false, alternateRegion = false;
+    bool previousScanoutBlocked = false;
     bool notified = false;
     std::unordered_set<std::string> shares;
     std::string reason = "not initialized";
@@ -114,7 +116,11 @@ class Cosmic {
     }
     bool blocked() const {
         if (g_pSessionLockManager->isSessionLocked() || g_pInputManager->isConstrained() || g_pInputManager->isLocked()) return true;
-        for (const auto& m : State::monitorState()->monitors()) if (!m->m_dpmsStatus) return true;
+        for (const auto& m : State::monitorState()->monitors()) {
+            if (!m->m_dpmsStatus) return true;
+            // Covers shares that predate require/setup or a configuration reload.
+            if (options.excludeShare && Screenshare::mgr()->isOutputBeingSSd(m)) return true;
+        }
         if (options.excludeShare && !shares.empty()) return true;
         if (options.excludeInhibit && !g_pInputManager->m_idleInhibitors.empty()) return true;
         for (const auto& w : Desktop::windowState()->windows()) {
@@ -142,7 +148,7 @@ class Cosmic {
             universe.reset({}, {}, cursor());
             snapshots.clear();
             snapshotBytes = 0;
-            g_pHyprRenderer->m_directScanoutBlocked = false;
+            g_pHyprRenderer->m_directScanoutBlocked = previousScanoutBlocked;
             damage();
             if (refreshPointer) g_pInputManager->simulateMouseMovement();
         }
@@ -221,6 +227,7 @@ class Cosmic {
         alternateRegion = false;
         lastTick = lastCapture = Clock::now();
         reason = preview ? "manual preview" : "idle";
+        previousScanoutBlocked = g_pHyprRenderer->m_directScanoutBlocked;
         g_pHyprRenderer->m_directScanoutBlocked = true;
         damage();
     }
