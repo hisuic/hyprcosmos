@@ -74,6 +74,13 @@ check_link "$plugin_link" "$plugin_target"
 
 markers=$(awk '/^-- hyprcosmos:begin$/ { begin++ } /^-- hyprcosmos:end$/ { end++ } END { print begin+0, end+0 }' "$real_config")
 [[ "$markers" == '0 0' || "$markers" == '1 1' ]] || die 'configuration has malformed or duplicated hyprcosmos markers'
+if [[ "$markers" == '1 1' ]] && ! awk '
+    /^-- hyprcosmos:begin$/ { if (state != 0 || seen++) exit 1; state=1; next }
+    /^-- hyprcosmos:end$/ { if (state != 2) exit 1; state=0; next }
+    state == 1 { if ($0 != "require(\"cosmic\")") exit 1; state=2; next }
+    state == 2 { exit 1 }
+    END { if (state != 0) exit 1 }
+' "$real_config"; then die 'the marked require block was edited; preserving it for manual review'; fi
 append=false
 if [[ "$markers" == '0 0' ]] && ! rg -q '^[^-]*require[[:space:]]*\([[:space:]]*["\x27]cosmic["\x27][[:space:]]*\)' "$real_config"; then
     append=true
@@ -111,7 +118,8 @@ if [[ ! -L "$plugin_link" ]]; then ln -s -- "$plugin_target" "$plugin_link"; fi
 if "$append"; then
     backup=$(mktemp "${real_config}.hyprcosmos-backup.$(date +%Y%m%dT%H%M%S).XXXXXX")
     cp -p -- "$real_config" "$backup"
-    printf '\n-- hyprcosmos:begin\nrequire("cosmic")\n-- hyprcosmos:end\n' >> "$real_config"
+    if [[ -s "$real_config" && -n $(tail -c 1 -- "$real_config") ]]; then printf '\n' >> "$real_config"; fi
+    printf -- '-- hyprcosmos:begin\nrequire("cosmic")\n-- hyprcosmos:end\n' >> "$real_config"
     printf 'Configuration backup: %s\n' "$backup"
 fi
 if "$reload"; then hyprctl -i "$instance" reload; fi
