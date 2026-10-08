@@ -30,8 +30,12 @@ class CosmicRenderer {
 
     // Must run with the compositor GL context current. draw() initializes lazily.
     bool initialize();
+    void configure(std::size_t stars, double background);
+    // Enqueues a custom pass; OpenGL drawing occurs when Hyprland executes it.
     void draw(PHLMONITOR monitor, const Universe& universe,
               const std::vector<Snapshot>& snapshots, bool alternateRegion = false);
+    void executeDraw(PHLMONITOR monitor, const Universe& universe,
+                     const std::vector<Snapshot>& snapshots, bool alternateRegion = false);
     // The returned pass runs within the current compositor frame. universe and
     // this renderer must outlive that frame; captures hold their own references.
     UP<IPassElement> pass(PHLMONITOR monitor, const Universe& universe,
