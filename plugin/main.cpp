@@ -7,6 +7,7 @@
 #include <hyprland/src/desktop/view/Window.hpp>
 #include <hyprland/src/state/MonitorState.hpp>
 #include <hyprland/src/managers/input/InputManager.hpp>
+#include <hyprland/src/managers/input/TextInput.hpp>
 #include <hyprland/src/protocols/InputMethodV2.hpp>
 #include <hyprland/src/protocols/XDGShell.hpp>
 #include <hyprland/src/protocols/XDGDialog.hpp>
@@ -180,6 +181,17 @@ Clock::time_point lastInput = Clock::now(), lastTick = lastInput, lastCapture = 
             (layer->m_interactivity != 0 || layer->m_ruleApplicator->aboveLock().valueOrDefault() ||
              protectedDesktopNamespace(layer->m_namespace));
     }
+    bool imeComposition() const {
+        const auto ime = g_pInputManager->m_relay.m_inputMethod.lock();
+        if (!ime) return false;
+        const auto textInput = g_pInputManager->m_relay.getFocusedTextInput();
+        // The relay can return a disabled focused input as a fallback. The
+        // core also retains old preedit bytes when resetting transaction
+        // flags; only a committed preedit is sent before TextInput's done.
+        return activeIMEComposition(textInput && textInput->isEnabled(),
+                                    ime->m_current.preeditString.committed,
+                                    !ime->m_current.preeditString.string.empty());
+    }
     bool desktopInteraction() const {
         // Do not turn a launcher, authentication prompt, composition or modal
         // seat grab into invisible input UI. Protocol state is the primary
@@ -195,9 +207,7 @@ Clock::time_point lastInput = Clock::now(), lastTick = lastInput, lastCapture = 
         // A grab means routing, not user activity. Only an actual focused
         // preedit inhibits entry; the core still draws IME UI above our pass,
         // and keyboard.key emits BEFORE ordinary delivery to an IME grab.
-        if (const auto ime = g_pInputManager->m_relay.m_inputMethod.lock();
-            ime && activeIMEComposition(!!g_pInputManager->m_relay.getFocusedTextInput(),
-                                       !ime->m_current.preeditString.string.empty())) return true;
+        if (imeComposition()) return true;
         return false;
     }
     bool blocked() {
@@ -711,8 +721,7 @@ int status(lua_State* L) {
     // guard when an otherwise idle desktop does not enter Cosmic.
     const auto ime = g_pInputManager->m_relay.m_inputMethod.lock();
     b("ime_keyboard_grab", ime && ime->hasGrab());
-    b("ime_composing", ime && activeIMEComposition(!!g_pInputManager->m_relay.getFocusedTextInput(),
-                                                  !ime->m_current.preeditString.string.empty()));
+    b("ime_composing", instance->imeComposition());
     b("seat_grab", !!g_pSeatManager->m_seatGrab);
     b("desktop_interaction_blocked", instance->desktopInteraction());
     b("held_input", instance->held());
