@@ -23,6 +23,28 @@ static_assert(!cosmic::protectedDesktopNamespace("waybar"));
 static_assert(!cosmic::authenticationWindowClass("kitty"));
 static_assert(noexcept(cosmic::protectedDesktopNamespace("")));
 static_assert(noexcept(cosmic::authenticationWindowClass("")));
+static_assert(!cosmic::activeIMEComposition(false, false));
+static_assert(!cosmic::activeIMEComposition(false, true));
+static_assert(!cosmic::activeIMEComposition(true, false));
+static_assert(cosmic::activeIMEComposition(true, true));
+static_assert(noexcept(cosmic::activeIMEComposition(true, true)));
+
+void testIMEComposition() {
+    for (const bool focused : {false, true})
+        for (const bool preedit : {false, true})
+            check(cosmic::activeIMEComposition(focused, preedit) == (focused && preedit),
+                  "only a focused text input with nonempty preedit inhibits idle entry");
+
+    bool focused = true;
+    const bool stalePreedit = true;
+    check(cosmic::activeIMEComposition(focused, stalePreedit), "focused composition inhibits Cosmic");
+    focused = false;
+    check(!cosmic::activeIMEComposition(focused, stalePreedit),
+          "a stale preedit stops inhibiting Cosmic after its text input loses focus");
+    const bool persistentKeyboardGrab = true;
+    check(persistentKeyboardGrab && !cosmic::activeIMEComposition(true, false),
+          "a persistent IME keyboard routing grab does not make empty preedit active composition");
+}
 
 void testLayerNamespaces() {
     check(!cosmic::protectedDesktopNamespace(""), "empty namespaces are not classified by a name heuristic");
@@ -86,6 +108,7 @@ int main() {
     try {
         testLayerNamespaces();
         testWindowClasses();
+        testIMEComposition();
         std::cout << "Desktop UI safety policy: " << assertions << " checks passed\n";
         return 0;
     } catch (const std::exception& error) {
