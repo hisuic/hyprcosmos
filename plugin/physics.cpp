@@ -40,6 +40,17 @@ Vec2 softenedGravity(Vec2 distance, double strength, double softening) {
     const double squared = lengthSquared(distance) + softening * softening;
     return distance * (strength / (squared * std::sqrt(squared)));
 }
+double segmentPortalEntry(Vec2 start, Vec2 end, Vec2 center, double portal_radius) {
+    const Vec2 offset = start - center, travel = end - start;
+    const double c = lengthSquared(offset) - portal_radius * portal_radius;
+    if (c <= 0.0) return 0.0;
+    const double a = lengthSquared(travel), b = dot(offset, travel);
+    if (a < 1e-12 || b >= 0.0) return std::numeric_limits<double>::infinity();
+    const double discriminant = b * b - a * c;
+    if (discriminant < 0.0) return std::numeric_limits<double>::infinity();
+    const double entry = (-b - std::sqrt(discriminant)) / a;
+    return entry >= 0.0 && entry <= 1.0 ? entry : std::numeric_limits<double>::infinity();
+}
 } // namespace
 
 Config Config::calm() { return {}; }
@@ -92,9 +103,10 @@ void Universe::configure(Config config) {
         m_particles.clear();
         m_waves.clear();
     }
-    if (!config.wormholes)
+    if (!config.wormholes) {
+        for (auto& body : m_bodies) if (body.portal_progress > 0.0) cancelPortal(body);
         m_wormholes.clear();
-    else if (m_wormholes.empty() && !m_regions.empty())
+    } else if (m_wormholes.empty() && !m_regions.empty())
         createWormholes();
     if (!config.rewind)
         m_rewinding = false;
@@ -167,6 +179,26 @@ void Universe::normalizeBody(Body& body, bool initialize_velocity) {
     body.sink_duration = finiteClamp(body.sink_duration, 0.0, 40000.0, 0.0);
     body.sink_camera_center = safeVector(body.sink_camera_center, region.center());
     body.sink_camera_zoom = finiteClamp(body.sink_camera_zoom, 0.02, 1.0, 1.0);
+    body.portal_progress = finiteClamp(body.portal_progress, 0.0, 1.0, 0.0);
+    body.portal_entry_center = safeVector(body.portal_entry_center, region.center());
+    body.portal_exit_center = safeVector(body.portal_exit_center, region.center());
+    body.portal_start_offset = safeVector(body.portal_start_offset);
+    body.portal_entry_axis = safeVector(body.portal_entry_axis, {1.0, 0.0});
+    body.portal_exit_offset = safeVector(body.portal_exit_offset);
+    body.portal_start_velocity = limited(body.portal_start_velocity, m_config.max_speed);
+    body.portal_arc = finiteClamp(body.portal_arc, 0.0, 100000.0, 0.0);
+    body.portal_start_angle = finiteClamp(body.portal_start_angle, -TAU, TAU, body.angle);
+    body.portal_start_scale = finiteClamp(body.portal_start_scale, 0.01, 0.42, body.scale);
+    body.portal_start_stretch = finiteClamp(body.portal_start_stretch, 1.0, 12.0, 1.0);
+    body.portal_start_twist = finiteClamp(body.portal_start_twist, -8.0, 8.0, 0.0);
+    body.portal_turn = finiteClamp(body.portal_turn, -TAU * 2.0, TAU * 2.0, 0.0);
+    body.portal_turn_sign = body.portal_turn_sign < 0.0 ? -1.0 : 1.0;
+    body.portal_entry_duration = finiteClamp(body.portal_entry_duration, m_config.fixed_step, 40000.0, 1.68);
+    body.portal_exit_duration = finiteClamp(body.portal_exit_duration, m_config.fixed_step, 40000.0, 0.75);
+    body.portal_source_camera_center = safeVector(body.portal_source_camera_center, region.center());
+    body.portal_destination_camera_center = safeVector(body.portal_destination_camera_center, region.center());
+    body.portal_source_camera_zoom = finiteClamp(body.portal_source_camera_zoom, 0.02, 1.0, 1.0);
+    body.portal_destination_camera_zoom = finiteClamp(body.portal_destination_camera_zoom, 0.02, 1.0, 1.0);
     if (initialize_velocity) {
         if (body.id == m_focused_id)
             body.mass = std::min(100.0, body.mass * 3.5);
@@ -241,7 +273,7 @@ uint64_t Universe::hitTestInRegion(Vec2 screen_position, const int* visible_regi
         const Body& body = *iterator;
         if (visible_region && body.region != *visible_region)
             continue;
-        if (body.stored || body.sink_progress > 0.0 || body.scale < 0.001)
+        if (body.stored || body.sink_progress > 0.0 || body.portal_progress > 0.0 || body.scale < 0.001)
             continue;
         const auto& region = regionFor(body.region);
         if (screen_position.x < region.x || screen_position.x > region.x + region.width ||
@@ -314,7 +346,7 @@ void Universe::supernova(Vec2 position, int region) {
         return;
     position = safeVector(position, regionFor(region).center());
     for (auto& body : m_bodies) {
-        if (body.stored || body.region != region || body.sink_progress > 0.0)
+        if (body.stored || body.region != region || body.sink_progress > 0.0 || body.portal_progress > 0.0)
             continue;
         Vec2 displacement = body.position - position;
         const double distance = length(displacement);
@@ -364,6 +396,114 @@ void Universe::createWormholes() {
     }
 }
 
+void Universe::beginPortal(Body& body, const Wormhole& entrance, const Wormhole& exit, Vec2 position) {
+    body.position = position; // First swept intersection, not a skipped mouth.
+    body.portal_progress = std::numeric_limits<double>::epsilon();
+    body.portal_emerging = false;
+    body.portal_source_region = entrance.region;
+    body.portal_destination_region = exit.region;
+    body.portal_entry_center = entrance.position;
+    body.portal_exit_center = exit.position;
+    body.portal_start_offset = body.position - entrance.position;
+    const double distance = length(body.portal_start_offset);
+    body.portal_entry_axis = distance > 1e-6 ? body.portal_start_offset / distance
+        : length(body.velocity) > 1e-6 ? body.velocity / length(body.velocity)
+        : rotate({1.0, 0.0}, static_cast<double>(body.id % 4096) / 4096.0 * TAU);
+    body.portal_start_velocity = body.velocity;
+    body.portal_start_angle = body.angle;
+    body.portal_start_scale = body.scale;
+    body.portal_start_stretch = body.stretch;
+    body.portal_start_twist = body.twist;
+    body.portal_turn = exit.angle - entrance.angle + PI;
+    const double momentum = cross(body.portal_start_offset, body.velocity);
+    body.portal_turn_sign = std::abs(momentum) > 1e-6 ? (momentum < 0.0 ? -1.0 : 1.0)
+                                                    : (body.id % 2 ? 1.0 : -1.0);
+    const Camera* source = cameraFor(entrance.region);
+    const Camera* destination = cameraFor(exit.region);
+    body.portal_source_camera_center = source ? source->center : regionFor(entrance.region).center();
+    body.portal_source_camera_zoom = source ? source->zoom : 1.0;
+    body.portal_destination_camera_center = destination ? destination->center : regionFor(exit.region).center();
+    body.portal_destination_camera_zoom = destination ? destination->zoom : 1.0;
+    const auto& region = regionFor(entrance.region);
+    const double visible_size = std::max(body.width, body.height) * body.scale * body.portal_source_camera_zoom;
+    const double excursion = std::min({std::clamp(visible_size * 0.13, 24.0, 64.0),
+                                      std::min(region.width, region.height) * 0.08,
+                                      entrance.radius * body.portal_source_camera_zoom * 0.80});
+    body.portal_arc = excursion / (0.58 * body.portal_source_camera_zoom);
+    const double radial_bound = 2.0 * distance + (PI + 1.0) * body.portal_arc;
+    const double angular_bound = TAU * 1.7 * (distance + 0.60 * body.portal_arc);
+    body.portal_entry_duration = std::max(std::max(1.4, std::min(m_config.sink_duration, 4.0) * 0.60),
+                                          std::hypot(radial_bound, angular_bound) / m_config.max_speed);
+    const Vec2 exit_velocity = rotate(body.portal_start_velocity, body.portal_turn);
+    const Vec2 direction = length(exit_velocity) > 1e-6 ? exit_velocity / length(exit_velocity)
+                                                     : rotate({1.0, 0.0}, exit.angle);
+    body.portal_exit_offset = direction * (exit.radius + radius(body) * 0.30 + 5.0);
+    body.portal_exit_duration = std::max(0.75, 1.5 * length(body.portal_exit_offset) / m_config.max_speed);
+    body.cooldown = 0.0; // Ordinary detection is disabled until emergence ends.
+}
+
+void Universe::advancePortal(Body& body, double dt) {
+    const Vec2 previous = body.position;
+    const double duration = body.portal_entry_duration + body.portal_exit_duration;
+    const double midpoint = body.portal_entry_duration / duration;
+    body.portal_progress = std::min(1.0, body.portal_progress + dt / duration);
+    if (!body.portal_emerging && body.portal_progress >= midpoint - 1e-12) {
+        // Present one exactly invisible frame when changing logical regions.
+        body.portal_progress = midpoint;
+        body.portal_emerging = true;
+        body.region = body.portal_destination_region;
+        body.position = body.portal_exit_center;
+        body.scale = 0.0;
+        body.velocity = {};
+        return;
+    }
+    if (!body.portal_emerging) {
+        const double progress = body.portal_progress / midpoint;
+        const double remaining = 1.0 - progress;
+        const double turn = body.portal_turn_sign * TAU * (0.3 * progress + 0.7 * progress * progress);
+        const Vec2 relative = body.portal_start_offset * (remaining * remaining) +
+                              body.portal_entry_axis * (body.portal_arc * std::sin(PI * progress) * remaining);
+        body.position = body.portal_entry_center + rotate(relative, turn);
+        body.angle = std::remainder(body.portal_start_angle + body.portal_turn_sign * TAU *
+                                   (0.6 * progress + 1.5 * progress * progress), TAU);
+        const double scale = 1.0 - progress * progress;
+        body.scale = body.portal_start_scale * scale * scale;
+        body.stretch = m_config.spaghetti ? 1.0 + 1.5 * std::sin(PI * smoothProgress(progress, 0.15)) : 1.0;
+        body.twist = m_config.spaghetti ? 2.4 * smoothProgress(progress, 0.25) : 0.0;
+    } else {
+        const double progress = (body.portal_progress - midpoint) / (1.0 - midpoint);
+        const double ease = smoothProgress(progress, 0.0);
+        body.position = body.portal_exit_center + body.portal_exit_offset * ease;
+        body.scale = body.portal_start_scale * ease;
+        body.angle = std::remainder(body.portal_start_angle + body.portal_turn +
+                                   body.portal_turn_sign * TAU * (1.0 - progress) * (1.0 - progress), TAU);
+        body.stretch = m_config.spaghetti ? 1.0 + 1.5 * (1.0 - ease) : 1.0;
+        body.twist = m_config.spaghetti ? 2.4 * (1.0 - ease) : 0.0;
+    }
+    body.velocity = limited((body.position - previous) / dt, m_config.max_speed);
+    if (body.portal_progress >= 1.0 - 1e-12) {
+        body.portal_progress = 0.0;
+        body.portal_emerging = false;
+        body.scale = body.portal_start_scale;
+        body.stretch = body.portal_start_stretch;
+        body.twist = body.portal_start_twist;
+        body.angle = std::remainder(body.portal_start_angle + body.portal_turn, TAU);
+        body.velocity = limited(rotate(body.portal_start_velocity, body.portal_turn), m_config.max_speed);
+        body.cooldown = m_config.wormhole_cooldown;
+    }
+}
+
+void Universe::cancelPortal(Body& body) {
+    body.velocity = limited(rotate(body.portal_start_velocity, body.portal_emerging ? body.portal_turn : 0.0), m_config.max_speed);
+    body.angle = std::remainder(body.portal_start_angle + (body.portal_emerging ? body.portal_turn : 0.0), TAU);
+    body.scale = body.portal_start_scale;
+    body.stretch = body.portal_start_stretch;
+    body.twist = body.portal_start_twist;
+    body.portal_progress = 0.0;
+    body.portal_emerging = false;
+    body.cooldown = m_config.wormhole_cooldown;
+}
+
 void Universe::cycleGravity() {
     if (!m_config.binary) {
         m_gravity_mode = GravityMode::Cursor;
@@ -383,7 +523,7 @@ void Universe::setBinaryPreset() {
     Body* first = nullptr;
     Body* second = nullptr;
     for (auto& body : m_bodies) {
-        if (body.stored || body.sink_progress > 0.0)
+        if (body.stored || body.sink_progress > 0.0 || body.portal_progress > 0.0)
             continue;
         if (!first)
             first = &body;
@@ -410,9 +550,11 @@ void Universe::setBinaryPreset() {
 
 void Universe::integrate(double dt) {
     std::vector<Vec2> acceleration(m_bodies.size());
+    // A completed transit still keeps its promised exit velocity for this step.
+    std::vector<bool> portal_updated(m_bodies.size(), false);
     for (std::size_t index = 0; index < m_bodies.size(); ++index) {
         const auto& body = m_bodies[index];
-        if (body.stored || body.sink_progress > 0.0)
+        if (body.stored || body.sink_progress > 0.0 || body.portal_progress > 0.0)
             continue;
         if (m_config.cursor_gravity && m_gravity_mode == GravityMode::Cursor)
             acceleration[index] += softenedGravity(screenToWorld(m_cursor, body.region) - body.position,
@@ -423,11 +565,11 @@ void Universe::integrate(double dt) {
     if (m_config.binary) {
         for (std::size_t first = 0; first < m_bodies.size(); ++first) {
             const auto& a = m_bodies[first];
-            if (a.stored || a.sink_progress > 0.0)
+            if (a.stored || a.sink_progress > 0.0 || a.portal_progress > 0.0)
                 continue;
             for (std::size_t second = first + 1; second < m_bodies.size(); ++second) {
                 const auto& b = m_bodies[second];
-                if (b.stored || b.sink_progress > 0.0 || a.region != b.region)
+                if (b.stored || b.sink_progress > 0.0 || b.portal_progress > 0.0 || a.region != b.region)
                     continue;
                 const bool focused_pair = m_gravity_mode == GravityMode::Focused && (a.id == m_focused_id || b.id == m_focused_id);
                 const double strength = m_config.mutual_strength * (focused_pair ? 8.0 : 1.0);
@@ -443,6 +585,11 @@ void Universe::integrate(double dt) {
         body.cooldown = std::max(0.0, body.cooldown - dt);
         if (body.stored)
             continue;
+        if (body.portal_progress > 0.0) {
+            portal_updated[index] = true;
+            advancePortal(body, dt);
+            continue;
+        }
         if (body.sink_progress > 0.0) {
             const double previous_scale = body.scale;
             const double duration = std::max(m_config.fixed_step, body.sink_duration);
@@ -489,6 +636,7 @@ void Universe::integrate(double dt) {
             }
             continue;
         }
+        const Vec2 previous_position = body.position;
         body.velocity = limited((body.velocity + limited(acceleration[index], m_config.max_acceleration) * dt) * damping,
                                 m_config.max_speed);
         body.position += body.velocity * dt;
@@ -497,30 +645,28 @@ void Universe::integrate(double dt) {
         body.angle = std::remainder(body.angle + body.angular_velocity * dt, TAU);
         body.angular_velocity *= std::exp(-0.008 * dt);
         if (m_config.wormholes && body.cooldown <= 0.0) {
+            const Wormhole* selected = nullptr;
+            double nearest = std::numeric_limits<double>::infinity();
             for (const auto& entrance : m_wormholes) {
-                if (entrance.region != body.region || length(body.position - entrance.position) > entrance.radius)
-                    continue;
-                const auto& exit = m_wormholes[entrance.partner];
-                const double turn = exit.angle - entrance.angle + PI;
-                body.velocity = rotate(body.velocity, turn);
-                const Vec2 direction = length(body.velocity) > 1.0 ? body.velocity / length(body.velocity)
-                                                                 : rotate({1.0, 0.0}, exit.angle);
-                body.position = exit.position + direction * (exit.radius + radius(body) * 0.30 + 5.0);
-                body.angle = std::remainder(body.angle + turn, TAU);
-                body.region = exit.region;
-                body.cooldown = m_config.wormhole_cooldown;
-                break;
+                if (entrance.region != body.region) continue;
+                const double intersection = segmentPortalEntry(previous_position, body.position, entrance.position, entrance.radius);
+                if (intersection < nearest) { nearest = intersection; selected = &entrance; }
+            }
+            if (selected) {
+                beginPortal(body, *selected, m_wormholes[selected->partner],
+                            previous_position + (body.position - previous_position) * nearest);
+                portal_updated[index] = true;
             }
         }
     }
     if (m_config.collisions && m_config.collision_strength > 0.0) {
         for (std::size_t first = 0; first < m_bodies.size(); ++first) {
             auto& a = m_bodies[first];
-            if (a.stored || a.sink_progress > 0.0)
+            if (a.stored || a.sink_progress > 0.0 || a.portal_progress > 0.0 || portal_updated[first])
                 continue;
             for (std::size_t second = first + 1; second < m_bodies.size(); ++second) {
                 auto& b = m_bodies[second];
-                if (b.stored || b.sink_progress > 0.0 || a.region != b.region)
+                if (b.stored || b.sink_progress > 0.0 || b.portal_progress > 0.0 || portal_updated[second] || a.region != b.region)
                     continue;
                 const Vec2 offset = b.position - a.position;
                 const double distance = length(offset), contact = radius(a) + radius(b);
@@ -542,8 +688,9 @@ void Universe::integrate(double dt) {
             }
         }
     }
-    for (auto& body : m_bodies) {
-        if (body.stored || body.sink_progress > 0.0)
+    for (std::size_t index = 0; index < m_bodies.size(); ++index) {
+        auto& body = m_bodies[index];
+        if (body.stored || body.sink_progress > 0.0 || body.portal_progress > 0.0 || portal_updated[index])
             continue;
         const auto& region = regionFor(body.region);
         const double expansion = m_config.expansion ? std::min(5.0, 1.0 + m_time * m_config.expansion_rate * 0.5) : 1.0;
@@ -600,6 +747,15 @@ void Universe::updateCameras(double dt) {
             camera.zoom = sinking->sink_camera_zoom;
             continue;
         }
+        const auto transit = std::find_if(m_bodies.begin(), m_bodies.end(), [&](const Body& body) {
+            return body.portal_progress > 0.0 && (camera.region == body.portal_source_region || camera.region == body.portal_destination_region);
+        });
+        if (transit != m_bodies.end()) {
+            const bool source = camera.region == transit->portal_source_region;
+            camera.center = source ? transit->portal_source_camera_center : transit->portal_destination_camera_center;
+            camera.zoom = source ? transit->portal_source_camera_zoom : transit->portal_destination_camera_zoom;
+            continue;
+        }
         double minimum_x = region.x, maximum_x = region.x + region.width;
         double minimum_y = region.y, maximum_y = region.y + region.height;
         for (const auto& body : m_bodies) {
@@ -652,6 +808,8 @@ void Universe::restoreFrame(const Frame& frame) {
         const auto previous = std::find_if(frame.bodies.begin(), frame.bodies.end(), [&](const Body& old) { return old.id == body.id; });
         if (previous != frame.bodies.end())
             body = *previous;
+        if (!m_config.wormholes && body.portal_progress > 0.0)
+            cancelPortal(body);
     }
     m_time = frame.time;
     updateCameras(0.0);
