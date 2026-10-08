@@ -322,7 +322,7 @@ void CosmicRenderer::executeDraw(PHLMONITOR monitor, const Universe& universe,
             capture.logicalBox.w * capture.monitorScale / texture->m_size.x,
             capture.logicalBox.h * capture.monitorScale / texture->m_size.y);
         impl.quad(position, dimensions, 1, {1, 1, 1, 1}, body.angle, body.stretch,
-                  body.twist, body.sink_progress * 0.24, true);
+                  body.twist, universe.config().spaghetti ? body.sink_progress * 0.24 : 0.0, true);
     }
     glUniform4f(impl.crop, 0, 0, 1, 1);
     if (universe.config().wormholes) {
