@@ -404,9 +404,13 @@ int setup(lua_State* L) {
         }
         lua_pop(L, 1);
         lua_getfield(L, 1, "rendering");
+        std::size_t stars = 120;
+        double background = .16;
         if (lua_istable(L, -1)) {
             next.physics.max_particles = static_cast<std::size_t>(number(L, -1, "particles", 96, 0, 384));
             next.snapshotBudget = static_cast<std::size_t>(number(L, -1, "snapshot_mb", 128, 16, 512) * 1024 * 1024);
+            stars = static_cast<std::size_t>(number(L, -1, "stars", 120, 0, 1024));
+            background = number(L, -1, "background", .16, 0, 1);
         }
         lua_pop(L, 1);
         lua_getfield(L, 1, "exclusions");
@@ -453,6 +457,7 @@ int setup(lua_State* L) {
         instance->shutdown();
         instance->options = std::move(next);
         instance->universe.configure(instance->options.physics);
+        instance->renderer.configure(stars, background);
         if (instance->options.enabled) instance->initialize();
         lua_pushboolean(L, true);
         return 1;
