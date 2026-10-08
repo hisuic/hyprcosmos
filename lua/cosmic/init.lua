@@ -3,7 +3,7 @@
 local Config = require("cosmic.config")
 local M = {}
 local options = Config.copy(Config.defaults)
-local initialized, stopped, warned = false, false, false
+local initialized, stopped, warned, configuration_ready = false, false, false, false
 local last_error, plugin_path
 local subscriptions, bindings = {}, {}
 
@@ -44,6 +44,7 @@ end
 
 local function bind_controls()
     remove_bindings()
+    if not options.enabled then return true end
     for action, chord in pairs(options.controls) do
         if chord then
             local ok, binding = pcall(hl.bind, chord, function() M.action(action) end,
@@ -91,7 +92,10 @@ local function attach()
         warn("this module requires the Hyprland Lua configuration API")
         return false
     end
-    subscriptions[#subscriptions + 1] = hl.on("config.reloaded", initialize)
+    subscriptions[#subscriptions + 1] = hl.on("config.reloaded", function()
+        configuration_ready = true
+        initialize()
+    end)
     subscriptions[#subscriptions + 1] = hl.on("hyprland.shutdown", function() M.shutdown() end)
     plugin_path = resolve_plugin()
     local file = io.open(plugin_path, "rb")
@@ -114,7 +118,12 @@ function M.setup(update)
     if initialized then
         local ok
         ok, message = call("setup", Config.copy(validated))
-        if not ok then warn(message); return nil, message end
+        if not ok then
+            remove_bindings()
+            initialized = false
+            warn(message)
+            return nil, message
+        end
         options = validated
         ok, message = bind_controls()
         if not ok then call("disable"); warn(message); return nil, message end
@@ -138,6 +147,11 @@ function M.setup(update)
                 if not ok then warn(message); return nil, message end
             end
         end
+        if not initialized and configuration_ready and native() then
+            local ok
+            ok, message = initialize()
+            if not ok then return nil, message end
+        end
     end
     return M
 end
@@ -145,12 +159,17 @@ end
 function M.enable()
     if stopped then return nil, "cosmic: call setup() to restart after shutdown()" end
     options.enabled = true
-    if initialized then return call("enable") end
+    if initialized then
+        local ok, message = call("enable")
+        if not ok then warn(message); return nil, message end
+        return bind_controls()
+    end
     return true
 end
 
 function M.disable()
     options.enabled = false
+    remove_bindings()
     if initialized then return call("disable") end
     return true
 end
