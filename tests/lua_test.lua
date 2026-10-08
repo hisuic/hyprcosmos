@@ -48,6 +48,55 @@ end
 check(Config.normalize({ history_hz = 60 }).history_hz == 60 and
     not Config.normalize({ history_hz = 60.01 }), "history frequency matches the simulation's sixty Hz cap")
 
+local default_sky = assert(Config.normalize())
+check(default_sky.rendering.background == 1 and default_sky.rendering.stars == 240,
+    "default cosmic sky fully covers the wallpaper with 240 ASCII stars")
+for _, opacity in ipairs({ 0, 0.375, 1 }) do
+    local sky = assert(Config.normalize({ rendering = { background = opacity } }))
+    check(sky.rendering.background == opacity, "background opacity retains accepted values including both boundaries")
+end
+for _, opacity in ipairs({ -0.00001, 1.00001, 0 / 0, math.huge, -math.huge }) do
+    local sky, message = Config.normalize({ rendering = { background = opacity } }, default_sky)
+    check(sky == nil and type(message) == "string", "invalid background opacity is rejected")
+    check(default_sky.rendering.background == 1, "invalid opacity does not mutate the accepted sky")
+end
+for _, stars in ipairs({ 0, 17, 240, 1024 }) do
+    local sky = assert(Config.normalize({ rendering = { stars = stars } }))
+    check(sky.rendering.stars == stars, "ASCII star count retains accepted integers including both boundaries")
+end
+for _, stars in ipairs({ -1, 1025, 0.5, 1023.5, 0 / 0, math.huge }) do
+    local sky, message = Config.normalize({ rendering = { stars = stars } }, default_sky)
+    check(sky == nil and type(message) == "string", "invalid ASCII star count is rejected")
+    check(default_sky.rendering.stars == 240, "invalid star count does not mutate the accepted sky")
+end
+for _, seed in ipairs({ 0, 0xFFFFFFFF }) do
+    local sky = assert(Config.normalize({ seed = seed }))
+    check(sky.seed == seed, "sky seed retains both unsigned 32-bit boundaries")
+end
+local custom_sky = assert(Config.normalize({ seed = 0xFFFFFFFF,
+    rendering = { background = 0.625, stars = 377 } }))
+local partial_sky = assert(Config.normalize({ idle_timeout = 9,
+    rendering = { particles = 12 } }, custom_sky))
+check(partial_sky.rendering.background == 0.625 and partial_sky.rendering.stars == 377 and
+    partial_sky.seed == 0xFFFFFFFF and partial_sky.rendering.particles == 12,
+    "partial reconfiguration preserves custom opacity, ASCII star count and sky seed")
+check(custom_sky.idle_timeout == Config.defaults.idle_timeout and custom_sky.rendering.particles == 96,
+    "partial sky reconfiguration does not mutate the previous options")
+local demo_sky = assert(Config.normalize({ preset = "demo" }, partial_sky))
+check(demo_sky.rendering.background == 1 and demo_sky.rendering.stars == 240 and
+    demo_sky.rendering.particles == 384 and demo_sky.seed == 0xFFFFFFFF and demo_sky.idle_timeout == 9,
+    "switching to demo resets rendering defaults while preserving unrelated sky seed and idle timeout")
+local custom_demo_sky = assert(Config.normalize({ rendering = { background = 0, stars = 0 } }, demo_sky))
+local calm_sky = assert(Config.normalize({ preset = "calm" }, custom_demo_sky))
+check(calm_sky.rendering.background == 1 and calm_sky.rendering.stars == 240 and
+    calm_sky.rendering.particles == 96 and calm_sky.seed == 0xFFFFFFFF,
+    "switching back to calm restores the opaque ASCII sky and calm particle default")
+local explicit_demo_sky = assert(Config.normalize({ preset = "demo",
+    rendering = { background = 0.25, stars = 1024 } }, calm_sky))
+check(explicit_demo_sky.rendering.background == 0.25 and explicit_demo_sky.rendering.stars == 1024 and
+    explicit_demo_sky.rendering.particles == 384,
+    "explicit sky overrides compose with a preset change")
+
 local original_open = io.open
 local function mock(mode)
     local state = { events = {}, bindings = {}, timers = {}, setups = 0, notifications = 0, loads = {},
