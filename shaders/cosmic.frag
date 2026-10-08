@@ -53,7 +53,7 @@ void main() {
         float streak = 0.55 + 0.45 * sin(a * 5.0 - uTime * 2.0 + uPhase);
         float alpha = (ring * streak + glow) * uColor.a;
         // Dark center makes wormhole mouths readable against bright windows.
-        float core = smoothstep(0.67, 0.42, r) * uPhase;
+        float core = (1.0 - smoothstep(0.42, 0.67, r)) * uPhase;
         vec3 color = uColor.rgb * alpha;
         alpha = max(alpha, core * 0.88 * uColor.a);
         fragColor = vec4(color, alpha);
