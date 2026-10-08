@@ -701,6 +701,16 @@ int status(lua_State* L) {
     n("gravity_mode", static_cast<std::size_t>(instance->universe.gravityMode()));
     b("alternate_region", instance->alternateRegion);
     b("desktop_ui_hidden", instance->active && instance->options.hideDesktopUI);
+    // Read-only diagnostics distinguish real activity from a persistent modal
+    // guard when an otherwise idle desktop does not enter Cosmic.
+    const auto ime = g_pInputManager->m_relay.m_inputMethod.lock();
+    b("ime_keyboard_grab", ime && ime->hasGrab());
+    b("seat_grab", !!g_pSeatManager->m_seatGrab);
+    b("desktop_interaction_blocked", instance->desktopInteraction());
+    b("held_input", instance->held());
+    b("entry_blocked", instance->blocked());
+    lua_pushnumber(L, std::chrono::duration<double>(Clock::now() - instance->lastInput).count());
+    lua_setfield(L, -2, "idle_seconds");
     lua_newtable(L);
     int index = 1;
     for (const auto& body : instance->universe.bodies()) {
