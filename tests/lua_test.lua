@@ -141,18 +141,18 @@ local function mock(mode, user_config_source)
         config_opens = 0, user_config_source = user_config_source }
     io.open = function(path)
         if path:match("/hyprcosmos%.lua$") then
-            state.config_opens = state.config_opens + 1
-            state.config_path = path
-            if state.user_config_source == nil then return nil, "No such file or directory", 2 end
-            return {
-                read = function(_, count) return state.user_config_source:sub(1, count) end,
-                close = function() return true end,
-            }
+            error("user settings must never use blocking Lua io.open")
         end
         if mode == "missing" then return nil, "missing test plugin" end
         return { close = function() end }
     end
     local api = {
+        read_user_config = function(path)
+            state.config_opens = state.config_opens + 1
+            state.config_path = path
+            if state.reader_error then return nil, state.reader_error, true end
+            return state.user_config_source, nil, state.user_config_source ~= nil
+        end,
         setup = function(options)
             state.setups = state.setups + 1
             if state.fail_setup then state.initialized = false; state.enabled = false; return nil, "runtime setup failure" end
@@ -169,6 +169,7 @@ local function mock(mode, user_config_source)
         action = function(action) state.actions[#state.actions + 1] = action; return true end,
         status = function() return { enabled = state.enabled, initialized = state.initialized, active = false, input_watchers = state.initialized and 1 or 0 } end,
     }
+    if mode == "old-api" then api.read_user_config = nil end
     _G.hl = {
         plugin = { load = function(path) state.loads[#state.loads + 1] = path end,
             cosmic = (mode ~= "missing" and mode ~= "delayed") and api or nil },
@@ -295,6 +296,67 @@ check(deferred.setups == 1 and deferred.notifications == 0 and not delayed.statu
 deferred.fire_timers()
 check(deferred.setups == 1, "completed initialization schedules no further probes")
 delayed.shutdown()
+
+local delayed_file, deferred_file = mock("delayed", [[
+    return { idle_timeout = 91, rendering = { stars = 127 }, effects = { orbit = false } }
+]])
+check(deferred_file.config_opens == 0 and not delayed_file.status().config_file_loaded,
+    "startup does not open user settings before the safe native reader exists")
+check(delayed_file.setup({ idle_timeout = 23 }) == delayed_file and
+    delayed_file.setup({ rendering = { particles = 19 } }) == delayed_file,
+    "multiple explicit setup patches can be recorded before the native API is published")
+deferred_file.fire("config.reloaded")
+deferred_file.publish_native()
+deferred_file.fire_timers()
+check(deferred_file.config_opens == 1 and delayed_file.status().config_file_loaded and
+    deferred_file.options.idle_timeout == 23 and deferred_file.options.rendering.stars == 127 and
+    deferred_file.options.rendering.particles == 19 and not deferred_file.options.effects.orbit,
+    "deferred startup honors defaults, then user settings, then every explicit setup patch")
+check(deferred_file.setups == 1 and deferred_file.notifications == 0 and
+    not delayed_file.status().initialization_pending,
+    "deferred settings initialization registers one native setup without warnings or stale probes")
+delayed_file.shutdown()
+
+local delayed_disabled, deferred_disabled = mock("delayed", "return {enabled=true, idle_timeout=91}")
+check(delayed_disabled.disable(), "disable before native availability records the requested state")
+deferred_disabled.fire("config.reloaded")
+deferred_disabled.publish_native()
+deferred_disabled.fire_timers()
+check(not deferred_disabled.options.enabled and deferred_disabled.live_bindings() == 0 and
+    deferred_disabled.options.idle_timeout == 91,
+    "deferred user settings cannot undo an explicit early disable")
+delayed_disabled.shutdown()
+
+local delayed_bad, deferred_bad = mock("delayed", "return {idle_timeout=0}")
+delayed_bad.setup({ rendering = { stars = 127 } })
+deferred_bad.fire("config.reloaded")
+deferred_bad.publish_native()
+deferred_bad.fire_timers()
+check(deferred_bad.config_opens == 1 and deferred_bad.setups == 0 and deferred_bad.disable == 1 and
+    deferred_bad.notifications == 1 and delayed_bad.status().config_file_error and
+    not delayed_bad.status().initialization_pending and deferred_bad.live_bindings() == 0,
+    "invalid deferred settings fail closed rather than bypassing validation with prior setup patches")
+check(delayed_bad.setup({idle_timeout=33}) == delayed_bad and deferred_bad.options.idle_timeout == 33 and
+    deferred_bad.options.rendering.stars == 127 and not delayed_bad.status().config_file_error,
+    "a deliberate valid setup can recover after a deferred file error")
+delayed_bad.shutdown()
+
+local delayed_conflict, deferred_conflict = mock("delayed", "return {controls={preview='SUPER+ALT+F12'}}")
+delayed_conflict.setup({ controls = { emergency = "SUPER+ALT+F12" } })
+deferred_conflict.fire("config.reloaded")
+deferred_conflict.publish_native()
+deferred_conflict.fire_timers()
+check(deferred_conflict.setups == 0 and deferred_conflict.notifications == 1 and
+    delayed_conflict.status().config_file_error:find("explicit setup conflicts", 1, true),
+    "a control conflict between deferred setup and file values fails closed with an actionable error")
+delayed_conflict.shutdown()
+
+local obsolete, obsolete_state = mock("old-api", "return {idle_timeout=91}")
+obsolete_state.fire("config.reloaded")
+check(obsolete_state.config_opens == 0 and obsolete_state.setups == 0 and obsolete_state.live_bindings() == 0 and
+    obsolete_state.notifications == 1 and obsolete.status().error:find("safe user settings reader", 1, true),
+    "an obsolete native API cannot fall back to unsafe blocking Lua file I/O")
+obsolete.shutdown()
 
 local canceled, cancellation = mock("delayed")
 cancellation.fire("config.reloaded")
