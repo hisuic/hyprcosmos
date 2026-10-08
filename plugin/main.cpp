@@ -1,9 +1,15 @@
 #include <hyprland/src/plugins/PluginAPI.hpp>
 #include <hyprland/src/desktop/state/WindowState.hpp>
 #include <hyprland/src/desktop/state/FocusState.hpp>
+#include <hyprland/src/desktop/state/LayerState.hpp>
+#include <hyprland/src/desktop/state/FadingOutState.hpp>
+#include <hyprland/src/desktop/view/LayerSurface.hpp>
 #include <hyprland/src/desktop/view/Window.hpp>
 #include <hyprland/src/state/MonitorState.hpp>
 #include <hyprland/src/managers/input/InputManager.hpp>
+#include <hyprland/src/protocols/InputMethodV2.hpp>
+#include <hyprland/src/protocols/XDGShell.hpp>
+#include <hyprland/src/protocols/XDGDialog.hpp>
 #include <hyprland/src/managers/SeatManager.hpp>
 #include <hyprland/src/managers/SessionLockManager.hpp>
 #include <hyprland/src/managers/screenshare/ScreenshareManager.hpp>
@@ -20,6 +26,7 @@
 #include <stdexcept>
 #include "physics.hpp"
 #include "renderer.hpp"
+#include "desktop_ui.hpp"
 
 namespace {
 using Clock = std::chrono::steady_clock;
@@ -50,6 +57,7 @@ struct Options {
     cosmic::Config physics = cosmic::Config::calm();
     double idleTimeout = 20, fps = 60, snapshotHz = 4;
     bool enabled = true, excludeFullscreen = true, excludeInhibit = true, excludeShare = true;
+    bool hideDesktopUI = true;
     std::size_t snapshotBudget = 128 * 1024 * 1024;
     std::vector<std::regex> excluded;
     std::vector<Control> controls;
@@ -59,6 +67,10 @@ class Cosmic;
 Cosmic* instance = nullptr;
 using RenderWindowFn = void (*)(Render::IHyprRenderer*, PHLWINDOW, PHLMONITOR, const Time::steady_tp&, bool, Render::eRenderPassMode, bool, bool);
 void renderWindowHook(Render::IHyprRenderer*, PHLWINDOW, PHLMONITOR, const Time::steady_tp&, bool, Render::eRenderPassMode, bool, bool);
+using RenderLayerFn = void (*)(Render::IHyprRenderer*, PHLLS, PHLMONITOR, const Time::steady_tp&, bool, bool);
+void renderLayerHook(Render::IHyprRenderer*, PHLLS, PHLMONITOR, const Time::steady_tp&, bool, bool);
+using RenderFadeoutsFn = void (*)(Render::IHyprRenderer*, PHLMONITOR, Desktop::eFadeoutPlane, PHLWORKSPACE);
+void renderFadeoutsHook(Render::IHyprRenderer*, PHLMONITOR, Desktop::eFadeoutPlane, PHLWORKSPACE);
 // Keep the exact C++ return type so the compiler supplies the same hidden
 // structure-return argument as CScreenshareSession::nextFrame(bool).
 using ScreenshareFrameFn = UP<Screenshare::CScreenshareFrame> (*)(Screenshare::CScreenshareSession*, bool);
@@ -75,6 +87,8 @@ class Cosmic {
     SP<CEventLoopTimer> timer;
     CFunctionHook* hook = nullptr;
     CFunctionHook* shareFrameHook = nullptr;
+    CFunctionHook* layerHook = nullptr;
+    CFunctionHook* fadeoutsHook = nullptr;
     bool initialized = false, active = false, capturing = false, alternateRegion = false;
     bool previousScanoutBlocked = false;
     bool notified = false;
@@ -161,8 +175,28 @@ Clock::time_point lastInput = Clock::now(), lastTick = lastInput, lastCapture = 
         }
         return false;
     }
+    bool protectedLayer(const PHLLS& layer) const {
+        return layer && layer->m_mapped &&
+            (layer->m_interactivity != 0 || layer->m_ruleApplicator->aboveLock().valueOrDefault() ||
+             protectedDesktopNamespace(layer->m_namespace));
+    }
+    bool desktopInteraction() const {
+        // Do not turn a launcher, authentication prompt, IME grab or modal
+        // seat grab into invisible input UI. Protocol state is the primary
+        // safeguard; names only provide additional conservative exceptions.
+        if (g_pSeatManager->m_seatGrab) return true;
+        const auto focus = g_pSeatManager->m_state.keyboardFocus.lock();
+        for (const auto& layer : Desktop::layerState()->layers()) {
+            if (protectedLayer(layer)) return true;
+            if (focus && layer && layer->m_mapped && layer->wlSurface() &&
+                layer->wlSurface()->resource() == focus) return true;
+        }
+        if (const auto ime = g_pInputManager->m_relay.m_inputMethod.lock(); ime && ime->hasGrab()) return true;
+        return false;
+    }
     bool blocked() {
         if (g_pSessionLockManager->isSessionLocked() || g_pInputManager->isConstrained() || g_pInputManager->isLocked()) return true;
+        if (desktopInteraction()) return true;
         for (const auto& m : State::monitorState()->monitors()) {
             if (!m->m_dpmsStatus) return true;
         }
@@ -171,6 +205,13 @@ Clock::time_point lastInput = Clock::now(), lastTick = lastInput, lastCapture = 
         if (options.excludeShare && sharesActive()) return true;
         for (const auto& w : Desktop::windowState()->windows()) {
             if (!w->m_isMapped || w->isHidden() || !g_pHyprRenderer->shouldRenderWindow(w)) continue;
+            if (authenticationWindowClass(w->m_class)) return true;
+            if (w->isModal()) return true;
+            if (const auto xdg = w->m_xdgSurface.lock()) {
+                if (const auto top = xdg->m_toplevel.lock()) {
+                    if (const auto dialog = top->m_dialog.lock(); dialog && dialog->modal) return true;
+                }
+            }
             if (options.excludeInhibit && g_pInputManager->isWindowInhibiting(w, false)) return true;
             if (options.excludeFullscreen && Fullscreen::controller()->isFullscreen(w)) return true;
             for (const auto& pattern : options.excluded) if (std::regex_search(w->m_class, pattern)) return true;
@@ -224,6 +265,16 @@ Clock::time_point lastInput = Clock::now(), lastTick = lastInput, lastCapture = 
             HyprlandAPI::removeFunctionHook(pluginHandle, shareFrameHook);
             shareFrameHook = nullptr;
         }
+        if (layerHook) {
+            layerHook->unhook();
+            HyprlandAPI::removeFunctionHook(pluginHandle, layerHook);
+            layerHook = nullptr;
+        }
+        if (fadeoutsHook) {
+            fadeoutsHook->unhook();
+            HyprlandAPI::removeFunctionHook(pluginHandle, fadeoutsHook);
+            fadeoutsHook = nullptr;
+        }
         lastShareRequest = shareObservationUntil = Clock::time_point{};
         if (g_pHyprRenderer && g_pHyprRenderer->glBackend()) {
             g_pHyprRenderer->glBackend()->makeEGLCurrent();
@@ -268,6 +319,15 @@ Clock::time_point lastInput = Clock::now(), lastTick = lastInput, lastCapture = 
     }
     void start(bool preview) {
         if (!initialized || !options.enabled || active || blocked()) return;
+        // Fading layer/popup snapshots have no retained namespace/aboveLock
+        // identity. Let them finish in the normal desktop before entering.
+        for (const auto& fadeout : Desktop::fadingOutState()->fadeouts()) {
+            if (!fadeout) continue;
+            const auto plane = fadeout->plane();
+            if (plane == Desktop::FADEOUT_PLANE_LAYER_BACKGROUND || plane == Desktop::FADEOUT_PLANE_LAYER_BOTTOM ||
+                plane == Desktop::FADEOUT_PLANE_LAYER_TOP || plane == Desktop::FADEOUT_PLANE_LAYER_OVERLAY ||
+                plane == Desktop::FADEOUT_PLANE_POPUP) return;
+        }
         // Observe existing window streams for the compositor's 500 ms stop
         // timeout plus one poll. This gate does not extend ordinary idle time.
         if (options.excludeShare && Clock::now() < shareObservationUntil) return;
@@ -384,7 +444,33 @@ Clock::time_point lastInput = Clock::now(), lastTick = lastInput, lastCapture = 
             break;
         }
         if (!hook || !hook->hook()) throw std::runtime_error("renderWindow detour could not be installed");
+        for (const auto& match : HyprlandAPI::findFunctionsByName(pluginHandle, "renderLayer")) {
+            if (match.demangled.find("IHyprRenderer::renderLayer(") == std::string::npos) continue;
+            layerHook = HyprlandAPI::createFunctionHook(pluginHandle, match.address, reinterpret_cast<void*>(renderLayerHook));
+            break;
+        }
+        if (!layerHook || !layerHook->hook()) throw std::runtime_error("renderLayer detour could not be installed");
+        for (const auto& match : HyprlandAPI::findFunctionsByName(pluginHandle, "renderFadeouts")) {
+            if (match.demangled.find("IHyprRenderer::renderFadeouts(") == std::string::npos) continue;
+            fadeoutsHook = HyprlandAPI::createFunctionHook(pluginHandle, match.address, reinterpret_cast<void*>(renderFadeoutsHook));
+            break;
+        }
+        if (!fadeoutsHook || !fadeoutsHook->hook()) throw std::runtime_error("renderFadeouts detour could not be installed");
         auto& events = Event::bus()->m_events;
+        listeners.push_back(events.layer.opened.listen([this](PHLLS layer) {
+            if (active && protectedLayer(layer)) stop("interactive or protected desktop UI");
+        }));
+        listeners.push_back(events.layer.updateRules.listen([this](PHLLS layer) {
+            if (active && protectedLayer(layer)) stop("protected desktop UI rule changed");
+        }));
+        listeners.push_back(events.layer.closed.listen([this](PHLLS layer) {
+            // closed emits before m_mapped is cleared. Reset idle even when
+            // already stopped, so an authentication fadeout remains visible.
+            if (protectedLayer(layer)) stop("protected desktop UI closed");
+        }));
+        listeners.push_back(g_pSeatManager->m_events.keyboardFocusChange.listen([this] {
+            if (active && desktopInteraction()) stop("desktop UI keyboard focus");
+        }));
         listeners.push_back(events.input.keyboard.key.listen([this](IKeyboard::SKeyEvent event, Event::SCallbackInfo&) {
             lastInput = Clock::now();
             if (active && event.state == WL_KEYBOARD_KEY_STATE_PRESSED && !dedicated(event)) stop("keyboard input");
@@ -408,6 +494,9 @@ Clock::time_point lastInput = Clock::now(), lastTick = lastInput, lastCapture = 
         // The screenshare manager clears this flag on output commits. Reassert
         // before direct-scanout checks on EVERY frame, including app-driven ones.
         listeners.push_back(events.render.preChecks.listen([this](PHLMONITOR) {
+            // Also inspect current state immediately BEFORE rendering, not
+            // just the timer: a new modal/security UI must appear this frame.
+            if (active && blocked()) stop("excluded or protected UI before render");
             if (active) g_pHyprRenderer->m_directScanoutBlocked = true;
         }));
         listeners.push_back(events.render.stage.listen([this](eRenderStage stage) {
@@ -454,6 +543,24 @@ void renderWindowHook(Render::IHyprRenderer* self, PHLWINDOW window, PHLMONITOR 
     if (instance->active && !instance->capturing && !standalone && !self->m_bRenderingSnapshot &&
         std::ranges::any_of(instance->snapshots, [&](const auto& shot) { return shot.id == window->m_stableID; })) return;
     reinterpret_cast<RenderWindowFn>(instance->hook->m_original)(self, window, monitor, time, decorate, mode, ignorePosition, standalone);
+}
+
+void renderLayerHook(Render::IHyprRenderer* self, PHLLS layer, PHLMONITOR monitor, const Time::steady_tp& time, bool popups, bool lockscreen) {
+    if (instance->active && instance->options.hideDesktopUI && !instance->capturing &&
+        !self->m_bRenderingSnapshot && !lockscreen && !g_pSessionLockManager->isSessionLocked()) {
+        if (instance->protectedLayer(layer)) instance->stop("protected desktop layer");
+        else return; // Includes a layer's child surfaces and popup pass.
+    }
+    reinterpret_cast<RenderLayerFn>(instance->layerHook->m_original)(self, layer, monitor, time, popups, lockscreen);
+}
+
+void renderFadeoutsHook(Render::IHyprRenderer* self, PHLMONITOR monitor, Desktop::eFadeoutPlane plane, PHLWORKSPACE workspace) {
+    if (instance->active && instance->options.hideDesktopUI && !instance->capturing &&
+        !self->m_bRenderingSnapshot && !g_pSessionLockManager->isSessionLocked() &&
+        (plane == Desktop::FADEOUT_PLANE_LAYER_BACKGROUND || plane == Desktop::FADEOUT_PLANE_LAYER_BOTTOM ||
+         plane == Desktop::FADEOUT_PLANE_LAYER_TOP || plane == Desktop::FADEOUT_PLANE_LAYER_OVERLAY ||
+         plane == Desktop::FADEOUT_PLANE_POPUP)) return;
+    reinterpret_cast<RenderFadeoutsFn>(instance->fadeoutsHook->m_original)(self, monitor, plane, workspace);
 }
 
 UP<Screenshare::CScreenshareFrame> screenshareFrameHook(Screenshare::CScreenshareSession* session, bool overlayCursor) {
@@ -508,6 +615,7 @@ int setup(lua_State* L) {
             next.snapshotBudget = static_cast<std::size_t>(number(L, -1, "snapshot_mb", 128, 16, 512) * 1024 * 1024);
             stars = static_cast<std::size_t>(number(L, -1, "stars", 240, 0, 1024));
             background = number(L, -1, "background", 1, 0, 1);
+            next.hideDesktopUI = boolean(L, -1, "hide_desktop_ui", true);
         }
         lua_pop(L, 1);
         lua_getfield(L, 1, "exclusions");
@@ -587,6 +695,7 @@ int status(lua_State* L) {
     n("particles", instance->universe.particles().size()); n("waves", instance->universe.waves().size());
     n("gravity_mode", static_cast<std::size_t>(instance->universe.gravityMode()));
     b("alternate_region", instance->alternateRegion);
+    b("desktop_ui_hidden", instance->active && instance->options.hideDesktopUI);
     lua_newtable(L);
     int index = 1;
     for (const auto& body : instance->universe.bodies()) {
