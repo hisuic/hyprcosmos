@@ -1,0 +1,5 @@
+#pragma once
+namespace cosmic {
+inline constexpr const char* vertexShaderSource = R"COSMIC(@COSMIC_VERTEX_SHADER@)COSMIC";
+inline constexpr const char* fragmentShaderSource = R"COSMIC(@COSMIC_FRAGMENT_SHADER@)COSMIC";
+}
