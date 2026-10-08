@@ -258,7 +258,7 @@ bool CosmicRenderer::initialize() {
         glUseProgram(impl.program);
         glUniform1i(uniform("uTexture"), 0);
         if (!impl.vao || !impl.buffer) throw std::runtime_error("Could not allocate Cosmic vertex mesh");
-        impl.peerLabel = g_pHyprRenderer->renderText("OTHER UNIVERSE  /  F10", CHyprColor{0.68, 0.84, 1.0, 1.0},
+        impl.peerLabel = g_pHyprRenderer->renderText("OTHER UNIVERSE", CHyprColor{0.68, 0.84, 1.0, 1.0},
                                                    24, false, "sans-serif", 600, 600);
         return true;
     } catch (const std::exception& exception) {
@@ -487,6 +487,20 @@ void CosmicRenderer::executeDraw(PHLMONITOR monitor, const Universe& universe,
                           {palette[0], palette[1], palette[2], foreground ? 0.65F : 0.95F},
                           hole.angle, 1, 0, 0, false, 0.04F, foreground ? 0 : 1);
             }
+        }
+        for (const auto& wave : universe.waves()) {
+            if (wave.region != inset->region.id) continue;
+            const double diameter = wave.radius * 2.65 * peerScale;
+            const float alpha = std::clamp(wave.life / std::max(wave.lifetime, 0.001), 0.0, 1.0);
+            impl.quad(peerPixel(wave.position), {diameter, diameter}, 2, {1.0F, 0.65F, 0.32F, alpha},
+                      0, 1, 0, 0, false, 0.012F, 0);
+        }
+        for (const auto& particle : universe.particles()) {
+            if (particle.region != inset->region.id) continue;
+            const double diameter = particle.size * 4 * peerScale;
+            const float alpha = std::clamp(particle.life / std::max(particle.lifetime, 0.001), 0.0, 1.0);
+            const auto palette = hue(particle.hue);
+            impl.quad(peerPixel(particle.position), {diameter, diameter}, 3, {palette[0], palette[1], palette[2], alpha});
         }
         glUniform4f(impl.clip, -1, -1, monitorSize.x + 1, monitorSize.y + 1);
     }
