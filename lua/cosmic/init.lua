@@ -1,14 +1,34 @@
 -- Hyprland 0.56.2 loads configured plugins after evaluating hyprland.lua.
--- Native initialization therefore runs on config.reloaded, once per Lua state.
+-- Native initialization runs after configuration/plugin loading. At compositor
+-- startup config.reloaded may precede construction of the plugin manager.
 local Config = require("cosmic.config")
 local M = {}
 local options = Config.copy(Config.defaults)
 local initialized, stopped, warned, configuration_ready = false, false, false, false
 local last_error, plugin_path
 local subscriptions, bindings = {}, {}
+local initialization_timer, initialization_generation = nil, 0
+local initialization_attempts, plugin_requested = 0, false
 
 local function native()
     return type(hl) == "table" and type(hl.plugin) == "table" and hl.plugin.cosmic or nil
+end
+
+local function native_ready()
+    local api = native()
+    return api and type(api.setup) == "function"
+end
+
+local function cancel_initialization()
+    initialization_generation = initialization_generation + 1
+    if initialization_timer then
+        -- HL.Timer has no remove method in 0.56.2. Draining a canceled oneshot
+        -- releases its Lua registry reference; disabling it would retain that
+        -- reference until the next config reload. The generation guard below
+        -- prevents any canceled initialization from running.
+        pcall(function() initialization_timer:set_timeout(1) end)
+        initialization_timer = nil
+    end
 end
 
 local function warn(message)
@@ -47,11 +67,11 @@ local function bind_controls()
     if not options.enabled then return true end
     for action, chord in pairs(options.controls) do
         if chord then
-            local ok, binding = pcall(hl.bind, chord, function() M.action(action) end,
+            local ok, binding, bind_error = pcall(hl.bind, chord, function() M.action(action) end,
                 { description = "Cosmic: " .. action, submap_universal = true })
-            if not ok then
+            if not ok or binding == nil then
                 remove_bindings()
-                return nil, "could not register control '" .. chord .. "': " .. tostring(binding)
+                return nil, "could not register control '" .. chord .. "': " .. tostring(bind_error or binding)
             end
             bindings[#bindings + 1] = binding
         end
@@ -77,6 +97,7 @@ end
 
 local function initialize()
     if initialized or stopped then return initialized end
+    cancel_initialization()
     local ok, message = call("setup", Config.copy(options))
     if not ok then warn(message); return nil, message end
     ok, message = bind_controls()
@@ -86,14 +107,36 @@ local function initialize()
     return true
 end
 
+local function await_plugin()
+    if stopped or initialized then return end
+    if native_ready() then
+        initialize()
+        return
+    end
+    if not plugin_requested or initialization_timer then return end
+    if initialization_attempts >= 50 then
+        warn("native plugin did not become available within 5 seconds; check plugin permissions and matching Hyprland headers")
+        return
+    end
+    local generation = initialization_generation
+    initialization_timer = hl.timer(function()
+        if generation ~= initialization_generation or stopped then return end
+        initialization_timer = nil
+        initialization_attempts = initialization_attempts + 1
+        await_plugin()
+    end, { timeout = 100, type = "oneshot" })
+end
+
 local function attach()
+    initialization_attempts = 0
+    plugin_requested = false
     if type(hl) ~= "table" or type(hl.on) ~= "function" or not hl.plugin then
         warn("this module requires the Hyprland Lua configuration API")
         return false
     end
     subscriptions[#subscriptions + 1] = hl.on("config.reloaded", function()
         configuration_ready = true
-        initialize()
+        await_plugin()
     end)
     subscriptions[#subscriptions + 1] = hl.on("hyprland.shutdown", function() M.shutdown() end)
     plugin_path = resolve_plugin()
@@ -105,6 +148,7 @@ local function attach()
     file:close()
     local ok, message = pcall(hl.plugin.load, plugin_path)
     if not ok then warn(message); return false end
+    plugin_requested = true
     return true
 end
 
@@ -133,10 +177,12 @@ function M.setup(update)
                 if not ok then return nil, message end
             end
         end
-        if not initialized and configuration_ready and native() then
+        if not initialized and native_ready() then
             local ok
             ok, message = initialize()
             if not ok then return nil, message end
+        elseif configuration_ready then
+            await_plugin()
         end
     end
     return M
@@ -171,6 +217,7 @@ function M.status()
     if type(result) ~= "table" then result = { enabled = false, active = false } end
     result.available = native() ~= nil
     result.module_initialized = initialized and not stopped
+    result.initialization_pending = initialization_timer ~= nil
     if result.initialized == nil then result.initialized = false end
     result.error = last_error
     result.config = Config.copy(options)
@@ -181,6 +228,7 @@ end
 function M.shutdown()
     if stopped then return true end
     stopped = true
+    cancel_initialization()
     remove_bindings()
     for _, subscription in ipairs(subscriptions) do pcall(function() subscription:remove() end) end
     subscriptions = {}
