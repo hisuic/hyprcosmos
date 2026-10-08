@@ -500,7 +500,9 @@ int status(lua_State* L) {
 APICALL EXPORT std::string PLUGIN_API_VERSION() { return HYPRLAND_API_VERSION; }
 APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     pluginHandle = handle;
-    if (HyprlandAPI::getHyprlandVersion(handle).hash != GIT_COMMIT_HASH) throw std::runtime_error("Cosmic: Hyprland commit mismatch; rebuild with the running compositor headers");
+    if (std::string(__hyprland_api_get_hash()) != __hyprland_api_get_client_hash() ||
+        HyprlandAPI::getHyprlandVersion(handle).hash != GIT_COMMIT_HASH)
+        throw std::runtime_error("Cosmic: Hyprland ABI mismatch; rebuild with the running compositor headers");
     instance = new Cosmic();
     for (auto [name, callback] : std::initializer_list<std::pair<const char*, PLUGIN_LUA_FN>>{{"setup", setup}, {"enable", enable}, {"disable", disable}, {"shutdown", shutdown}, {"action", action}, {"status", status}}) {
         if (!HyprlandAPI::addLuaFunction(handle, "cosmic", name, callback)) {
