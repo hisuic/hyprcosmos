@@ -163,6 +163,19 @@ check(recovering.setup({ idle_timeout = 7 }) == recovering and recovery.live_bin
     recovering.status().initialized, "valid setup recovers after a native failure without a reload")
 recovering.shutdown()
 
+local reenabling, reenable = mock("success")
+reenable.fire("config.reloaded")
+reenable.fail_setup = true
+check(not reenabling.setup({ idle_timeout = 11 }), "native reconfiguration failure prepares enable recovery")
+check(not reenabling.enable() and reenable.setups == 3 and reenable.live_bindings() == 0 and
+    not reenabling.status().initialized, "enable reports a continuing native initialization failure")
+reenable.fail_setup = false
+check(reenabling.enable() and reenable.setups == 4 and reenable.live_bindings() == 7 and
+    reenabling.status().initialized and reenable.options.idle_timeout == 5,
+    "enable reinitializes accepted configuration after native failure")
+reenabling.shutdown()
+check(not reenabling.enable() and reenable.setups == 4, "enable still requires setup after full shutdown")
+
 local delayed, deferred = mock("delayed")
 deferred.fire("config.reloaded")
 deferred.fire("config.reloaded")
@@ -196,6 +209,13 @@ check(#unavailable.timers == 50 and unavailable.notifications == 1 and not timed
     "unavailable plugin reports once after fifty bounded probes and stops all scheduling")
 unavailable.fire("config.reloaded")
 check(#unavailable.timers == 50 and unavailable.notifications == 1, "the failed deadline does not create a perpetual retry timer")
+check(timed_out.enable() and timed_out.status().initialization_pending and #unavailable.timers == 51,
+    "explicit enable restarts a bounded availability attempt after its failed deadline")
+check(timed_out.enable() and #unavailable.timers == 51, "repeated enable while pending preserves one availability probe")
+unavailable.publish_native()
+unavailable.fire_timers()
+check(unavailable.setups == 1 and timed_out.status().initialized and unavailable.notifications == 1,
+    "enable retry initializes when native becomes available without duplicate failure notifications")
 timed_out.shutdown()
 
 for _, mode in ipairs({ "nil-error", "throw", "missing" }) do
@@ -204,6 +224,10 @@ for _, mode in ipairs({ "nil-error", "throw", "missing" }) do
     failure.fire("config.reloaded")
     check(not failed.status().initialized and failure.live_bindings() == 0, "failed initialization never registers consuming controls")
     check(failure.notifications == 1 and failed.status().error, "failure is explained once per module lifecycle")
+    if mode == "missing" then
+        check(not failed.enable() and #failure.timers == 0,
+            "enable reports a missing unregistered plugin without claiming success or scheduling futile probes")
+    end
     failed.shutdown()
     check(failure.live_events() == 0, "failed module can be shut down completely")
 end
