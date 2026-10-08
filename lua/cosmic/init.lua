@@ -31,7 +31,9 @@ local function call(method, ...)
     end
     local ok, result, message = pcall(api[method], ...)
     if not ok then return nil, tostring(result) end
-    if result == false then return nil, message or ("native " .. method .. " failed") end
+    if result == false or (result == nil and message ~= nil) then
+        return nil, message or ("native " .. method .. " failed")
+    end
     return result == nil and true or result, message
 end
 
@@ -65,7 +67,9 @@ local function resolve_plugin()
     end
     if module_file then
         local directory = module_file:match("^(.*)/init%.lua$")
-        if directory then return directory .. "/../cosmic.so" end
+        -- Remove the final component lexically. Using cosmic/../ would follow
+        -- the module symlink first and incorrectly resolve inside the checkout.
+        if directory then return (directory:match("^(.*)/[^/]+$") or ".") .. "/cosmic.so" end
     end
     local config_home = os.getenv("XDG_CONFIG_HOME") or ((os.getenv("HOME") or "") .. "/.config")
     return config_home .. "/hypr/cosmic.so"
@@ -119,7 +123,11 @@ function M.setup(update)
         options = validated
         if stopped then
             stopped = false
-            attach()
+            if attach() and native() then
+                local ok
+                ok, message = initialize()
+                if not ok then return nil, message end
+            end
         elseif options.plugin_path ~= previous_path and type(hl) == "table" and hl.plugin then
             plugin_path = resolve_plugin()
             local file = io.open(plugin_path, "rb")
@@ -157,7 +165,8 @@ function M.status()
     local result = initialized and not stopped and call("status") or nil
     if type(result) ~= "table" then result = { enabled = false, active = false } end
     result.available = native() ~= nil
-    result.initialized = initialized and not stopped
+    result.module_initialized = initialized and not stopped
+    if result.initialized == nil then result.initialized = false end
     result.error = last_error
     result.config = Config.copy(options)
     result.plugin_path = plugin_path
