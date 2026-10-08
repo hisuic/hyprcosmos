@@ -69,7 +69,7 @@ Luaの設定変更だけなら通常の `hyprctl reload` で反映できます�
 | F7 | 表示中の形状でカーソル下を選び、固定中心へ吸い込む |
 | F8 | 有限長の演出履歴を逆再生／通常再生 |
 | F9 | カーソル位置で超新星のデモ |
-| F10 | 現在のモニターの通常領域／別の仮想領域を鑑賞 |
+| F10 | 各モニターの通常領域／別の仮想領域を鑑賞 |
 | F11 | 手動プレビュー開始／終了 |
 | F12 | 緊急解除 |
 
@@ -127,7 +127,7 @@ cosmic.setup(cosmic.preset("demo"))
 状態と操作をターミナルから確認:
 
 ```sh
-hyprctl repl 'return require("cosmic").status()'
+hyprctl repl 'local s=require("cosmic").status(); for _,k in ipairs({"enabled","initialized","active","bodies","stored","history_frames","snapshot_bytes"}) do print(k.."="..tostring(s[k])) end'
 hyprctl eval 'require("cosmic").disable()'
 hyprctl eval 'require("cosmic").enable()'
 hyprctl eval 'require("cosmic").shutdown()'
