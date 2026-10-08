@@ -63,6 +63,31 @@ check(Config.normalize({ history_hz = 60 }).history_hz == 60 and
 local default_sky = assert(Config.normalize())
 check(default_sky.rendering.background == 1 and default_sky.rendering.stars == 240,
     "default cosmic sky fully covers the wallpaper with 240 ASCII stars")
+check(default_sky.rendering.hide_desktop_ui == true and Config.defaults.rendering.hide_desktop_ui == true,
+    "cosmic hides ordinary desktop layer UI by default")
+for _, hidden in ipairs({ false, true }) do
+    local sky = assert(Config.normalize({ rendering = { hide_desktop_ui = hidden } }))
+    check(sky.rendering.hide_desktop_ui == hidden, "desktop UI visibility retains either explicit boolean value")
+end
+local visible_ui = assert(Config.normalize({ rendering = { hide_desktop_ui = false } }))
+local partial_ui = assert(Config.normalize({ rendering = { stars = 127 }, idle_timeout = 23 }, visible_ui))
+check(partial_ui.rendering.hide_desktop_ui == false and partial_ui.rendering.stars == 127 and
+    partial_ui.idle_timeout == 23 and visible_ui.rendering.stars == 240,
+    "partial setup preserves desktop UI visibility without mutating previous options")
+for _, invalid in ipairs({ 0, 1, "false", "true", {}, function() end }) do
+    local sky, message = Config.normalize({ rendering = { hide_desktop_ui = invalid } }, visible_ui)
+    check(sky == nil and type(message) == "string" and message:find("rendering.hide_desktop_ui", 1, true),
+        "non-boolean desktop UI visibility is rejected with its configuration path")
+    check(visible_ui.rendering.hide_desktop_ui == false,
+        "invalid desktop UI visibility does not mutate the accepted rendering options")
+end
+local demo_ui = assert(Config.normalize({ preset = "demo" }, visible_ui))
+local explicit_demo_ui = assert(Config.normalize({ preset = "demo",
+    rendering = { hide_desktop_ui = false } }, visible_ui))
+local calm_ui = assert(Config.normalize({ preset = "calm" }, explicit_demo_ui))
+check(demo_ui.rendering.hide_desktop_ui == true and explicit_demo_ui.rendering.hide_desktop_ui == false and
+    calm_ui.rendering.hide_desktop_ui == true,
+    "preset changes reset desktop UI visibility while honoring explicit rendering overrides")
 for _, opacity in ipairs({ 0, 0.375, 1 }) do
     local sky = assert(Config.normalize({ rendering = { background = opacity } }))
     check(sky.rendering.background == opacity, "background opacity retains accepted values including both boundaries")
@@ -197,6 +222,11 @@ check(state.setups == 1 and state.options.idle_timeout == 6, "recursive plugin r
 check(state.live_bindings() == 7 and state.live_events() == 2, "one set of controls and event ownership")
 check(cosmic.setup({ effects = { wormholes = false }, controls = { supernova = false } }) == cosmic, "setup updates native options")
 check(state.live_bindings() == 6 and state.setups == 2, "setup replaces bindings without duplication")
+check(state.options.rendering.hide_desktop_ui == true,
+    "native setup receives the default desktop UI suppression option")
+check(cosmic.setup({ rendering = { hide_desktop_ui = false } }) == cosmic and
+    state.options.rendering.hide_desktop_ui == false and not cosmic.status().config.rendering.hide_desktop_ui,
+    "desktop UI visibility reconfiguration reaches native setup and module status")
 local count = state.setups
 local ok, message = cosmic.setup({ idle_timeout = -5 })
 check(not ok and message and state.setups == count and cosmic.status().config.idle_timeout == 6, "invalid update never reaches native code")
@@ -210,7 +240,7 @@ check(not cosmic.action("invalid"), "unknown actions are rejected")
 check(cosmic.shutdown() and cosmic.shutdown(), "shutdown is repeatable")
 check(state.shutdown == 1 and state.live_bindings() == 0 and state.live_events() == 0, "shutdown releases all Lua ownership once")
 check(not cosmic.enable(), "enable after full shutdown requires setup")
-check(cosmic.setup({ enabled = false }) == cosmic and state.setups == 3 and state.live_bindings() == 0, "setup restarts ownership after shutdown without enabling consuming controls")
+check(cosmic.setup({ enabled = false }) == cosmic and state.setups == 4 and state.live_bindings() == 0, "setup restarts ownership after shutdown without enabling consuming controls")
 state.fire("hyprland.shutdown")
 check(state.live_bindings() == 0 and state.live_events() == 0 and cosmic.status().input_watchers == 0, "compositor shutdown cleans module ownership and exposes native counters")
 
