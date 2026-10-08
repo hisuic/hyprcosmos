@@ -31,8 +31,10 @@ client_b=""
 client_c=""
 held_input=""
 share_pid=""
+capture_child=""
+capture_jobs=()
 cleanup() {
-    for pid in "$share_pid" "$held_input" "$client_a" "$client_b" "$client_c" "$compositor_pid"; do
+    for pid in "$capture_child" "${capture_jobs[@]}" "$share_pid" "$held_input" "$client_a" "$client_b" "$client_c" "$compositor_pid"; do
         if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then kill -TERM "$pid" 2>/dev/null || true; fi
     done
     if [[ -n "$native_socket" && -L "$XDG_RUNTIME_DIR/$socket" && $(readlink -- "$XDG_RUNTIME_DIR/$socket") == "$native_socket" ]]; then
@@ -105,7 +107,7 @@ eval_lua() {
     fi
     [[ "$result" == ok ]] || { printf 'Lua check failed: %s\n%s\n' "$1" "$result" >&2; exit 1; }
 }
-status() { ctl repl 'local s=require("cosmic").status(); for _,k in ipairs({"enabled","initialized","active","bodies","stored","snapshots","snapshot_bytes","history_frames","physics_steps","last_reason"}) do print(k .. "=" .. tostring(s[k])) end'; }
+status() { ctl repl 'local s=require("cosmic").status(); for _,k in ipairs({"enabled","initialized","active","bodies","stored","snapshots","snapshot_bytes","history_frames","physics_steps","last_reason"}) do print(k .. "=" .. tostring(s[k])) end; for _,b in ipairs(s.objects or {}) do print(string.format("object id=%s x=%.4f y=%.4f angle=%.4f scale=%.6f stretch=%.4f twist=%.4f sink=%.6f stored=%s",tostring(b.id),b.x,b.y,b.angle,b.scale,b.stretch,b.twist,b.sink_progress,tostring(b.stored))) end'; }
 wait_active() {
     for ((attempt=0; attempt<60; ++attempt)); do
         if [[ $(ctl eval 'assert(require("cosmic").status().active)') == ok ]]; then return; fi
@@ -151,8 +153,22 @@ stop_window_share() {
 }
 capture() {
     if command -v grim >/dev/null; then
-        env -u HYPRLAND_INSTANCE_SIGNATURE WAYLAND_DISPLAY="$socket" grim "$output/$1.png" || true
+        # Screenshot delivery is not instantaneous. The actual image lies
+        # within this interval, not necessarily at the requested sample time.
+        printf 'capture_before_monotonic=%s\n' "$(awk '{print $1}' /proc/uptime)" > "$output/$1.capture.txt"
+        status >> "$output/$1.capture.txt"
+        env -u HYPRLAND_INSTANCE_SIGNATURE WAYLAND_DISPLAY="$socket" grim "$output/$1.png" &
+        capture_child=$!
+        wait "$capture_child" || true
+        capture_child=""
+        printf 'capture_after_monotonic=%s\n' "$(awk '{print $1}' /proc/uptime)" >> "$output/$1.capture.txt"
+        status >> "$output/$1.capture.txt"
     fi
+}
+wait_sink_time() {
+    local remaining
+    remaining=$(awk -v origin="$sink_started" -v desired="$1" '{d=desired-($1-origin); printf "%.3f\n", (d>0?d:0)}' /proc/uptime)
+    sleep "$remaining"
 }
 measure_cpu() {
     local mode=$1 duration=$2 before after start end ticks
@@ -285,21 +301,48 @@ eval_lua 'require("cosmic").action("rewind"); assert(require("cosmic").status().
 sleep 0.2
 capture rewind
 
-# A controlled native sink exercises real GL stretching/twisting and virtual
-# storage, followed by replay of the same living application imagery.
-eval_lua 'require("cosmic").setup({enabled=true, physics={sink_duration=1.2}, effects={cursor_gravity=false,orbit=false,binary=false,collisions=false,wormholes=false,supernova=false,expansion=false}})'
+# A real F7 tests the default-duration take-in motion, intermediate scales and
+# deformation, virtual storage, and replay of the same living app imagery.
+# Other forces are disabled so the measured motion comes from the sink itself.
+eval_lua 'require("cosmic").setup({enabled=true, effects={cursor_gravity=false,orbit=false,binary=false,collisions=false,wormholes=false,supernova=false,expansion=false}})'
 wait_active
 sleep 0.5
 read -r body_x body_y <<< "$(ctl repl 'local s=require("cosmic").status(); for _,b in ipairs(s.objects) do if b.region<1000000 then print(math.floor(b.x).." "..math.floor(b.y)); break end end')"
 read -r extent_x extent_y <<< "$(monitor_extents)"
 [[ "$body_x" =~ ^[0-9]+$ && "$body_y" =~ ^[0-9]+$ ]] || { printf 'Could not resolve a virtual sink target.\n' >&2; exit 1; }
 probe move "$body_x" "$body_y" "$extent_x" "$extent_y"
-eval_lua 'require("cosmic").action("black_hole"); local s=require("cosmic").status(); local found=false; for _,b in ipairs(s.objects) do found=found or b.sink_progress>0 end; assert(s.active and found)'
-sleep 0.65
-eval_lua 'local s=require("cosmic").status(); local found=false; for _,b in ipairs(s.objects) do found=found or (b.stretch>1.5 and b.twist>0 and b.scale<0.42) end; assert(s.active and found)'
-capture black-hole
-sleep 0.85
-eval_lua 'assert(require("cosmic").status().stored>=1)'
+eval_lua '_cosmic_sink_origins={}; for _,b in ipairs(require("cosmic").status().objects) do _cosmic_sink_origins[b.id]={x=b.x,y=b.y,scale=b.scale} end'
+probe key 65
+sink_started=$(awk '{print $1}' /proc/uptime)
+eval_lua 'local s=require("cosmic").status(); local found=false; for _,b in ipairs(s.objects) do if b.sink_progress>0 and not b.stored then _cosmic_sink_target=b.id; _cosmic_sink_previous_scale=b.scale; found=true end end; assert(s.active and found, "real F7 did not start a native sink")'
+status > "$output/black-hole-start.txt"
+for sample in 0.1 0.5 1.0 1.5 2.0; do
+    (
+        # Own only this capture subprocess; never run the main session cleanup
+        # from a background worker or leave a sharing client after interruption.
+        trap 'if [[ -n "$capture_child" ]]; then kill -TERM "$capture_child" 2>/dev/null || true; fi' EXIT
+        trap 'exit 130' INT TERM
+        wait_sink_time "$sample"
+        capture "black-hole-$sample"
+    ) &
+    capture_jobs+=("$!")
+done
+wait_sink_time 0.20
+eval_lua 'local s=require("cosmic").status(); local found=false; for _,b in ipairs(s.objects) do if b.id==_cosmic_sink_target then assert(not b.stored and b.sink_progress>0 and b.sink_progress<0.5); assert(b.scale>_cosmic_sink_origins[b.id].scale*0.8, "sink image shrank too early"); _cosmic_sink_previous_scale=b.scale; found=true end end; assert(s.active and found)'
+status > "$output/black-hole-early-status.txt"
+wait_sink_time 0.75
+eval_lua 'local s=require("cosmic").status(); local found=false; for _,b in ipairs(s.objects) do if b.id==_cosmic_sink_target then local o=_cosmic_sink_origins[b.id]; assert(not b.stored and b.scale>0 and b.scale<=_cosmic_sink_previous_scale); assert((b.x-o.x)^2+(b.y-o.y)^2>9, "centered sink did not visibly move"); _cosmic_sink_previous_scale=b.scale; found=true end end; assert(s.active and found)'
+status > "$output/black-hole-motion-status.txt"
+wait_sink_time 1.40
+eval_lua 'local s=require("cosmic").status(); local found=false; for _,b in ipairs(s.objects) do if b.id==_cosmic_sink_target then assert(not b.stored and b.scale>0 and b.scale<_cosmic_sink_previous_scale and b.stretch>1.5 and b.twist>0, "missing intermediate shrinking/deformation"); _cosmic_sink_previous_scale=b.scale; found=true end end; assert(s.active and found)'
+status > "$output/black-hole-middle-status.txt"
+wait_sink_time 2.05
+eval_lua 'local s=require("cosmic").status(); local found=false; for _,b in ipairs(s.objects) do if b.id==_cosmic_sink_target then assert(not b.stored and b.scale>0 and b.scale<_cosmic_sink_previous_scale); found=true end end; assert(s.active and found)'
+status > "$output/black-hole-late-status.txt"
+for capture_job in "${capture_jobs[@]}"; do wait "$capture_job"; done
+capture_jobs=()
+wait_sink_time 3.20
+eval_lua 'local s=require("cosmic").status(); local found=false; for _,b in ipairs(s.objects) do if b.id==_cosmic_sink_target then assert(b.stored and b.scale==0); found=true end end; assert(s.active and found)'
 capture stored
 status > "$output/stored-status.txt"
 eval_lua 'require("cosmic").action("rewind"); assert(require("cosmic").status().rewinding)'
