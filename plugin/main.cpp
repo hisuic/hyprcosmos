@@ -14,6 +14,7 @@
 #include <linux/input-event-codes.h>
 #include <algorithm>
 #include <chrono>
+#include <ctime>
 #include <cmath>
 #include <regex>
 #include <stdexcept>
@@ -75,9 +76,16 @@ class Cosmic {
     bool notified = false;
     std::unordered_set<std::string> shares;
     std::string reason = "not initialized";
-    Clock::time_point lastInput = Clock::now(), lastTick = lastInput, lastCapture = lastInput;
+Clock::time_point lastInput = Clock::now(), lastTick = lastInput, lastCapture = lastInput;
     std::size_t refreshIndex = 0, snapshotBytes = 0;
     uint64_t physicsSteps = 0;
+    double lastBootTime = bootTime();
+
+    static double bootTime() {
+        timespec time{};
+        clock_gettime(CLOCK_BOOTTIME, &time);
+        return static_cast<double>(time.tv_sec) + time.tv_nsec / 1e9;
+    }
 
     Cosmic() {
         // This listener alone survives shutdown, so removing require on reload
@@ -187,10 +195,10 @@ class Cosmic {
         const auto bytes = static_cast<std::size_t>(monitor->m_pixelSize.x * monitor->m_pixelSize.y * 4);
         if (snapshotBytes + bytes > options.snapshotBudget) return false;
         capturing = true;
+        struct CaptureGuard { bool& flag; ~CaptureGuard() { flag = false; } } guard{capturing};
         // makeSnapshotFB is deliberately outside a render-stage callback: it
         // starts/ends its own fake pass and would corrupt a nested render pass.
         auto framebuffer = g_pHyprRenderer->makeSnapshotFB(window);
-        capturing = false;
         if (!framebuffer || !framebuffer->isAllocated()) return false;
         result.id = window->m_stableID;
         result.window = window;
@@ -286,8 +294,13 @@ class Cosmic {
         auto now = Clock::now();
         const double elapsed = std::chrono::duration<double>(now - lastTick).count();
         lastTick = now;
+        const double boot = bootTime();
+        const double bootElapsed = boot - lastBootTime;
+        lastBootTime = boot;
         if (!options.enabled) return;
-        if (elapsed > 1.0) { stop("resume or long pause"); return; }
+        // CLOCK_MONOTONIC excludes suspend on Linux. CLOCK_BOOTTIME lets us
+        // detect resume without feeding suspend time into the simulation.
+        if (elapsed > 1.0 || bootElapsed - elapsed > .5) { stop("resume or long pause"); return; }
         if (blocked()) { if (active) stop("excluded, locked or display off"); lastInput = now; return; }
         if (!active) {
             if (std::chrono::duration<double>(now - lastInput).count() >= options.idleTimeout && !held()) start(false);
@@ -342,11 +355,13 @@ class Cosmic {
             catch (const std::exception& error) { fail(error.what()); }
         }));
         timer = makeShared<CEventLoopTimer>(std::chrono::milliseconds(250), [this](SP<CEventLoopTimer> self, void*) {
-            tick();
+            try { tick(); }
+            catch (const std::exception& error) { fail(error.what()); }
             if (initialized) self->updateTimeout(std::chrono::milliseconds(active ? static_cast<int>(1000.0 / options.fps) : 250));
         }, nullptr);
         g_pEventLoopManager->addTimer(timer);
         lastInput = lastTick = Clock::now();
+        lastBootTime = bootTime();
         initialized = true;
         reason = "waiting for idle";
     }
