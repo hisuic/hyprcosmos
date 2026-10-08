@@ -18,7 +18,7 @@ hl.config({
 -- Cosmic module below. The script removes only this section for lifecycle tests.
 require("cosmic").setup({
     enabled = false,
-    -- Deliberately omit idle_timeout: the test verifies the public 20 s default.
+    -- Deliberately omit idle_timeout: the test verifies the public 60 s default.
     fps = 30,
     snapshot_hz = 4,
     -- The test's screenshots are real screencopy sessions. Live defaults remain
