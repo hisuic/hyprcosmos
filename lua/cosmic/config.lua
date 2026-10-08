@@ -29,8 +29,13 @@ M.defaults = {
         classes = { "^steam_app_", "^steam$", "^gamescope$", "^mpv$" },
     },
     -- Cosmic replaces the wallpaper only while active. Explicit values below
-    -- one opt back into transparency; zero stars also disables meteors.
-    rendering = { particles = 96, stars = 240, background = 1, snapshot_mb = 128 },
+    -- one opt back into transparency; zero stars also disables meteors. Ordinary
+    -- desktop layer-shell UI is hidden without changing its process or layout;
+    -- lock screens and other protected surfaces remain visible.
+    rendering = {
+        particles = 96, stars = 240, background = 1, snapshot_mb = 128,
+        hide_desktop_ui = true,
+    },
     -- Dedicated keys avoid modifier preambles: ordinary modifier presses must
     -- restore immediately, including modifiers used by input methods.
     controls = {
