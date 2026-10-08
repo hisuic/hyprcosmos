@@ -508,10 +508,10 @@ probe key 68
 # for only one native tick before forward playback enters again. IPC polling
 # can miss that 33ms state. Observe it inside the isolated compositor without
 # changing the simulation, and retain the actual observed result for assertions.
-eval_lua '_cosmic_portal_reverse_complete=false; _cosmic_portal_reverse_observed=nil; local observer; local attempts=0; observer=hl.timer(function() attempts=attempts+1; local s=require("cosmic").status(); for _,b in ipairs(s.objects) do if b.id==_cosmic_portal_target and s.active and b.portal_progress==0 and b.region==_cosmic_portal_source then _cosmic_portal_reverse_complete=true; _cosmic_portal_reverse_observed={id=b.id,region=b.region,progress=b.portal_progress,stored=b.stored,scale=b.scale}; return end end; if s.active and attempts<6000 then observer:set_timeout(1) end end,{timeout=1,type="oneshot"}); require("cosmic").action("rewind"); assert(require("cosmic").status().rewinding)'
+eval_lua '_cosmic_portal_reverse_complete=false; _cosmic_portal_reverse_observed=nil; local observer; local attempts=0; observer=hl.timer(function() attempts=attempts+1; local s=require("cosmic").status(); for _,b in ipairs(s.objects) do if b.id==_cosmic_portal_target and s.active and b.portal_progress==0 and b.region==_cosmic_portal_source then _cosmic_portal_reverse_complete=true; _cosmic_portal_reverse_observed={id=b.id,region=b.region,progress=b.portal_progress,stored=b.stored,scale=b.scale}; observer:set_enabled(false); return end end; if not s.active or attempts>=6000 then observer:set_enabled(false) end end,{timeout=1,type="repeat"}); require("cosmic").action("rewind"); assert(require("cosmic").status().rewinding)'
 wait_portal 'b.portal_progress>0 and b.region==_cosmic_portal_source'
 capture portal-rewind-source
-wait_portal '_cosmic_portal_reverse_complete or (b.portal_progress==0 and b.region==_cosmic_portal_source)'
+wait_portal '_cosmic_portal_reverse_complete'
 eval_lua 'local b=_cosmic_portal_reverse_observed; assert(_cosmic_portal_reverse_complete and b and b.id==_cosmic_portal_target and b.region==_cosmic_portal_source and b.progress==0 and not b.stored and b.scale>0)'
 ctl repl 'local b=_cosmic_portal_reverse_observed; print(string.format("Observed native reverse boundary: id=%s region=%s progress=%s stored=%s scale=%.6f",b.id,b.region,b.progress,tostring(b.stored),b.scale))' > "$output/portal-reverse-boundary.txt"
 probe key 30
