@@ -1,0 +1,298 @@
+#include "physics.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
+#include <iostream>
+#include <limits>
+#include <string_view>
+
+using namespace cosmic;
+
+namespace {
+int assertions = 0;
+
+void check(bool condition, std::string_view description) {
+    ++assertions;
+    if (!condition) {
+        std::cerr << "FAILED: " << description << '\n';
+        std::exit(EXIT_FAILURE);
+    }
+}
+bool close(double a, double b, double epsilon = 1e-7) { return std::abs(a - b) <= epsilon; }
+double magnitude(Vec2 value) { return std::hypot(value.x, value.y); }
+Body body(uint64_t id, Vec2 position, Vec2 velocity = {}) {
+    Body result;
+    result.id = id;
+    result.position = position;
+    result.velocity = velocity;
+    result.width = 160.0;
+    result.height = 100.0;
+    return result;
+}
+Config inert() {
+    Config config;
+    config.cursor_gravity = config.orbit = config.binary = config.collisions = false;
+    config.expansion = config.wormholes = false;
+    config.damping = 0.0;
+    return config;
+}
+void advance(Universe& universe, double seconds, Vec2 cursor = {960.0, 540.0}) {
+    const int frames = static_cast<int>(std::ceil(seconds * 120.0));
+    for (int index = 0; index < frames; ++index)
+        universe.step(1.0 / 120.0, cursor);
+}
+void checkFinite(const Universe& universe) {
+    for (const auto& current : universe.bodies()) {
+        check(std::isfinite(current.position.x) && std::isfinite(current.position.y), "positions remain finite");
+        check(std::isfinite(current.velocity.x) && std::isfinite(current.velocity.y), "velocities remain finite");
+        check(std::isfinite(current.angle) && std::isfinite(current.scale) && std::isfinite(current.stretch) &&
+              std::isfinite(current.twist), "render transforms remain finite");
+        check(magnitude(current.velocity) <= universe.config().max_speed + 1e-6, "speed cap enforced");
+    }
+    for (const auto& camera : universe.cameras())
+        check(std::isfinite(camera.zoom) && camera.zoom >= 0.02 && camera.zoom <= 1.0, "camera zoom finite and bounded");
+    check(universe.bodies().size() <= universe.config().max_bodies, "body cap enforced");
+    check(universe.particles().size() <= universe.config().max_particles, "particle cap enforced");
+    check(universe.waves().size() <= 16, "wave cap enforced");
+    check(universe.historyFrames() <= universe.historyLimit(), "history cap enforced");
+}
+
+void fixedStepAndDeterminism() {
+    auto config = inert();
+    Universe first(config), second(config);
+    first.reset({body(1, {500.0, 400.0}, {30.0, 10.0})}, {Region{}}, {960.0, 540.0});
+    second.reset({body(1, {500.0, 400.0}, {30.0, 10.0})}, {Region{}}, {960.0, 540.0});
+    for (int index = 0; index < 120; ++index)
+        first.step(1.0 / 120.0, {});
+    for (int index = 0; index < 60; ++index)
+        second.step(1.0 / 60.0, {});
+    check(close(first.bodies()[0].position.x, 530.0), "constant velocity uses supplied monotonic time");
+    check(close(first.bodies()[0].position.x, second.bodies()[0].position.x), "fixed-step frame-rate independence");
+    check(close(first.bodies()[0].angle, second.bodies()[0].angle), "seeded rotations reproducible");
+    const Vec2 before = first.bodies()[0].position;
+    first.step(86400.0, {});
+    check(magnitude(first.bodies()[0].position - before) < 3.0, "day-long stall discards huge integration interval");
+    const Vec2 after = first.bodies()[0].position;
+    first.step(std::numeric_limits<double>::quiet_NaN(), {});
+    first.step(-10.0, {});
+    check(close(after.x, first.bodies()[0].position.x), "invalid and backwards deltas ignored");
+}
+
+void orbitsAndBinary() {
+    auto config = inert();
+    config.cursor_gravity = config.orbit = true;
+    Universe universe(config);
+    const Vec2 center{960.0, 540.0};
+    universe.reset({body(1, {1200.0, 540.0})}, {Region{}}, center, 1);
+    const auto initial = universe.bodies()[0];
+    check(initial.velocity.y > 0.0 && close(initial.velocity.x, 0.0), "orbit seeds tangential velocity");
+    check(initial.mass > 1.0, "last focused body has greater mass");
+    advance(universe, 60.0, center);
+    const double distance = magnitude(universe.bodies()[0].position - center);
+    check(distance > 100.0 && distance < 600.0, "cursor orbit remains bounded over a minute");
+    const Vec2 velocity_before = universe.bodies()[0].velocity;
+    advance(universe, 1.0, {1300.0, 900.0});
+    check(magnitude(universe.bodies()[0].velocity - velocity_before) > 1.0, "moving cursor perturbs gravity");
+
+    config = inert();
+    config.binary = true;
+    config.collisions = false;
+    universe.configure(config);
+    Body heavy = body(2, {900.0, 540.0});
+    heavy.mass = 4.0;
+    universe.reset({body(1, {1000.0, 540.0}), heavy}, {Region{}}, center);
+    universe.setBinaryPreset();
+    check(universe.gravityMode() == GravityMode::Binary, "binary preset selects mutual gravity");
+    const auto first = universe.bodies()[0], second = universe.bodies()[1];
+    const Vec2 initial_center = (first.position * first.mass + second.position * second.mass) / (first.mass + second.mass);
+    const Vec2 initial_momentum = first.velocity * first.mass + second.velocity * second.mass;
+    check(magnitude(initial_momentum) < 1e-9, "binary initial momentum balances masses");
+    advance(universe, 25.0);
+    const auto a = universe.bodies()[0], b = universe.bodies()[1];
+    const Vec2 final_center = (a.position * a.mass + b.position * b.mass) / (a.mass + b.mass);
+    check(magnitude(final_center - initial_center) < 1e-6, "binary conserves common barycenter");
+    check(magnitude(a.position - b.position) > 100.0, "binary does not collapse into coincident bodies");
+    const Vec2 before_third = a.velocity;
+    check(universe.addBody(body(3, a.position + Vec2{50.0, 0.0}, {20.0, 0.0}), false), "third body can join ongoing simulation");
+    advance(universe, 0.5);
+    check(magnitude(universe.bodies()[0].velocity - before_third) > 0.1, "third body changes orbit");
+}
+
+void collisionAndBoundary() {
+    auto config = inert();
+    config.collisions = true;
+    config.collision_strength = 1.0;
+    config.restitution = 0.8;
+    Universe universe(config);
+    Body a = body(1, {940.0, 540.0}, {40.0, 0.0});
+    Body b = body(2, {970.0, 540.0}, {-40.0, 0.0});
+    universe.reset({a, b}, {Region{}}, {960.0, 540.0});
+    universe.step(1.0 / 120.0, {});
+    check(universe.bodies()[0].velocity.x < 0.0 && universe.bodies()[1].velocity.x > 0.0, "colliding bodies rebound");
+    check(close(universe.bodies()[0].velocity.x + universe.bodies()[1].velocity.x, 0.0), "equal-mass collision preserves momentum");
+    universe.reset({body(1, {1900.0, 540.0}, {100.0, 0.0})}, {Region{}}, {});
+    universe.step(1.0 / 120.0, {});
+    check(universe.bodies()[0].velocity.x < 0.0, "virtual boundary reflects outward velocity");
+}
+
+void wormholesAndRegions() {
+    auto config = inert();
+    config.wormholes = true;
+    Universe universe(config);
+    Region main{42, 0.0, 0.0, 1920.0, 1080.0};
+    Region alternate{1000042, 0.0, 0.0, 1920.0, 1080.0};
+    universe.reset({}, {main, alternate}, {});
+    const auto entrance = universe.wormholes().front();
+    const auto exit = universe.wormholes()[entrance.partner];
+    Body traveler = body(1, entrance.position, {120.0, 20.0});
+    traveler.region = main.id;
+    universe.reset({traveler}, {main, alternate}, {});
+    universe.step(1.0 / 120.0, {});
+    const auto transferred = universe.bodies()[0];
+    check(transferred.region == alternate.id, "portal changes virtual region with arbitrary region id");
+    check(close(magnitude(transferred.velocity), magnitude(traveler.velocity)), "portal preserves speed");
+    check(transferred.cooldown > 1.9, "portal sets repeat-transfer cooldown");
+    check(magnitude(transferred.position - exit.position) > exit.radius, "exit emerges outside portal mouth");
+    advance(universe, 0.5);
+    check(universe.bodies()[0].region == alternate.id, "cooldown prevents immediate round trip");
+    const auto screen = universe.worldToScreen(universe.bodies()[0].position, alternate.id);
+    check(universe.hitTest(screen, main.id) == 0, "hidden virtual region cannot be selected");
+    check(universe.hitTest(screen, alternate.id) == 1, "visible alternate region can be selected");
+    const Vec2 world = universe.screenToWorld(screen, alternate.id);
+    check(magnitude(world - universe.bodies()[0].position) < 1e-7, "camera mappings invert across virtual region");
+}
+
+void blackHoleAndLivingHistory() {
+    auto config = inert();
+    config.history_seconds = 8.0;
+    Universe universe(config);
+    Body target = body(1, {960.0, 540.0}, {20.0, 0.0});
+    target.width = 400.0;
+    target.height = 200.0;
+    target.angle = 1.0;
+    universe.reset({target, body(2, {1300.0, 700.0}, {30.0, 0.0})}, {Region{}}, {960.0, 540.0});
+    check(universe.hitTest({960.0, 540.0}) == 1, "rotated visual body is selectable at its center");
+    check(!universe.startBlackHole({20.0, 20.0}), "empty display point does not choose real window coordinates");
+    check(universe.startBlackHole({960.0, 540.0}), "black hole starts for selected body");
+    const double initial_scale = universe.bodies()[0].scale;
+    advance(universe, 1.0, {1800.0, 1000.0});
+    const auto falling = universe.bodies()[0];
+    check(close(falling.sink_center.x, 960.0) && close(falling.sink_center.y, 540.0), "sink origin remains fixed while cursor moves");
+    check(falling.scale < initial_scale && falling.stretch > 1.0 && falling.twist > 0.0, "sink shrinks and deforms whole texture");
+    advance(universe, 2.0);
+    check(universe.bodies()[0].stored && close(universe.bodies()[0].scale, 0.0), "completed sink virtually stores body");
+    universe.removeBody(2);
+    check(universe.addBody(body(3, {500.0, 300.0}, {10.0, 0.0}), false), "new body remains live across history replay");
+    universe.setRewinding(true);
+    check(universe.rewinding(), "history enables reverse playback");
+    for (int index = 0; index < 400 && universe.rewinding(); ++index) {
+        universe.step(1.0 / 60.0, {});
+        check(std::none_of(universe.bodies().begin(), universe.bodies().end(), [](const Body& current) { return current.id == 2; }),
+              "closed application is never resurrected");
+    }
+    check(!universe.bodies()[0].stored && close(universe.bodies()[0].scale, initial_scale), "rewind restores living stored window");
+    check(close(universe.bodies()[0].sink_progress, 0.0), "rewind restores pre-sink deformation state");
+    check(universe.bodies().size() == 2 && universe.bodies()[1].id == 3, "rewind preserves actual live application set");
+    check(!universe.rewinding(), "reverse playback stops at finite history boundary");
+}
+
+void supernovaAndCaps() {
+    auto config = inert();
+    config.max_bodies = 3;
+    config.max_particles = 80;
+    config.history_seconds = 0.5;
+    Universe universe(config);
+    universe.reset({body(1, {700.0, 540.0}, {-10.0, 0.0}), body(2, {1200.0, 540.0}, {10.0, 0.0})}, {Region{}}, {});
+    const double before = universe.bodies()[0].velocity.x;
+    universe.supernova({960.0, 540.0});
+    check(universe.bodies()[0].velocity.x < before, "supernova impulse points away from source");
+    check(!universe.particles().empty() && !universe.waves().empty(), "supernova emits visible particles and wave");
+    check(universe.addBody(body(3, {960.0, 540.0})), "real new window emits supernova");
+    check(!universe.addBody(body(4, {960.0, 540.0})), "body cap rejects additional target");
+    check(!universe.addBody(body(1, {960.0, 540.0})), "duplicate live ids rejected");
+    for (int index = 0; index < 100; ++index)
+        universe.supernova({960.0, 540.0});
+    checkFinite(universe);
+    advance(universe, 5.0);
+    check(universe.particles().empty() && universe.waves().empty(), "transient emissions expire without unbounded retention");
+    check(universe.historyFrames() <= 16, "short history remains a finite ring");
+    config.rewind = false;
+    universe.configure(config);
+    check(universe.historyFrames() == 0, "disabling rewind releases history");
+}
+
+void expansionAndStress() {
+    auto config = inert();
+    config.expansion = true;
+    config.expansion_rate = 0.1;
+    Universe universe(config);
+    universe.reset({body(1, {700.0, 540.0}, {-10.0, 0.0}), body(2, {1200.0, 540.0}, {10.0, 0.0})}, {Region{}}, {});
+    const double before = magnitude(universe.bodies()[1].position - universe.bodies()[0].position);
+    advance(universe, 30.0);
+    const double after = magnitude(universe.bodies()[1].position - universe.bodies()[0].position);
+    check(after > before * 2.0, "expansion grows virtual body separation");
+    check(universe.cameras().front().zoom < 0.9, "expansion camera zooms out to keep bodies observable");
+    for (const auto& current : universe.bodies()) {
+        const Vec2 screen = universe.worldToScreen(current.position, current.region);
+        check(screen.x > -10.0 && screen.x < 1930.0 && screen.y > -10.0 && screen.y < 1090.0,
+              "expanded bodies remain inside visible camera view");
+    }
+
+    config = Config::demo();
+    config.max_bodies = 32;
+    config.max_particles = 128;
+    config.history_seconds = 2.0;
+    config.cursor_strength = 20000000.0;
+    config.mutual_strength = 2000000.0;
+    config.softening = 10.0;
+    universe.configure(config);
+    std::vector<Body> crowded;
+    for (uint64_t id = 1; id <= 32; ++id)
+        crowded.push_back(body(id, {960.0, 540.0}, {static_cast<double>(id * 20), 20.0}));
+    universe.reset(crowded, {Region{}}, {960.0, 540.0}, 1);
+    for (int frame = 0; frame < 12000; ++frame) {
+        if (frame % 97 == 0)
+            universe.supernova({960.0, 540.0});
+        if (frame % 521 == 0)
+            universe.cycleGravity();
+        if (frame == 300)
+            universe.startBlackHole(universe.worldToScreen(universe.bodies()[0].position, 0));
+        if (frame % 241 == 0)
+            universe.step(3600.0, {960.0, 540.0});
+        else
+            universe.step(1.0 / 120.0, {960.0 + std::sin(frame * 0.005) * 600.0, 540.0 + std::cos(frame * 0.007) * 300.0});
+        if (frame % 100 == 0)
+            checkFinite(universe);
+    }
+    checkFinite(universe);
+    config.history_seconds = 60.0;
+    config.history_hz = 60.0;
+    config.max_bodies = 128;
+    universe.configure(config);
+    check(universe.historyLimit() < 1000, "maximum history is additionally bounded by 16 MiB memory budget");
+
+    // Invalid runtime input cannot introduce NaN into rendering transforms.
+    config.cursor_strength = std::numeric_limits<double>::infinity();
+    config.fixed_step = std::numeric_limits<double>::quiet_NaN();
+    config.max_substeps = 1000000;
+    universe.configure(config);
+    Body corrupt = body(900, {std::numeric_limits<double>::quiet_NaN(), 0.0});
+    corrupt.scale = std::numeric_limits<double>::infinity();
+    corrupt.mass = -1.0;
+    universe.addBody(corrupt, false);
+    universe.step(1.0, {std::numeric_limits<double>::quiet_NaN(), 0.0});
+    checkFinite(universe);
+}
+} // namespace
+
+int main() {
+    fixedStepAndDeterminism();
+    orbitsAndBinary();
+    collisionAndBoundary();
+    wormholesAndRegions();
+    blackHoleAndLivingHistory();
+    supernovaAndCaps();
+    expansionAndStress();
+    std::cout << "Cosmic physics: " << assertions << " checks passed\n";
+}
