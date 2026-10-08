@@ -115,7 +115,8 @@ vec3 asciiMeteor(vec2 logical, vec2 canvas) {
     float size = min(0.7 + skyRandom(key + 5u) * 1.1,
                      max(0.45, min(canvas.x, canvas.y) / 80.0));
     vec2 head = midpoint + travel * (age / lifetime - 0.5);
-    float spacing = 12.0 * size;
+    // The nearest-segment strip must contain even the diagonal tips of '*'.
+    float spacing = 14.0 * size;
     float segment = floor(dot(head - logical, direction) / spacing + 0.5);
     if (segment < 0.0 || segment > 9.0) return vec3(0.0);
     vec2 offset = logical - (head - direction * segment * spacing);
