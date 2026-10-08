@@ -130,6 +130,7 @@ class Universe {
     void removeBody(uint64_t id);
     void setRewinding(bool enabled);
     bool startBlackHole(Vec2 screen_cursor);
+    bool startBlackHole(Vec2 screen_cursor, int visible_region);
     void supernova(Vec2 position, int region = 0);
     void cycleGravity();
     void setBinaryPreset();
@@ -146,6 +147,7 @@ class Universe {
     std::size_t historyFrames() const { return m_history.size(); }
     std::size_t historyLimit() const { return m_history_limit; }
     uint64_t hitTest(Vec2 screen_position) const;
+    uint64_t hitTest(Vec2 screen_position, int visible_region) const;
     Vec2 worldToScreen(Vec2 position, int region) const;
     Vec2 screenToWorld(Vec2 position, int region) const;
 
@@ -180,6 +182,8 @@ class Universe {
     void restoreFrame(const Frame& frame);
     void resizeHistory();
     double randomUnit();
+    uint64_t hitTestInRegion(Vec2 screen_position, const int* visible_region) const;
+    bool startBlackHoleById(Vec2 screen_cursor, uint64_t id);
 };
 
 } // namespace cosmic
