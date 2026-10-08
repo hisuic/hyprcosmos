@@ -48,6 +48,9 @@ void checkFinite(const Universe& universe) {
         check(std::isfinite(current.velocity.x) && std::isfinite(current.velocity.y), "velocities remain finite");
         check(std::isfinite(current.angle) && std::isfinite(current.scale) && std::isfinite(current.stretch) &&
               std::isfinite(current.twist), "render transforms remain finite");
+        check(std::isfinite(current.portal_progress) && current.portal_progress >= 0.0 && current.portal_progress <= 1.0 &&
+              std::isfinite(current.portal_arc) && std::isfinite(current.portal_entry_duration) &&
+              std::isfinite(current.portal_exit_duration), "automatic portal seeds and phase stay finite and bounded");
         check(magnitude(current.velocity) <= universe.config().max_speed + 1e-6, "speed cap enforced");
     }
     for (const auto& camera : universe.cameras())
@@ -150,7 +153,16 @@ void wormholesAndRegions() {
     traveler.region = main.id;
     universe.reset({traveler}, {main, alternate}, {});
     universe.step(1.0 / 120.0, {});
+    const auto entered = universe.bodies()[0];
+    check(entered.region == main.id && entered.portal_progress > 0.0 && !entered.portal_emerging,
+          "automatic portal entry starts visibly in its source region");
+    check(close(entered.scale, 0.42) && magnitude(entered.position - entrance.position) < 1e-7,
+          "automatic entry never instantly teleports or shrinks its first frame");
+    int frames = 0;
+    for (; frames < 600 && universe.bodies()[0].portal_progress > 0.0; ++frames)
+        universe.step(1.0 / 120.0, {});
     const auto transferred = universe.bodies()[0];
+    check(frames > 200 && frames < 400, "default portal transfer lasts a visibly cinematic interval");
     check(transferred.region == alternate.id, "portal changes virtual region with arbitrary region id");
     check(close(magnitude(transferred.velocity), magnitude(traveler.velocity)), "portal preserves speed");
     check(transferred.cooldown > 1.9, "portal sets repeat-transfer cooldown");
@@ -162,6 +174,250 @@ void wormholesAndRegions() {
     check(universe.hitTest(screen, alternate.id) == 1, "visible alternate region can be selected");
     const Vec2 world = universe.screenToWorld(screen, alternate.id);
     check(magnitude(world - universe.bodies()[0].position) < 1e-7, "camera mappings invert across virtual region");
+}
+
+void cinematicAutomaticPortals() {
+    constexpr double pi = 3.14159265358979323846;
+    auto config = inert();
+    config.wormholes = true;
+    config.black_hole = false; // This exercises natural entry, never the F7 path.
+    Region source{42, 0.0, 0.0, 1920.0, 1080.0};
+    Region destination{1000042, 0.0, 0.0, 1920.0, 1080.0};
+    Universe universe(config);
+    universe.reset({}, {source, destination}, {});
+    const Wormhole entrance = universe.wormholes().front();
+    const Wormhole exit = universe.wormholes()[entrance.partner];
+    Body target = body(1, entrance.position, {120.0, 20.0});
+    target.region = source.id;
+    target.width = 1600.0;
+    target.height = 900.0;
+    universe.reset({target}, {source, destination}, {});
+    const Body initial = universe.bodies()[0];
+    universe.step(1.0 / 120.0, {});
+    const Body started = universe.bodies()[0];
+    check(started.portal_source_region == source.id && started.portal_destination_region == destination.id,
+          "automatic transit captures the actual linked pair's arbitrary region ids");
+    check(close(started.portal_entry_duration, 1.68) && close(started.portal_exit_duration, 0.75),
+          "calm automatic ingress and egress have readable default durations");
+    check(magnitude(started.position - initial.position) < 1e-7 && close(started.scale, initial.scale),
+          "exact-center natural portal entry is continuous at activation");
+    check(started.sink_progress == 0.0 && !started.stored, "portal entry is not black-hole storage");
+    check(universe.hitTest(universe.worldToScreen(started.position, started.region), source.id) == 0,
+          "a transiting image cannot be selected for a conflicting F7 absorption");
+    const Vec2 source_anchor = universe.worldToScreen(entrance.position, source.id);
+    const Vec2 destination_anchor = universe.worldToScreen(exit.position, destination.id);
+    bool switched = false, seen_emergence = false;
+    double entry_scale = initial.scale, exit_scale = 0.0, maximum_motion = 0.0;
+    int switches = 0, frames = 0;
+    for (; frames < 700 && universe.bodies()[0].portal_progress > 0.0; ++frames) {
+        const Body previous = universe.bodies()[0];
+        universe.step(1.0 / 120.0, {1800.0, 900.0});
+        const Body current = universe.bodies()[0];
+        check(!current.stored && close(current.sink_progress, 0.0), "portal animation never stores or closes its living body");
+        check(std::isfinite(current.position.x) && std::isfinite(current.velocity.x) &&
+              magnitude(current.velocity) <= config.max_speed + 1e-6, "portal animation keeps finite capped velocities");
+        if (current.region != previous.region) {
+            ++switches;
+            switched = true;
+            check(current.portal_emerging && current.region == destination.id && current.scale == 0.0,
+                  "logical regions switch only in an exactly invisible midpoint frame");
+            check(magnitude(current.position - exit.position) < 1e-7, "midpoint arrives exactly at the linked exit center");
+        } else {
+            check(magnitude(current.position - previous.position) <= config.max_speed / 120.0 + 1e-6,
+                  "actual same-region cinematic portal motion obeys the speed cap");
+        }
+        if (!switched) {
+            check(current.region == source.id && !current.portal_emerging, "the entire visible ingress remains in its source region");
+            check(current.scale <= entry_scale + 1e-12, "automatic ingress shrinks monotonically");
+            entry_scale = current.scale;
+            maximum_motion = std::max(maximum_motion, magnitude(current.position - initial.position));
+            if (frames == 11)
+                check(current.scale > initial.scale * 0.98 && current.stretch < 1.02,
+                      "natural entry retains a readable application image during the first tenth-second");
+            if (frames == 59)
+                check(maximum_motion > 20.0 && current.scale > initial.scale * 0.80,
+                      "centered natural entry visibly spirals instead of disappearing abruptly");
+        } else {
+            check(current.scale + 1e-12 >= exit_scale, "automatic emergence restores image size monotonically");
+            exit_scale = current.scale;
+            if (current.scale > initial.scale * 0.30 && current.scale < initial.scale * 0.95)
+                seen_emergence = true;
+        }
+        if (current.portal_progress > 0.0) {
+            check(magnitude(universe.worldToScreen(entrance.position, source.id) - source_anchor) < 1e-7 &&
+                  magnitude(universe.worldToScreen(exit.position, destination.id) - destination_anchor) < 1e-7,
+                  "both portal anchors stay fixed while the mouse moves during transit");
+            check(current.cooldown == 0.0, "repeat-transfer cooldown begins only when emergence completes");
+        }
+    }
+    const Body completed = universe.bodies()[0];
+    check(switches == 1 && maximum_motion > 40.0 && seen_emergence, "one natural crossing visibly enters and emerges exactly once");
+    check(frames < 400 && completed.portal_progress == 0.0 && !completed.portal_emerging,
+          "normal calm transit completes and releases its cinematic state");
+    check(close(completed.scale, initial.scale) && close(completed.stretch, initial.stretch) && close(completed.twist, initial.twist),
+          "emergence restores the original full image transforms");
+    const double turn = exit.angle - entrance.angle + pi;
+    const Vec2 rotated_velocity{initial.velocity.x * std::cos(turn) - initial.velocity.y * std::sin(turn),
+                               initial.velocity.x * std::sin(turn) + initial.velocity.y * std::cos(turn)};
+    check(magnitude(completed.velocity - rotated_velocity) < 1e-7 && close(completed.cooldown, config.wormhole_cooldown),
+          "emergence preserves speed, transforms exit direction, and starts a fresh cooldown");
+
+    // A fast body can cross an entire small mouth between sampled endpoints.
+    config.fixed_step = 1.0 / 30.0;
+    config.max_speed = 5000.0;
+    universe.configure(config);
+    const Region compact{7, 0.0, 0.0, 320.0, 320.0};
+    universe.reset({}, {compact}, {});
+    const auto small = universe.wormholes().front();
+    Body fast = body(2, small.position - Vec2{70.0, 0.0}, {5000.0, 0.0});
+    fast.region = compact.id;
+    universe.reset({fast}, {compact}, {});
+    universe.step(1.0 / 30.0, {});
+    check(universe.bodies()[0].portal_progress > 0.0 && !universe.bodies()[0].portal_emerging,
+          "swept detection catches a portal skipped by both frame endpoints");
+    check(close(magnitude(universe.bodies()[0].position - small.position), small.radius),
+          "fast ingress starts at the first actual mouth intersection");
+
+    // Rewind into an entry leg, then replay the identical transfer and emergence.
+    config = inert(); config.wormholes = true; config.black_hole = false;
+    universe.configure(config);
+    universe.reset({target}, {source, destination}, {});
+    universe.step(1.0 / 120.0, {});
+    // The entry-trigger step also counts toward the 30 Hz history clock.
+    for (int frame = 0; frame < 83; ++frame) universe.step(1.0 / 120.0, {});
+    const Universe expected_seed = universe;
+    Universe expected = expected_seed;
+    const double recorded = universe.bodies()[0].portal_progress;
+    advance(universe, 1.4);
+    check(universe.bodies()[0].portal_emerging, "history test reaches the destination emergence leg");
+    universe.setRewinding(true);
+    for (int frame = 0; frame < 100 && universe.bodies()[0].portal_progress > recorded + 1e-9; ++frame)
+        universe.step(1.0 / config.history_hz, {});
+    check(close(universe.bodies()[0].portal_progress, recorded) && universe.bodies()[0].region == source.id,
+          "rewind reverses the region switch and restores the recorded entry leg");
+    universe.setRewinding(false);
+    for (int frame = 0; frame < 250; ++frame) {
+        universe.step(1.0 / 120.0, {});
+        expected.step(1.0 / 120.0, {});
+        const Body replayed = universe.bodies()[0], original = expected.bodies()[0];
+        check(replayed.region == original.region && replayed.portal_emerging == original.portal_emerging &&
+              close(replayed.portal_progress, original.portal_progress), "resumed portal playback repeats its phase and region exactly");
+        check(magnitude(replayed.position - original.position) < 1e-7 && magnitude(replayed.velocity - original.velocity) < 1e-7 &&
+              close(replayed.scale, original.scale) && close(replayed.angle, original.angle) &&
+              close(replayed.stretch, original.stretch) && close(replayed.twist, original.twist),
+              "resumed automatic transit follows identical motion and image deformation");
+    }
+    universe.removeBody(target.id);
+    universe.setRewinding(true);
+    advance(universe, 3.0);
+    check(universe.bodies().empty(), "rewind never resurrects a real app closed during portal transit");
+
+    for (const double cancel_time : {0.4, 1.9}) {
+        universe.configure(config);
+        universe.reset({target}, {source, destination}, {});
+        universe.step(1.0 / 120.0, {});
+        advance(universe, cancel_time);
+        const Body before = universe.bodies()[0];
+        auto disabled = config; disabled.wormholes = false;
+        universe.configure(disabled);
+        const Body canceled = universe.bodies()[0];
+        check(canceled.portal_progress == 0.0 && !canceled.portal_emerging && !canceled.stored &&
+              canceled.region == before.region && magnitude(canceled.position - before.position) < 1e-7,
+              "disabling wormholes safely cancels either leg without teleporting or storing the app");
+        check(close(canceled.scale, initial.scale) && close(magnitude(canceled.velocity), magnitude(initial.velocity)),
+              "canceling a transit restores its normal image and conserved speed");
+        universe.setRewinding(true);
+        advance(universe, 0.3);
+        check(universe.bodies()[0].portal_progress == 0.0 && close(universe.bodies()[0].scale, initial.scale),
+              "disabled wormholes cannot be reactivated by historical transit frames");
+    }
+
+    config = inert(); config.wormholes = true; config.cursor_gravity = config.orbit = true;
+    config.cursor_strength = 0.0; config.spaghetti = false;
+    universe.configure(config);
+    Body still = target; still.velocity = {};
+    universe.reset({still}, {source, destination}, entrance.position);
+    check(magnitude(universe.bodies()[0].velocity) == 0.0, "zero-speed portal regression uses a genuinely stationary body");
+    universe.step(1.0 / 120.0, entrance.position);
+    advance(universe, 0.4, entrance.position);
+    check(magnitude(universe.bodies()[0].position - entrance.position) > 5.0 &&
+          universe.bodies()[0].scale < initial.scale && close(universe.bodies()[0].stretch, 1.0) &&
+          close(universe.bodies()[0].twist, 0.0),
+          "stationary center entry still animates motion and shrinking with spaghetti disabled");
+    Universe untouched = universe;
+    auto strong = config;
+    strong.cursor_strength = 20000000.0; strong.binary = strong.collisions = strong.expansion = true;
+    strong.mutual_strength = 2000000.0; strong.explosion_strength = 3000.0;
+    universe.configure(strong);
+    Body neighbor = body(9, universe.bodies()[0].position, {50.0, 0.0}); neighbor.region = source.id;
+    universe.addBody(neighbor, false);
+    universe.setBinaryPreset();
+    universe.supernova(universe.bodies()[0].position, source.id);
+    for (int frame = 0; frame < 180; ++frame) {
+        universe.step(1.0 / 120.0, {1800.0, 900.0});
+        untouched.step(1.0 / 120.0, {1800.0, 900.0});
+        const Body actual = universe.bodies()[0], expected = untouched.bodies()[0];
+        check(magnitude(actual.position - expected.position) < 1e-7 && magnitude(actual.velocity - expected.velocity) < 1e-7 &&
+              close(actual.scale, expected.scale) && actual.region == expected.region && close(actual.portal_progress, expected.portal_progress),
+              "portal legs ignore external gravity, binary presets, collisions, expansion and explosions");
+    }
+    checkFinite(universe);
+
+    // Non-sorted physical ids and delayed travelers share frozen camera seeds.
+    config = inert(); config.wormholes = true;
+    universe.configure(config);
+    Region second_monitor{7, 1920.0, 0.0, 1280.0, 720.0};
+    universe.reset({}, {source, second_monitor, destination}, {});
+    const Wormhole forward = universe.wormholes().front();
+    const Wormhole reverse = universe.wormholes()[forward.partner];
+    Body first = body(20, forward.position, {5.0, 5.0}); first.region = source.id;
+    Body delayed = body(21, forward.position + Vec2{5.0, 0.0}, {5.0, 0.0});
+    delayed.region = source.id; delayed.cooldown = 0.30;
+    universe.reset({first, delayed}, {source, second_monitor, destination}, {});
+    universe.step(1.0 / 120.0, {});
+    const Vec2 frozen_source = universe.worldToScreen(forward.position, source.id);
+    const Vec2 frozen_exit = universe.worldToScreen(reverse.position, second_monitor.id);
+    bool first_finished_while_second_transits = false;
+    for (int frame = 0; frame < 350; ++frame) {
+        universe.step(1.0 / 120.0, {});
+        if (universe.bodies()[0].portal_progress == 0.0 && universe.bodies()[0].region == second_monitor.id &&
+            universe.bodies()[1].portal_progress > 0.0)
+            first_finished_while_second_transits = true;
+        if (universe.bodies()[0].portal_progress > 0.0 || universe.bodies()[1].portal_progress > 0.0)
+            check(magnitude(universe.worldToScreen(forward.position, source.id) - frozen_source) < 1e-7 &&
+                  magnitude(universe.worldToScreen(reverse.position, second_monitor.id) - frozen_exit) < 1e-7,
+                  "overlapping travelers retain the same source and destination cameras after the earlier one finishes");
+    }
+    check(first_finished_while_second_transits && universe.bodies()[0].region == second_monitor.id &&
+          universe.bodies()[1].region == second_monitor.id,
+          "delayed overlapping transits resolve actual linked monitor ids, not virtual-id arithmetic");
+    Body returning = body(22, reverse.position, {10.0, 5.0}); returning.region = second_monitor.id;
+    universe.reset({returning}, {source, second_monitor, destination}, {});
+    universe.step(1.0 / 120.0, {});
+    check(universe.bodies()[0].portal_source_region == second_monitor.id && universe.bodies()[0].portal_destination_region == source.id,
+          "a reverse linked mouth captures the exact opposite source and destination");
+    for (int frame = 0; frame < 400 && universe.bodies()[0].portal_progress > 0.0; ++frame)
+        universe.step(1.0 / 120.0, {});
+    check(universe.bodies()[0].region == source.id && close(magnitude(universe.bodies()[0].velocity), magnitude(returning.velocity)),
+          "reverse automatic transfer emerges with its original speed in the real source monitor");
+
+    config.max_speed = 180.0; config.sink_duration = 0.3;
+    universe.configure(config);
+    universe.reset({target}, {source, destination}, {});
+    universe.step(1.0 / 120.0, {});
+    check(universe.bodies()[0].portal_entry_duration >= 1.4 && universe.bodies()[0].portal_exit_duration >= 0.75,
+          "an aggressive sink setting cannot make natural portal animation instantaneous");
+    int limited_frames = 0;
+    for (; limited_frames < 1700 && universe.bodies()[0].portal_progress > 0.0; ++limited_frames) {
+        const Body before = universe.bodies()[0];
+        universe.step(1.0 / 120.0, {});
+        const Body after = universe.bodies()[0];
+        if (before.region == after.region)
+            check(magnitude(after.position - before.position) <= config.max_speed / 120.0 + 1e-6,
+                  "low speed caps extend entry and exit durations to bound actual image displacement");
+    }
+    check(limited_frames < 1700 && universe.bodies()[0].portal_progress == 0.0,
+          "speed-limited natural transit still completes rather than remaining in a hidden state");
 }
 
 void blackHoleAndLivingHistory() {
@@ -464,6 +720,7 @@ int main() {
     orbitsAndBinary();
     collisionAndBoundary();
     wormholesAndRegions();
+    cinematicAutomaticPortals();
     blackHoleAndLivingHistory();
     cinematicBlackHole();
     supernovaAndCaps();
