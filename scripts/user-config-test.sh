@@ -83,7 +83,9 @@ write_config() {
         bare) printf '%s\n' 'require("cosmic")' >> "$output/config/hyprland.lua" ;;
         inline) printf '%s\n' 'require("cosmic").setup({idle_timeout=19,rendering={stars=31}})' >> "$output/config/hyprland.lua" ;;
         startup-inline)
-            printf '%s\n' 'assert(hl.plugin.cosmic==nil,"startup fixture must precede native API publication")' \
+            # Plugin publication causes Hyprland to evaluate this same config
+            # again. Record both states without rejecting the second evaluation.
+            printf '%s\n' 'print("User-config fixture native API before setup: "..tostring(hl.plugin.cosmic~=nil))' \
                 'assert(require("cosmic").setup({idle_timeout=23,controls={preview="F6"}}))' \
                 >> "$output/config/hyprland.lua"
             ;;
@@ -102,6 +104,7 @@ write_config startup-inline
 # No probes or input injection are needed. The only compositor selected for
 # reloads is the new child PID's exact instance. A private headless output makes
 # native initialization independent of the parent's rendering/idle state.
+ulimit -c 0
 env -u HYPRLAND_INSTANCE_SIGNATURE HYPRLAND_NO_SD_VARS=1 HYPRLAND_NO_SD_NOTIFY=1 \
     HYPRLAND_NO_CRASHREPORTER=1 AQ_DRM_DEVICES=/dev/null Hyprland --config "$output/config/hyprland.lua" \
     > "$output/compositor.log" 2>&1 &
