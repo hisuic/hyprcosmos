@@ -10,8 +10,8 @@ local function check(condition, message)
 end
 
 local default_idle = assert(Config.normalize())
-check(default_idle.idle_timeout == 20 and Config.defaults.idle_timeout == 20,
-    "the default cosmic idle activation delay is twenty seconds")
+check(default_idle.idle_timeout == 60 and Config.defaults.idle_timeout == 60,
+    "the default cosmic idle activation delay is sixty seconds")
 local short_idle = assert(Config.normalize({ idle_timeout = 5 }))
 local explicit_idle = assert(Config.normalize({ idle_timeout = 20 }))
 check(short_idle.idle_timeout == 5 and explicit_idle.idle_timeout == 20,
