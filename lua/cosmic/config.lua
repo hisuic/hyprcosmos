@@ -12,7 +12,6 @@ M.defaults = {
     history_seconds = 12,
     history_hz = 30,
     history_mb = 16,
-    plugin_path = false,
     effects = {
         cursor_gravity = true, orbit = true, binary = true, collisions = true,
         black_hole = true, spaghetti = true, wormholes = true, supernova = true,
@@ -42,18 +41,18 @@ local ranges = {
     idle_timeout = { 0.25, 3600 }, seed = { 0, 0xFFFFFFFF, true },
     max_windows = { 1, 48, true }, fps = { 10, 120, true },
     snapshot_hz = { 0.25, 30 }, history_seconds = { 0.1, 60 },
-    history_hz = { 1, 120 }, history_mb = { 1, 64 },
-    ["physics.fixed_step"] = { 1 / 240, 1 / 20 },
+    history_hz = { 1, 60 }, history_mb = { 1, 64 },
+    ["physics.fixed_step"] = { 1 / 240, 1 / 30 },
     ["physics.max_substeps"] = { 1, 16, true },
-    ["physics.cursor_strength"] = { 0, 100000000 },
-    ["physics.mutual_strength"] = { 0, 10000000 },
-    ["physics.softening"] = { 1, 1000 },
-    ["physics.max_acceleration"] = { 1, 10000 },
-    ["physics.max_speed"] = { 1, 5000 }, ["physics.damping"] = { 0, 10 },
+    ["physics.cursor_strength"] = { 0, 20000000 },
+    ["physics.mutual_strength"] = { 0, 2000000 },
+    ["physics.softening"] = { 10, 2000 },
+    ["physics.max_acceleration"] = { 10, 10000 },
+    ["physics.max_speed"] = { 10, 5000 }, ["physics.damping"] = { 0, 10 },
     ["physics.restitution"] = { 0, 1 }, ["physics.collision_strength"] = { 0, 1 },
-    ["physics.expansion_rate"] = { 0, 0.1 }, ["physics.sink_duration"] = { 0.2, 30 },
-    ["physics.wormhole_cooldown"] = { 0.1, 10 },
-    ["physics.explosion_strength"] = { 0, 5000 },
+    ["physics.expansion_rate"] = { 0, 0.1 }, ["physics.sink_duration"] = { 0.3, 20 },
+    ["physics.wormhole_cooldown"] = { 0.2, 10 },
+    ["physics.explosion_strength"] = { 0, 3000 },
     ["rendering.particles"] = { 0, 384, true },
     ["rendering.stars"] = { 0, 1024, true }, ["rendering.background"] = { 0, 1 },
     ["rendering.snapshot_mb"] = { 16, 512 },
@@ -94,13 +93,6 @@ local function canonical_chord(chord, path)
 end
 
 local function validate(value, expected, path)
-    if path == "plugin_path" then
-        if value == false then return end
-        if type(value) ~= "string" or value:sub(1, 1) ~= "/" or value:find("\0", 1, true) then
-            fail(path, "must be false or an absolute plugin path")
-        end
-        return
-    end
     if path:match("^controls%.") then
         if value ~= false and (type(value) ~= "string" or not value:find("%S") or value:find("\0", 1, true)) then
             fail(path, "must be a key chord or false")
