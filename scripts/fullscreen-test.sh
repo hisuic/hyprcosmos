@@ -5,14 +5,16 @@ repository=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 plugin="$repository/build/cosmic.so"
 output=""
 nested_window=false
+unload_only=false
 unload_rounds=12
 while (($#)); do
     case "$1" in
         --plugin) plugin=${2:?}; shift 2 ;;
         --output) output=${2:?}; shift 2 ;;
         --nested-window) nested_window=true; shift ;;
+        --unload-only) unload_only=true; shift ;;
         --unload-rounds) unload_rounds=${2:?}; shift 2 ;;
-        -h|--help) printf '%s\n' 'Usage: scripts/fullscreen-test.sh [--plugin FILE] [--output DIR] [--nested-window] [--unload-rounds N]'; exit 0 ;;
+        -h|--help) printf '%s\n' 'Usage: scripts/fullscreen-test.sh [--plugin FILE] [--output DIR] [--nested-window] [--unload-rounds N] [--unload-only]'; exit 0 ;;
         *) printf 'Unknown argument: %s\n' "$1" >&2; exit 2 ;;
     esac
 done
@@ -205,6 +207,7 @@ reserved > "$output/reserved-before.json"
 ctl -j monitors | python3 -c 'import json,sys; m=json.load(sys.stdin)[0]; assert max(m["reserved"])>=48,m'
 capture normal visible
 eval_lua 'require("cosmic").enable()'
+if ! "$unload_only"; then
 preview
 eval_lua 'assert(require("cosmic").status().desktop_ui_hidden)'
 capture cosmic hidden
@@ -236,9 +239,27 @@ eval_lua 'assert(not require("cosmic").status().desktop_ui_hidden)'
 capture ui-opt-out visible
 eval_lua 'require("cosmic").action("emergency"); require("cosmic").setup({rendering={hide_desktop_ui=true}})'
 
+# Unmapping a suppressed layer still needs a normal snapshot for the native
+# fadeout path. Test that the resulting fadeout cannot reappear over Cosmic.
+eval_lua 'hl.config({animations={enabled=true}}); hl.animation({leaf="fadeLayersOut",enabled=true,speed=20,bezier="default"})'
+preview
+printf 'unmap_before_monotonic=%s\n' "$(awk '{print $1}' /proc/uptime)" > "$output/fadeout-timing.txt"
+kill -TERM "$overlay_pid"
+wait "$overlay_pid" 2>/dev/null || true
+overlay_pid=""
+sleep .1
+eval_lua 'assert(require("cosmic").status().active)'
+capture overlay-fadeout hidden
+printf 'capture_after_monotonic=%s\n' "$(awk '{print $1}' /proc/uptime)" >> "$output/fadeout-timing.txt"
+eval_lua 'require("cosmic").action("emergency"); hl.config({animations={enabled=false}})'
+sleep 2.1
+start_layer "$output/overlay-restored.jsonl" overlay cosmic-test-overlay
+overlay_pid=$extra_pid; extra_pid=""
+capture overlay-remapped visible
+
 # Real interactive and lock-like surfaces must be shown rather than suppressed,
 # including a lock namespace that intentionally requests no keyboard focus.
-for spec in 'exclusive cosmic-test-launcher' 'none hyprlock'; do
+for spec in 'exclusive cosmic-test-launcher' 'on-demand cosmic-test-on-demand' 'none hyprlock'; do
     read -r keyboard_mode namespace <<< "$spec"
     preview
     start_layer "$output/$namespace.jsonl" overlay "$namespace" "$keyboard_mode"
@@ -249,12 +270,17 @@ for spec in 'exclusive cosmic-test-launcher' 'none hyprlock'; do
     stop_extra
     eval_lua 'require("cosmic").setup({idle_timeout=require("cosmic.config").defaults.idle_timeout})'
 done
+fi
 
 # Exercise unload without first shutting Cosmic down. Screenshot delivery proves
 # an actual Cosmic pass has been rendered/retained immediately before unload.
-    for ((round=1; round<=unload_rounds; ++round)); do
+active_expectation=hidden
+# Legacy plugins predate desktop UI suppression; this mode isolates just the
+# retained-render-pass unload crash for a controlled old/new negative control.
+if "$unload_only"; then active_expectation=visible; fi
+for ((round=1; round<=unload_rounds; ++round)); do
     preview
-    capture "direct-active-$round" hidden
+    capture "direct-active-$round" "$active_expectation"
     # unloadPlugin queues an automatic config reload in 0.56.2. Remove require
     # from the generated child config first, without reloading: Cosmic is still
     # active at the direct unload, and that queued reload cannot load it again.
@@ -264,19 +290,25 @@ done
     write_config true
     [[ $(ctl reload) == ok ]] || { printf 'Direct unload recovery reload failed.\n' >&2; exit 1; }
     wait_lua 'hl.plugin.cosmic~=nil and require("cosmic").status().module_initialized'
-    eval_lua 'require("cosmic").enable()'
+    if "$unload_only"; then eval_lua 'require("cosmic").setup({enabled=true,rendering={hide_desktop_ui=false}})'
+    else eval_lua 'require("cosmic").enable()'; fi
 done
 for ((round=1; round<=3; ++round)); do
     preview
-    capture "remove-active-$round" hidden
+    capture "remove-active-$round" "$active_expectation"
     write_config false
     [[ $(ctl reload) == ok ]] || { printf 'Require-removal reload failed.\n' >&2; exit 1; }
     check_alive "require-removed-$round"
     write_config true
     [[ $(ctl reload) == ok ]] || { printf 'Require-restoration reload failed.\n' >&2; exit 1; }
     wait_lua 'hl.plugin.cosmic~=nil and require("cosmic").status().module_initialized'
-    eval_lua 'require("cosmic").enable()'
+    if "$unload_only"; then eval_lua 'require("cosmic").setup({enabled=true,rendering={hide_desktop_ui=false}})'
+    else eval_lua 'require("cosmic").enable()'; fi
 done
+if "$unload_only"; then
+    printf 'PASS: %s active direct plugin unloads and 3 active require-removal reloads survived real subsequent frames. Parent session was never changed.\n' "$unload_rounds" | tee "$output/result.txt"
+    exit 0
+fi
 
 eval_lua 'require("cosmic").setup({idle_timeout=require("cosmic.config").defaults.idle_timeout}); assert(require("cosmic").status().config.idle_timeout==20)'
 probe move 640 360 1280 720
@@ -291,4 +323,4 @@ capture idle-21s hidden
 probe key 30
 wait_lua 'not require("cosmic").status().active'
 capture idle-restored visible
-printf 'PASS: real TOP/OVERLAY suppression, exclusive-zone and geometry preservation, first panel click once, protected/interactive layer safety, optional UI visibility, %s active direct unloads, 3 active require removals, and default 20 s idle activation. Parent session was never changed.\n' "$unload_rounds" | tee "$output/result.txt"
+printf 'PASS: real TOP/OVERLAY suppression and unmap fadeout, exclusive-zone and geometry preservation, first panel click once, protected/interactive layer safety, optional UI visibility, %s active direct unloads, 3 active require removals, and default 20 s idle activation. Parent session was never changed.\n' "$unload_rounds" | tee "$output/result.txt"
