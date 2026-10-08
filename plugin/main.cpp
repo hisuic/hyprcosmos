@@ -420,7 +420,11 @@ Clock::time_point lastInput = Clock::now(), lastTick = lastInput, lastCapture = 
 };
 
 void renderWindowHook(Render::IHyprRenderer* self, PHLWINDOW window, PHLMONITOR monitor, const Time::steady_tp& time, bool decorate, Render::eRenderPassMode mode, bool ignorePosition, bool standalone) {
-    if (instance->active && !instance->capturing && std::ranges::any_of(instance->snapshots, [&](const auto& shot) { return shot.id == window->m_stableID; })) return;
+    // Window exports render offscreen with standalone=true; compositor-owned
+    // snapshots also need the original image. Suppress only desktop rendering,
+    // including the first shared frame before its sharing notification arrives.
+    if (instance->active && !instance->capturing && !standalone && !self->m_bRenderingSnapshot &&
+        std::ranges::any_of(instance->snapshots, [&](const auto& shot) { return shot.id == window->m_stableID; })) return;
     reinterpret_cast<RenderWindowFn>(instance->hook->m_original)(self, window, monitor, time, decorate, mode, ignorePosition, standalone);
 }
 
