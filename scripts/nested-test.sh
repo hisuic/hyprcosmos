@@ -32,9 +32,11 @@ client_b=""
 client_c=""
 held_input=""
 share_pid=""
+recorder_pid=""
 capture_child=""
 capture_jobs=()
 cleanup() {
+    if [[ -n "$recorder_pid" ]] && kill -0 "$recorder_pid" 2>/dev/null; then kill -INT "$recorder_pid" 2>/dev/null || true; fi
     for pid in "$capture_child" "${capture_jobs[@]}" "$share_pid" "$held_input" "$client_a" "$client_b" "$client_c" "$compositor_pid"; do
         if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then kill -TERM "$pid" 2>/dev/null || true; fi
     done
@@ -108,7 +110,7 @@ eval_lua() {
     fi
     [[ "$result" == ok ]] || { printf 'Lua check failed: %s\n%s\n' "$1" "$result" >&2; exit 1; }
 }
-status() { ctl repl 'local s=require("cosmic").status(); for _,k in ipairs({"enabled","initialized","active","bodies","stored","snapshots","snapshot_bytes","history_frames","physics_steps","last_reason"}) do print(k .. "=" .. tostring(s[k])) end; for _,b in ipairs(s.objects or {}) do print(string.format("object id=%s x=%.4f y=%.4f angle=%.4f scale=%.6f stretch=%.4f twist=%.4f sink=%.6f stored=%s",tostring(b.id),b.x,b.y,b.angle,b.scale,b.stretch,b.twist,b.sink_progress,tostring(b.stored))) end'; }
+status() { ctl repl 'local s=require("cosmic").status(); for _,k in ipairs({"enabled","initialized","active","bodies","stored","snapshots","snapshot_bytes","history_frames","physics_steps","last_reason"}) do print(k .. "=" .. tostring(s[k])) end; for _,b in ipairs(s.objects or {}) do print(string.format("object id=%s x=%.4f y=%.4f angle=%.4f scale=%.6f stretch=%.4f twist=%.4f sink=%.6f stored=%s",tostring(b.id),b.x,b.y,b.angle,b.scale,b.stretch,b.twist,b.sink_progress,tostring(b.stored))); if b.portal_progress then print(string.format("portal id=%s progress=%.6f emerging=%s source=%s destination=%s entry=(%.4f,%.4f) exit=(%.4f,%.4f) entry_duration=%.4f exit_duration=%.4f",tostring(b.id),b.portal_progress,tostring(b.portal_emerging),tostring(b.portal_source_region),tostring(b.portal_destination_region),b.portal_entry_x,b.portal_entry_y,b.portal_exit_x,b.portal_exit_y,b.portal_entry_duration,b.portal_exit_duration)) end end; for i,h in ipairs(s.wormholes or {}) do print(string.format("wormhole index=%d region=%s x=%.4f y=%.4f radius=%.4f partner=%s",i,tostring(h.region),h.x,h.y,h.radius,tostring(h.partner))) end'; }
 wait_active() {
     for ((attempt=0; attempt<60; ++attempt)); do
         if [[ $(ctl eval 'assert(require("cosmic").status().active)') == ok ]]; then return; fi
@@ -186,6 +188,44 @@ check_distinct_captures() {
         printf 'PASS: distinct timed frames %s and %s\n' "$first" "$second" >> "$output/capture-regression.txt"
     else
         printf 'SKIP: %s/%s acquisition intervals overlap; these PNGs are not independent-time visual evidence. Pause parent Cosmic/frame throttling and rerun.\n' "$first" "$second" | tee -a "$output/capture-regression.txt" >&2
+    fi
+}
+wait_portal() {
+    local predicate=$1
+    for ((attempt=0; attempt<160; ++attempt)); do
+        if [[ $(ctl repl "local s=require('cosmic').status(); local b; for _,o in ipairs(s.objects) do if o.id==_cosmic_portal_target then b=o; break end end; print(s.active and b and ($predicate) or false)") == true ]]; then return; fi
+        sleep 0.025
+    done
+    status >&2
+    printf 'Timed out waiting for automatic portal state: %s\n' "$predicate" >&2
+    exit 1
+}
+start_portal_recording() {
+    local output_name
+    if command -v wf-recorder >/dev/null && command -v ffprobe >/dev/null; then
+        output_name=$(ctl -j monitors | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["name"])')
+        printf 'recorder_before_monotonic=%s\n' "$(awk '{print $1}' /proc/uptime)" > "$output/automatic-portal.recording.txt"
+        env -u HYPRLAND_INSTANCE_SIGNATURE WAYLAND_DISPLAY="$socket" wf-recorder --no-dmabuf -D -r 60 \
+            -o "$output_name" -c libx264 -p preset=ultrafast -p crf=18 -x yuv420p \
+            -F 'pad=ceil(iw/2)*2:ceil(ih/2)*2' -f "$output/automatic-portal.mp4" > "$output/automatic-portal-recorder.log" 2>&1 &
+        recorder_pid=$!
+        sleep 0.3
+        if ! kill -0 "$recorder_pid" 2>/dev/null; then
+            wait "$recorder_pid" || true
+            recorder_pid=""
+            printf 'SKIP: continuous recording failed; see automatic-portal-recorder.log.\n' >&2
+        fi
+    else
+        printf 'SKIP: wf-recorder/ffprobe unavailable; native portal and screenshot checks still run.\n' >&2
+    fi
+}
+stop_portal_recording() {
+    if [[ -n "$recorder_pid" ]]; then
+        kill -INT "$recorder_pid"
+        wait "$recorder_pid"
+        recorder_pid=""
+        printf 'recorder_after_monotonic=%s\n' "$(awk '{print $1}' /proc/uptime)" >> "$output/automatic-portal.recording.txt"
+        ffprobe -v error -show_entries format=duration:stream=width,height,avg_frame_rate,nb_frames -of json "$output/automatic-portal.mp4" > "$output/automatic-portal-video.json"
     fi
 }
 measure_cpu() {
@@ -371,6 +411,65 @@ capture black-hole-rewind
 sleep 1.6
 eval_lua 'local s=require("cosmic").status(); assert(s.active and s.stored==0)'
 
+# Reproduce the user's actual trigger: natural entry into a permanent round
+# wormhole. No F7 and no black_hole action are used in this entire phase.
+eval_lua 'require("cosmic").setup({enabled=true,effects={cursor_gravity=false,orbit=false,binary=false,collisions=false,black_hole=false,wormholes=true,supernova=false,expansion=false}})'
+wait_active
+read -r portal_x portal_y portal_source <<< "$(ctl repl 'local s=require("cosmic").status(); assert(type(s.wormholes)=="table"); for _,h in ipairs(s.wormholes) do if h.region<1000000 and s.wormholes[h.partner].region~=h.region then _cosmic_portal_expected_source=h.region; print(math.floor(h.x).." "..math.floor(h.y).." "..h.region); break end end')"
+[[ "$portal_x" =~ ^[0-9]+$ && "$portal_y" =~ ^[0-9]+$ ]] || { printf 'Could not resolve the actual source portal screen coordinates.\n' >&2; exit 1; }
+eval_lua 'require("cosmic").disable()'
+portal_window=$(ctl -j clients | python3 -c 'import json,sys; print(next(c["address"] for c in json.load(sys.stdin) if c.get("title")=="Cosmic probe A"))')
+ctl dispatch setfloating "address:$portal_window" > "$output/portal-setfloating.txt"
+ctl dispatch resizewindowpixel "exact 360 240,address:$portal_window" > "$output/portal-resize.txt"
+ctl dispatch movewindowpixel "exact $((portal_x - 180)) $((portal_y - 120)),address:$portal_window" > "$output/portal-position.txt"
+sleep 0.2
+ctl -j clients > "$output/portal-normal-baseline.json"
+ctl -j activewindow > "$output/portal-normal-focus.json"
+start_portal_recording
+printf 'enable_before_monotonic=%s\n' "$(awk '{print $1}' /proc/uptime)" >> "$output/automatic-portal.recording.txt"
+eval_lua 'require("cosmic").enable()'
+wait_active
+for ((attempt=0; attempt<40; ++attempt)); do
+    if [[ $(ctl repl 'local s=require("cosmic").status(); local entering=false; for _,b in ipairs(s.objects) do if b.portal_progress and b.portal_progress>0 and not b.portal_emerging then entering=true end end; print(s.active and entering)') == true ]]; then break; fi
+    sleep 0.025
+done
+eval_lua 'local s=require("cosmic").status(); local found=false; for _,b in ipairs(s.objects) do if b.portal_progress and b.portal_progress>0 then assert(b.sink_progress==0 and not b.stored and not b.portal_emerging and b.region==_cosmic_portal_expected_source); _cosmic_portal_target=b.id; _cosmic_portal_source=b.portal_source_region; _cosmic_portal_destination=b.portal_destination_region; _cosmic_portal_midpoint=b.portal_entry_duration/(b.portal_entry_duration+b.portal_exit_duration); _cosmic_portal_scale=b.scale; _cosmic_portal_origin={x=b.x,y=b.y}; found=true; break end end; assert(s.active and found,"normal client inside entrance did not start an AUTOMATIC portal transit")'
+eval_lua 'local s=require("cosmic").status(); local peer=false; for _,v in ipairs(s.peer_views or {}) do if v.region==_cosmic_portal_destination and v.content_width>0 and v.content_height>0 and v.scale>0 then peer=true end end; assert(peer,"pending automatic destination has no visible peer-world inset")'
+printf 'first_automatic_transit_monotonic=%s\n' "$(awk '{print $1}' /proc/uptime)" >> "$output/automatic-portal.recording.txt"
+status > "$output/portal-entry-start.txt"
+capture portal-entry-early
+wait_portal 'not b.portal_emerging and b.portal_progress>_cosmic_portal_midpoint*.40 and b.portal_progress<_cosmic_portal_midpoint*.80'
+eval_lua 'local s=require("cosmic").status(); for _,b in ipairs(s.objects) do if b.id==_cosmic_portal_target then assert(b.region==_cosmic_portal_source and b.sink_progress==0 and not b.stored and b.scale>0 and b.scale<_cosmic_portal_scale); assert(b.stretch>1 and b.twist>0); assert((b.x-_cosmic_portal_origin.x)^2+(b.y-_cosmic_portal_origin.y)^2>9,"automatic entry did not visibly move"); _cosmic_portal_middle_scale=b.scale end end'
+capture portal-entry-middle
+check_distinct_captures portal-entry-early portal-entry-middle
+wait_portal 'not b.portal_emerging and b.portal_progress>_cosmic_portal_midpoint*.78'
+eval_lua 'for _,b in ipairs(require("cosmic").status().objects) do if b.id==_cosmic_portal_target then assert(b.region==_cosmic_portal_source and not b.stored and b.scale>0 and b.scale<_cosmic_portal_middle_scale) end end'
+capture portal-entry-near-transfer
+wait_portal 'b.portal_emerging and b.portal_progress>_cosmic_portal_midpoint+(1-_cosmic_portal_midpoint)*.35 and b.portal_progress<.98'
+eval_lua 'for _,b in ipairs(require("cosmic").status().objects) do if b.id==_cosmic_portal_target then assert(b.region==_cosmic_portal_destination and b.sink_progress==0 and not b.stored and b.scale>0 and b.scale<_cosmic_portal_scale) end end'
+capture portal-emergence-inset
+wait_portal 'b.portal_progress==0 and b.region==_cosmic_portal_destination'
+eval_lua 'local s=require("cosmic").status(); for _,b in ipairs(s.objects) do if b.id==_cosmic_portal_target then assert(not b.stored and b.sink_progress==0 and not b.portal_emerging and b.scale>=_cosmic_portal_scale*.95) end end; local peer=false; for _,v in ipairs(s.peer_views or {}) do if v.region==_cosmic_portal_destination then peer=true end end; assert(peer,"peer-world inset disappeared after automatic arrival")'
+capture portal-arrived-inset
+probe key 68
+eval_lua 'assert(require("cosmic").status().alternate_region)'
+capture portal-arrived-main
+probe key 68
+eval_lua 'require("cosmic").action("rewind"); assert(require("cosmic").status().rewinding)'
+wait_portal 'b.portal_progress>0 and b.region==_cosmic_portal_source'
+capture portal-rewind-source
+wait_portal 'b.portal_progress==0 and b.region==_cosmic_portal_source'
+probe key 30
+eval_lua 'assert(not require("cosmic").status().active and require("cosmic").status().stored==0)'
+ctl -j clients > "$output/portal-normal-restored.json"
+ctl -j activewindow > "$output/portal-restored-focus.json"
+python3 -c 'import json,sys; a=json.load(open(sys.argv[1])); b=json.load(open(sys.argv[2])); shape=lambda cs:sorted((c["address"],c["at"],c["size"],c["workspace"]["id"],c["floating"]) for c in cs); assert shape(a)==shape(b), "Natural portal animation changed the normal geometry or real workspace"; f=json.load(open(sys.argv[3])); g=json.load(open(sys.argv[4])); assert f.get("address")==g.get("address"), "Natural portal animation changed ordinary keyboard focus"' "$output/portal-normal-baseline.json" "$output/portal-normal-restored.json" "$output/portal-normal-focus.json" "$output/portal-restored-focus.json"
+capture portal-restored
+stop_portal_recording
+eval_lua 'require("cosmic").disable()'
+ctl dispatch settiled "address:$portal_window" > "$output/portal-settiled.txt"
+printf 'PASS: automatic permanent-hole entry, visible ingress, virtual destination emergence, replay, unchanged normal geometry/workspace/focus; no F7 or black_hole action used.\n' | tee "$output/automatic-portal-result.txt"
+
 # Actual window creation emits a shockwave; closing it removes every historical
 # reference so replay cannot resurrect an exited client.
 eval_lua 'require("cosmic").setup({enabled=true,effects={supernova=true}})'
@@ -410,7 +509,7 @@ sed '/require("cosmic")/,$d' "$repository/tests/nested.lua" > "$output/config/hy
 ctl reload > "$output/remove-require.txt"
 sleep 0.3
 eval_lua 'assert(hl.plugin.cosmic == nil)'
-printf '%s\n' 'PASS: nested real GL rotation/deformation/store/rewind, first key/button/scroll, dedicated controls, holds, modifiers, mouse focus, geometry, actual window creation/closure, window-share enable/disable regressions, lifecycle and require removal. Hotplug result and CPU measurements are in adjacent files.' | tee "$output/result.txt"
+printf '%s\n' 'PASS: nested real GL rotation/deformation/store/rewind, actual automatic portal ingress/emergence/replay, first key/button/scroll, dedicated controls, holds, modifiers, mouse focus, geometry, actual window creation/closure, window-share enable/disable regressions, lifecycle and require removal. Hotplug result and CPU measurements are in adjacent files.' | tee "$output/result.txt"
 if "$keep_open"; then
     printf 'Dedicated nested compositor remains until Ctrl-C.\n'
     while kill -0 "$compositor_pid" 2>/dev/null; do sleep 1; done
