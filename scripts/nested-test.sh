@@ -19,6 +19,7 @@ for command in Hyprland hyprctl gcc wayland-scanner pkg-config python3 rg; do
 done
 [[ -f "$plugin" ]] || { printf 'Build the Cosmic plugin first: %s\n' "$plugin" >&2; exit 1; }
 [[ -n ${WAYLAND_DISPLAY:-} && -n ${XDG_RUNTIME_DIR:-} ]] || { printf 'Run from a Wayland session.\n' >&2; exit 1; }
+printf '%s\n' 'Visual-test note: the parent compositor must continuously render this nested window. Pause parent Cosmic or other frame throttling before visual checks; this script NEVER changes the parent session.' >&2
 if [[ -z "$output" ]]; then output=$(mktemp -d /tmp/hyprcosmos-test.XXXXXXXX); else mkdir -p -- "$output"; fi
 output=$(realpath -- "$output")
 plugin=$(realpath -- "$plugin")
@@ -169,6 +170,23 @@ wait_sink_time() {
     local remaining
     remaining=$(awk -v origin="$sink_started" -v desired="$1" '{d=desired-($1-origin); printf "%.3f\n", (d>0?d:0)}' /proc/uptime)
     sleep "$remaining"
+}
+check_distinct_captures() {
+    local first=$1 second=$2 first_end second_begin
+    [[ -s "$output/$first.png" && -s "$output/$second.png" ]] || return 0
+    first_end=$(awk -F= '/^capture_after_monotonic=/ {print $2}' "$output/$first.capture.txt")
+    second_begin=$(awk -F= '/^capture_before_monotonic=/ {print $2}' "$output/$second.capture.txt")
+    # Delayed overlapping requests may legitimately resolve to the same frame.
+    # Only compare intervals separated by more than one configured frame.
+    if awk -v end="$first_end" -v begin="$second_begin" 'BEGIN {exit !(begin-end>0.04)}'; then
+        if cmp -s "$output/$first.png" "$output/$second.png"; then
+            printf 'FAIL: frozen screencopy mirror between %s and %s. Check shader mirror output and ensure the parent compositor is not throttling this nested window.\n' "$first" "$second" >&2
+            exit 1
+        fi
+        printf 'PASS: distinct timed frames %s and %s\n' "$first" "$second" >> "$output/capture-regression.txt"
+    else
+        printf 'SKIP: %s/%s acquisition intervals overlap; these PNGs are not independent-time visual evidence. Pause parent Cosmic/frame throttling and rerun.\n' "$first" "$second" | tee -a "$output/capture-regression.txt" >&2
+    fi
 }
 measure_cpu() {
     local mode=$1 duration=$2 before after start end ticks
@@ -341,6 +359,8 @@ eval_lua 'local s=require("cosmic").status(); local found=false; for _,b in ipai
 status > "$output/black-hole-late-status.txt"
 for capture_job in "${capture_jobs[@]}"; do wait "$capture_job"; done
 capture_jobs=()
+check_distinct_captures black-hole-0.1 black-hole-0.5
+check_distinct_captures black-hole-1.0 black-hole-1.5
 wait_sink_time 3.20
 eval_lua 'local s=require("cosmic").status(); local found=false; for _,b in ipairs(s.objects) do if b.id==_cosmic_sink_target then assert(b.stored and b.scale==0); found=true end end; assert(s.active and found)'
 capture stored
