@@ -298,12 +298,12 @@ def hashed(x):
     return x^(x>>16)
 seed=0xC05C1C ^ json.load(sys.stdin)[0]["id"]
 key=hashed(seed ^ 0x4d455445)
-print(3+(hashed(key)>>8)/16777216*4)
+print(18+(hashed(key)>>8)/16777216*24)
 ')
 sky_remaining=$(awk -v origin="$sky_started" -v onset="$sky_onset" '{d=origin+onset+0.65-$1; printf "%.3f\n", (d>0?d:0)}' /proc/uptime)
 sleep "$sky_remaining"
 capture ascii-meteor
-sleep 1.4
+sleep 1.8
 capture ascii-after-meteor
 check_distinct_captures ascii-sky ascii-meteor
 check_distinct_captures ascii-meteor ascii-after-meteor
