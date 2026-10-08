@@ -125,7 +125,14 @@ end
 
 function M.normalize(options, previous)
     local result = M.copy(previous or M.defaults)
-    local ok, message = pcall(merge, result, options or {}, M.defaults, "")
+    local patch = options == nil and {} or options
+    if type(patch) == "table" and patch.preset and patch.preset ~= result.preset then
+        local selected, message = M.preset(patch.preset)
+        if not selected then return nil, message end
+        result.physics = selected.physics
+        result.rendering = selected.rendering
+    end
+    local ok, message = pcall(merge, result, patch, M.defaults, "")
     if not ok then return nil, message end
     local used = {}
     for action, chord in pairs(result.controls) do
@@ -145,10 +152,13 @@ function M.preset(name)
     local result = M.copy(M.defaults)
     result.preset = name
     if name == "demo" then
-        result.physics.mutual_strength = 42000
+        result.physics.cursor_strength = 2100000
+        result.physics.mutual_strength = 36000
         result.physics.collision_strength = 0.8
-        result.physics.expansion_rate = 0.014
-        result.physics.explosion_strength = 640
+        result.physics.restitution = 0.86
+        result.physics.expansion_rate = 0.025
+        result.physics.explosion_strength = 560
+        result.physics.sink_duration = 2.2
         result.rendering.particles = 384
     end
     return result
