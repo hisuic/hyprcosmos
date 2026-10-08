@@ -42,8 +42,9 @@ float skyRandom(uint value) {
 // No font lookup, texture upload, per-star draw call or neighbor-cell search.
 float asciiGlyph(vec2 offset, int glyph, float inkSize) {
     vec2 ink = offset / inkSize + vec2(2.5, 3.5);
-    // Derivatives must be evaluated before glyph-specific early returns.
-    vec2 antialias = max(fwidth(ink) * 0.65, vec2(0.001));
+    // This canvas is affine: use its known pixel scale instead of derivatives
+    // inside per-cell branches (undefined for discontinuous glyph centers).
+    vec2 antialias = vec2(max(0.65 / (inkSize * max(uPixelScale, 0.1)), 0.001));
     ivec2 cell = ivec2(floor(ink));
     if (cell.x < 0 || cell.x >= 5 || cell.y < 0 || cell.y >= 7) return 0.0;
     uint row = 0u;
