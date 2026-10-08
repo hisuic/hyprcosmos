@@ -70,6 +70,29 @@ local function fail(path, explanation)
     error("cosmic: " .. path .. " " .. explanation, 0)
 end
 
+local function canonical_chord(chord, path)
+    local parts = {}
+    for word in (chord .. "+"):gmatch("(.-)%+") do
+        word = word:gsub("^%s+", ""):gsub("%s+$", ""):upper()
+        if word == "" then fail(path, "contains an empty key/modifier") end
+        parts[#parts + 1] = word
+    end
+    local modifiers, recognized = {}, { SUPER = true, ALT = true, CTRL = true, CONTROL = true, SHIFT = true }
+    for index = 1, #parts - 1 do
+        local word = parts[index] == "CONTROL" and "CTRL" or parts[index]
+        if not recognized[word] or modifiers[word] then fail(path, "contains an unknown or repeated modifier") end
+        modifiers[word] = true
+    end
+    local key = parts[#parts]
+    if not key:match("^[A-Z0-9_]+$") or recognized[key] then fail(path, "must end in a named XKB key symbol") end
+    local normalized = {}
+    for _, modifier in ipairs({ "SUPER", "ALT", "CTRL", "SHIFT" }) do
+        if modifiers[modifier] then normalized[#normalized + 1] = modifier end
+    end
+    normalized[#normalized + 1] = key
+    return table.concat(normalized, "+")
+end
+
 local function validate(value, expected, path)
     if path == "plugin_path" then
         if value == false then return end
@@ -82,6 +105,7 @@ local function validate(value, expected, path)
         if value ~= false and (type(value) ~= "string" or not value:find("%S") or value:find("\0", 1, true)) then
             fail(path, "must be a key chord or false")
         end
+        if value then canonical_chord(value, path) end
         return
     end
     if path == "preset" then
@@ -137,7 +161,7 @@ function M.normalize(options, previous)
     local used = {}
     for action, chord in pairs(result.controls) do
         if chord then
-            local canonical = chord:upper():gsub("%s", "")
+            local canonical = canonical_chord(chord, "controls." .. action)
             if used[canonical] then
                 return nil, "cosmic: controls." .. action .. " duplicates controls." .. used[canonical]
             end
