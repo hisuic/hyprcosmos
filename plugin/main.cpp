@@ -576,10 +576,31 @@ int status(lua_State* L) {
         value("id", body.id); value("x", display.x); value("y", display.y);
         value("angle", body.angle); value("scale", body.scale); value("stretch", body.stretch);
         value("twist", body.twist); value("region", body.region); value("sink_progress", body.sink_progress);
+        value("portal_progress", body.portal_progress);
+        value("portal_source_region", body.portal_source_region);
+        value("portal_destination_region", body.portal_destination_region);
+        value("portal_entry_duration", body.portal_entry_duration);
+        value("portal_exit_duration", body.portal_exit_duration);
+        const auto entry = instance->universe.worldToScreen(body.portal_entry_center, body.portal_source_region);
+        const auto exit = instance->universe.worldToScreen(body.portal_exit_center, body.portal_destination_region);
+        value("portal_entry_x", entry.x); value("portal_entry_y", entry.y);
+        value("portal_exit_x", exit.x); value("portal_exit_y", exit.y);
+        lua_pushboolean(L, body.portal_emerging); lua_setfield(L, -2, "portal_emerging");
         lua_pushboolean(L, body.stored); lua_setfield(L, -2, "stored");
         lua_rawseti(L, -2, index++);
     }
     lua_setfield(L, -2, "objects");
+    lua_newtable(L);
+    index = 1;
+    for (const auto& hole : instance->universe.wormholes()) {
+        lua_newtable(L);
+        const auto display = instance->universe.worldToScreen(hole.position, hole.region);
+        auto value = [&](const char* key, double number) { lua_pushnumber(L, number); lua_setfield(L, -2, key); };
+        value("region", hole.region); value("x", display.x); value("y", display.y);
+        value("radius", hole.radius); value("partner", hole.partner + 1);
+        lua_rawseti(L, -2, index++);
+    }
+    lua_setfield(L, -2, "wormholes");
     lua_pushstring(L, instance->reason.c_str()); lua_setfield(L, -2, "last_reason");
     lua_pushstring(L, GIT_COMMIT_HASH); lua_setfield(L, -2, "hyprland_commit");
     lua_pushstring(L, "bounded refreshed snapshots"); lua_setfield(L, -2, "capture_mode");
