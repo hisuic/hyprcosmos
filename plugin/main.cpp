@@ -56,7 +56,7 @@ std::string string(lua_State* L, int table, const char* key, const std::string& 
 struct Control { xkb_keysym_t symbol = XKB_KEY_NoSymbol; uint32_t mods = 0; };
 struct Options {
     cosmic::Config physics = cosmic::Config::calm();
-    double idleTimeout = 20, fps = 60, snapshotHz = 4;
+    double idleTimeout = 60, fps = 60, snapshotHz = 4;
     bool enabled = true, excludeFullscreen = true, excludeInhibit = true, excludeShare = true;
     bool hideDesktopUI = true;
     std::size_t snapshotBudget = 128 * 1024 * 1024;
@@ -598,7 +598,7 @@ int setup(lua_State* L) {
         Options next;
         next.physics = string(L, 1, "preset", "calm") == "demo" ? cosmic::Config::demo() : cosmic::Config::calm();
         next.enabled = boolean(L, 1, "enabled", true);
-        next.idleTimeout = number(L, 1, "idle_timeout", 20, .25, 3600);
+        next.idleTimeout = number(L, 1, "idle_timeout", 60, .25, 3600);
         next.fps = number(L, 1, "fps", 60, 10, 120);
         next.snapshotHz = number(L, 1, "snapshot_hz", 4, .25, 30);
         next.physics.max_bodies = static_cast<std::size_t>(number(L, 1, "max_windows", 24, 1, 48));
