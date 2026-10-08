@@ -75,7 +75,8 @@ void testWindowClasses() {
         check(!cosmic::authenticationWindowClass(name), "ordinary or unrelated window classes are not authentication agents");
     check(!cosmic::authenticationWindowClass("polki"), "an incomplete token is not an authentication class");
     check(!cosmic::authenticationWindowClass("\xFF\x80"), "non-ASCII class bytes do not trigger ASCII case folding");
-    check(cosmic::authenticationWindowClass(std::string_view("prefix\0PINENTRY", 14)),
+    constexpr std::string_view embeddedNull("prefix\0PINENTRY", sizeof("prefix\0PINENTRY") - 1);
+    check(cosmic::authenticationWindowClass(embeddedNull),
           "string views are matched by their explicit length rather than an implicit C-string terminator");
 }
 
