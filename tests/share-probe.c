@@ -46,8 +46,26 @@ static void damage(void* data, struct hyprland_toplevel_export_frame_v1* frame,
 static void flags(void* data, struct hyprland_toplevel_export_frame_v1* frame, uint32_t value) {}
 static void ready(void* data, struct hyprland_toplevel_export_frame_v1* frame,
                   uint32_t hi, uint32_t lo, uint32_t ns) {
+    // SHM is newly zeroed for every capture. A blank first frame caused by a
+    // render detour can still receive ready, so inspect the actual copied image.
+    unsigned nonblack = 0, color_count = 0;
+    uint32_t colors[8] = {0};
+    const unsigned step_x = width / 64 ? width / 64 : 1;
+    const unsigned step_y = height / 64 ? height / 64 : 1;
+    for (unsigned y = 0; y < height; y += step_y) {
+        const uint32_t* row = (const uint32_t*)((const uint8_t*)pixels + (size_t)y * stride);
+        for (unsigned x = 0; x < width; x += step_x) {
+            const uint32_t rgb = row[x] & 0x00ffffff;
+            if (rgb) ++nonblack;
+            unsigned index = 0;
+            while (index < color_count && colors[index] != rgb) ++index;
+            if (index == color_count && color_count < 8) colors[color_count++] = rgb;
+        }
+    }
+    if (nonblack < 10 || color_count < 3)
+        fail("Window export ready contained a blank or uniform frame instead of the probe checkerboard");
     completed = 1;
-    printf("{\"event\":\"window_frame\",\"frames\":%u,\"width\":%u,\"height\":%u}\n", ++frames, width, height);
+    printf("{\"event\":\"window_frame\",\"frames\":%u,\"width\":%u,\"height\":%u,\"nonblack_samples\":%u,\"colors\":%u}\n", ++frames, width, height, nonblack, color_count);
 }
 static void frame_failed(void* data, struct hyprland_toplevel_export_frame_v1* frame) { completed = failed = 1; }
 static void dmabuf(void* data, struct hyprland_toplevel_export_frame_v1* frame,
