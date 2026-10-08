@@ -7,7 +7,8 @@ local M = {}
 local options = Config.copy(Config.defaults)
 local initialized, stopped, warned, configuration_ready = false, false, false, false
 local last_error, plugin_path
-local config_file, config_file_loaded, config_file_error
+local config_directory, config_file, config_file_loaded, config_file_error
+local config_read, pending_updates = false, {}
 local subscriptions, bindings = {}, {}
 local initialization_timer, initialization_generation = nil, 0
 local initialization_attempts, plugin_requested = 0, false
@@ -98,11 +99,47 @@ local function resolve_config_directory()
     return config_home .. "/hypr"
 end
 
+local function load_config_file()
+    if config_read then return not config_file_error, config_file_error end
+    local api = native()
+    if not api or type(api.read_user_config) ~= "function" then
+        return nil, "native plugin is unavailable or lacks the safe user settings reader"
+    end
+    config_read = true
+    local loaded, message, found = UserConfig.load(config_file, api.read_user_config)
+    config_file_loaded = found and loaded ~= nil
+    if loaded then
+        -- Startup evaluates hyprland.lua before the native plugin exists. Replay
+        -- explicit setup patches only after reading the file so their priority
+        -- is identical to setup() during an ordinary configuration reload.
+        for _, update in ipairs(pending_updates) do
+            loaded, message = Config.normalize(update, loaded)
+            if not loaded then
+                message = config_file .. ": explicit setup conflicts with user settings: " .. message
+                break
+            end
+        end
+    end
+    pending_updates = {}
+    if not loaded then
+        config_file_error = message
+        -- A retained plugin can still own input/render hooks after a reload.
+        -- Invalid settings must stop it, not leave the old universe running.
+        call("disable")
+        warn(message)
+        return nil, message
+    end
+    options = loaded
+    return true
+end
+
 local function initialize()
     if config_file_error then return nil, config_file_error end
     if initialized or stopped then return initialized end
+    local ok, message = load_config_file()
+    if not ok then warn(message); return nil, message end
     cancel_initialization()
-    local ok, message = call("setup", Config.copy(options))
+    ok, message = call("setup", Config.copy(options))
     if not ok then warn(message); return nil, message end
     ok, message = bind_controls()
     if not ok then call("shutdown"); warn(message); return nil, message end
@@ -143,7 +180,7 @@ local function attach()
         await_plugin()
     end)
     subscriptions[#subscriptions + 1] = hl.on("hyprland.shutdown", function() M.shutdown() end)
-    plugin_path = resolve_config_directory() .. "/cosmic.so"
+    plugin_path = config_directory .. "/cosmic.so"
     local file = io.open(plugin_path, "rb")
     if not file then
         warn("plugin file is missing: " .. plugin_path)
@@ -159,6 +196,7 @@ end
 function M.setup(update)
     local validated, message = Config.normalize(update, options)
     if not validated then return nil, message end
+    if not config_read then pending_updates[#pending_updates + 1] = Config.copy(update or {}) end
     -- A valid explicit setup can recover from a file error. It remains the
     -- highest-priority override; reloading re-reads the file from defaults.
     config_file_error = nil
@@ -199,6 +237,7 @@ function M.enable()
     if stopped then return nil, "cosmic: call setup() to restart after shutdown()" end
     if config_file_error then return nil, config_file_error end
     options.enabled = true
+    if not config_read then pending_updates[#pending_updates + 1] = { enabled = true } end
     if initialized then
         local ok, message = call("enable")
         if not ok then warn(message); return nil, message end
@@ -217,6 +256,7 @@ end
 
 function M.disable()
     options.enabled = false
+    if not config_read then pending_updates[#pending_updates + 1] = { enabled = false } end
     remove_bindings()
     if initialized then return call("disable") end
     return true
@@ -260,17 +300,12 @@ function M.preset(name)
     return Config.preset(name)
 end
 
-config_file = resolve_config_directory() .. "/hyprcosmos.lua"
-local file_options, file_error, file_found = UserConfig.load(config_file)
-config_file_loaded = file_found and file_options ~= nil
-if file_options then
-    options = file_options
-else
-    config_file_error = file_error
-    -- A retained native plugin may exist after a config reload. A broken
-    -- user file must never keep that previous universe/input hook running.
-    if native() then call("disable") end
-    warn(file_error)
-end
+config_directory = resolve_config_directory()
+config_file = config_directory .. "/hyprcosmos.lua"
+config_file_loaded = false
+-- Never use blocking Lua file I/O for user settings on the compositor thread.
+-- On a reload the API may already exist; on startup initialize() reads the
+-- file once after the native plugin's bounded regular-file reader is ready.
+if native() and type(native().read_user_config) == "function" then load_config_file() end
 attach()
 return M
