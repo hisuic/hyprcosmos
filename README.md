@@ -18,7 +18,7 @@ CMake、pkg-config、Lua 5.5、hyprutils、hyprgraphics、Aquamarine、Wayland�
 GLES、pixman、libdrm の開発用ファイル。現在の Arch 環境には導入済みです。
 
 ```sh
-cd /home/hisui/g/hyprcosmos
+cd hyprcosmos
 ./scripts/install.sh
 hyprctl reload
 ```
