@@ -103,11 +103,11 @@ class Cosmic {
         for (const auto& m : State::monitorState()->monitors())
             if (m->m_dpmsStatus) g_pHyprRenderer->damageMonitor(m);
     }
-    void fail(const std::string& message) {
+    void fail(const std::string& message, bool notify = true) {
         reason = message;
         options.enabled = false;
         stop(message);
-        if (!notified) {
+        if (notify && !notified) {
             notified = true;
             HyprlandAPI::addNotification(pluginHandle, "Cosmic: " + message + ". Run scripts/build.sh and reinstall for Hyprland 0.56.2.", CHyprColor(1, .4, .2, 1), 8000);
         }
@@ -445,15 +445,17 @@ int setup(lua_State* L) {
                         auto word = chord.substr(begin, end - begin);
                         std::erase(word, ' ');
                         if (word == "SUPER") control.mods |= HL_MODIFIER_META;
-                        if (word == "ALT") control.mods |= HL_MODIFIER_ALT;
-                        if (word == "CTRL" || word == "CONTROL") control.mods |= HL_MODIFIER_CTRL;
-                        if (word == "SHIFT") control.mods |= HL_MODIFIER_SHIFT;
+                        else if (word == "ALT") control.mods |= HL_MODIFIER_ALT;
+                        else if (word == "CTRL" || word == "CONTROL") control.mods |= HL_MODIFIER_CTRL;
+                        else if (word == "SHIFT") control.mods |= HL_MODIFIER_SHIFT;
+                        else throw std::invalid_argument("unsupported control modifier: " + word);
                         begin = end + 1;
                     }
                     auto key = chord.substr(begin);
                     std::erase(key, ' ');
                     control.symbol = xkb_keysym_to_lower(xkb_keysym_from_name(key.c_str(), XKB_KEYSYM_CASE_INSENSITIVE));
-                    if (control.symbol != XKB_KEY_NoSymbol) next.controls.push_back(control);
+                    if (control.symbol == XKB_KEY_NoSymbol) throw std::invalid_argument("unknown control key: " + key);
+                    next.controls.push_back(control);
                 }
                 lua_pop(L, 1);
             }
@@ -468,7 +470,7 @@ int setup(lua_State* L) {
         return 1;
     } catch (const std::exception& error) {
         instance->shutdown();
-        instance->fail(error.what());
+        instance->fail(error.what(), false); // Lua reports synchronous failures once.
         lua_pushnil(L);
         lua_pushstring(L, error.what());
         return 2;
@@ -476,11 +478,11 @@ int setup(lua_State* L) {
 }
 int enable(lua_State* L) {
     try { instance->options.enabled = true; instance->initialize(); lua_pushboolean(L, true); }
-    catch (const std::exception& error) { instance->shutdown(); instance->fail(error.what()); lua_pushboolean(L, false); }
+    catch (const std::exception& error) { instance->shutdown(); instance->fail(error.what(), false); lua_pushboolean(L, false); lua_pushstring(L, error.what()); return 2; }
     return 1;
 }
 int disable(lua_State* L) { instance->options.enabled = false; instance->shutdown(); lua_pushboolean(L, true); return 1; }
-int shutdown(lua_State* L) { instance->shutdown(); lua_pushboolean(L, true); return 1; }
+int shutdown(lua_State* L) { instance->options.enabled = false; instance->shutdown(); lua_pushboolean(L, true); return 1; }
 int action(lua_State* L) { instance->action(luaL_checkstring(L, 1)); lua_pushboolean(L, true); return 1; }
 int status(lua_State* L) {
     lua_newtable(L);
