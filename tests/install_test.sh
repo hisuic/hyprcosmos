@@ -1,6 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Only the atomic settings publication is intercepted by this offline mock.
+if [[ $(basename -- "$0") == ln ]]; then
+    if [[ ${1:-} == -T && ${4:-} == "${MOCK_SETTINGS_FILE:-}" ]]; then
+        case "${MOCK_SETTINGS_RACE:-}" in
+            regular)
+                printf 'return { idle_timeout = 137, rendering = { stars = 3 } }\n' > "$MOCK_SETTINGS_FILE"
+                chmod 640 -- "$MOCK_SETTINGS_FILE" ;;
+            directory)
+                mkdir -- "$MOCK_SETTINGS_FILE"
+                printf 'keep concurrent directory\n' > "$MOCK_SETTINGS_FILE/user-data" ;;
+        esac
+    fi
+    exec "${MOCK_REAL_LN:?}" "$@"
+fi
+
 repository=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 sandbox=$(mktemp -d /tmp/hyprcosmos-install-test.XXXXXX)
 trap 'if [[ "$sandbox" == /tmp/hyprcosmos-install-test.* && -d "$sandbox" ]]; then rm -rf -- "$sandbox"; fi' EXIT
@@ -8,6 +23,7 @@ config_dir="$sandbox/hypr"
 actual_dir="$sandbox/actual config"
 config="$config_dir/hyprland.lua"
 actual="$actual_dir/hyprland.lua"
+settings="$config_dir/hyprcosmos.lua"
 state="$sandbox/state"
 mkdir -p -- "$config_dir" "$actual_dir" "$sandbox/build"
 printf 'installer fixture only: not a loadable shared object\n' > "$sandbox/build/cosmic.so"
@@ -36,6 +52,8 @@ install_fixture --dry-run
 check cmp -s "$actual" "$sandbox/original"
 check test ! -e "$state"
 check test ! -e "$config_dir/cosmic"
+check test ! -e "$settings"
+check rg -q 'User settings: .*hyprcosmos.lua \(create;' "$sandbox/install.log"
 install_fixture || { cat "$sandbox/install.log" >&2; fail 'first installation'; }
 check test -L "$config"
 check test "$(readlink -- "$config")" = "$actual"
@@ -43,10 +61,17 @@ check test "$(readlink -- "$config_dir/cosmic")" = "$repository/lua/cosmic"
 check test "$(readlink -- "$config_dir/cosmic.so")" = "$sandbox/build/cosmic.so"
 check test "$(rg -c '^require\("cosmic"\)$' "$actual")" = 1
 check test -f "$state/installation"
+check test "$(wc -l < "$state/installation")" = 9
+check cmp -s "$settings" "$repository/examples/hyprcosmos.lua"
+check test "$(stat -c %a -- "$settings")" = 600
+check test ! -e "$actual_dir/hyprcosmos.lua"
+cp -- "$settings" "$sandbox/settings-original"
 check test "$(rg --files "$actual_dir" | awk '/hyprcosmos-backup/ { count++ } END { print count+0 }')" = 1
 cp -- "$actual" "$sandbox/installed"
 install_fixture
 check cmp -s "$actual" "$sandbox/installed"
+check cmp -s "$settings" "$sandbox/settings-original"
+check rg -q 'User settings: .*hyprcosmos.lua \(preserve;' "$sandbox/install.log"
 check test "$(rg --files "$actual_dir" | awk '/hyprcosmos-backup/ { count++ } END { print count+0 }')" = 1
 uninstall_fixture --dry-run
 check cmp -s "$actual" "$sandbox/installed"
@@ -57,9 +82,11 @@ check test -L "$config"
 check test ! -L "$config_dir/cosmic"
 check test ! -L "$config_dir/cosmic.so"
 check test ! -f "$state/installation"
+check cmp -s "$settings" "$sandbox/settings-original"
 check test "$(rg --files "$actual_dir" | awk '/hyprcosmos-backup/ { count++ } END { print count+0 }')" = 2
 uninstall_fixture
 check cmp -s "$actual" "$sandbox/original"
+check cmp -s "$settings" "$sandbox/settings-original"
 install_fixture
 uninstall_fixture
 check cmp -s "$actual" "$sandbox/original"
@@ -131,4 +158,88 @@ rm -- "$config"
 ln -s -- "$actual" "$config"
 uninstall_fixture
 check cmp -s "$actual" "$sandbox/original"
+
+# User edits, metadata and even an external settings symlink remain user-owned.
+printf 'return { idle_timeout = 91, rendering = { stars = 5 } }\n' > "$settings"
+chmod 640 -- "$settings"
+cp -- "$settings" "$sandbox/settings-edited"
+settings_inode=$(stat -c %i -- "$settings")
+install_fixture --dry-run
+check rg -q 'User settings: .*hyprcosmos.lua \(preserve;' "$sandbox/install.log"
+install_fixture
+install_fixture
+uninstall_fixture
+check cmp -s "$settings" "$sandbox/settings-edited"
+check test "$(stat -c %i -- "$settings")" = "$settings_inode"
+check test "$(stat -c %a -- "$settings")" = 640
+rm -- "$settings"
+settings_target="$sandbox/private settings.lua"
+cp -- "$sandbox/settings-edited" "$settings_target"
+chmod 400 -- "$settings_target"
+ln -s -- "$settings_target" "$settings"
+install_fixture
+uninstall_fixture
+check test -L "$settings"
+check test "$(readlink -- "$settings")" = "$settings_target"
+check cmp -s "$settings_target" "$sandbox/settings-edited"
+check test "$(stat -c %a -- "$settings_target")" = 400
+rm -- "$settings"
+
+# Invalid existing paths are refused before links, ownership or config edits.
+for kind in directory fifo dangling unreadable; do
+    case "$kind" in
+        directory) mkdir -- "$settings"; printf 'preserve directory\n' > "$settings/user-data" ;;
+        fifo) mkfifo -- "$settings" ;;
+        dangling) ln -s -- "$sandbox/missing-settings.lua" "$settings" ;;
+        unreadable) cp -- "$sandbox/settings-original" "$settings"; chmod 000 -- "$settings" ;;
+    esac
+    expect_failure install_fixture --dry-run
+    expect_failure install_fixture
+    check cmp -s "$actual" "$sandbox/original"
+    check test ! -e "$state/installation"
+    check test ! -L "$config_dir/cosmic"
+    check test ! -L "$config_dir/cosmic.so"
+    case "$kind" in
+        directory)
+            check test -f "$settings/user-data"
+            rm -- "$settings/user-data"; rmdir -- "$settings" ;;
+        fifo) check test -p "$settings"; rm -- "$settings" ;;
+        dangling)
+            check test -L "$settings"
+            check test "$(readlink -- "$settings")" = "$sandbox/missing-settings.lua"
+            rm -- "$settings" ;;
+        unreadable)
+            check test "$(stat -c %a -- "$settings")" = 0
+            chmod 600 -- "$settings"
+            check cmp -s "$settings" "$sandbox/settings-original"
+            rm -- "$settings" ;;
+    esac
+done
+
+# A readable file winning the publication race is preserved, not truncated.
+mkdir -- "$sandbox/bin"
+real_ln=$(command -v ln)
+ln -s -- "$repository/tests/install_test.sh" "$sandbox/bin/ln"
+MOCK_REAL_LN="$real_ln" MOCK_SETTINGS_FILE="$settings" MOCK_SETTINGS_RACE=regular \
+    PATH="$sandbox/bin:$PATH" install_fixture
+check rg -q '^return \{ idle_timeout = 137,' "$settings"
+check test "$(stat -c %a -- "$settings")" = 640
+check rg -q 'Preserved concurrently created user settings:' "$sandbox/install.log"
+cp -- "$settings" "$sandbox/settings-race-original"
+uninstall_fixture
+check cmp -s "$settings" "$sandbox/settings-race-original"
+rm -- "$settings"
+
+# ln -T must reject a concurrent directory rather than publish a file inside it.
+MOCK_REAL_LN="$real_ln" MOCK_SETTINGS_FILE="$settings" MOCK_SETTINGS_RACE=directory \
+    PATH="$sandbox/bin:$PATH" expect_failure install_fixture
+check test -f "$settings/user-data"
+check test "$(find "$settings" -mindepth 1 -maxdepth 1 -type f | wc -l)" = 1
+check cmp -s "$actual" "$sandbox/original"
+check test ! -e "$state/installation"
+check test ! -L "$config_dir/cosmic"
+check test ! -L "$config_dir/cosmic.so"
+check test "$(find "$config_dir" -maxdepth 1 -name '.hyprcosmos-settings.*' | wc -l)" = 0
+rm -- "$settings/user-data"
+rmdir -- "$settings"
 printf 'Installer lifecycle: %s checks passed (isolated fixtures; no session contacted)\n' "$checks"
