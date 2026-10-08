@@ -47,6 +47,9 @@ class CosmicRenderer {
 
     // Must run with the compositor GL context current. draw() initializes lazily.
     bool initialize();
+    // Start the ambient clock at each idle entry; no background work while idle
+    // detection is waiting in the normal desktop.
+    void beginScene();
     void configure(std::size_t stars, double background);
     // Enqueues a custom pass; OpenGL drawing occurs when Hyprland executes it.
     void draw(PHLMONITOR monitor, const Universe& universe,
