@@ -214,10 +214,20 @@ Vec2 Universe::screenToWorld(Vec2 position, int region_id) const {
 }
 
 uint64_t Universe::hitTest(Vec2 screen_position) const {
+    return hitTestInRegion(screen_position, nullptr);
+}
+
+uint64_t Universe::hitTest(Vec2 screen_position, int visible_region) const {
+    return hitTestInRegion(screen_position, &visible_region);
+}
+
+uint64_t Universe::hitTestInRegion(Vec2 screen_position, const int* visible_region) const {
     if (!std::isfinite(screen_position.x) || !std::isfinite(screen_position.y))
         return 0;
     for (auto iterator = m_bodies.rbegin(); iterator != m_bodies.rend(); ++iterator) {
         const Body& body = *iterator;
+        if (visible_region && body.region != *visible_region)
+            continue;
         if (body.stored || body.sink_progress > 0.0 || body.scale < 0.001)
             continue;
         const auto& region = regionFor(body.region);
@@ -237,9 +247,16 @@ uint64_t Universe::hitTest(Vec2 screen_position) const {
 }
 
 bool Universe::startBlackHole(Vec2 screen_cursor) {
+    return startBlackHoleById(screen_cursor, hitTest(screen_cursor));
+}
+
+bool Universe::startBlackHole(Vec2 screen_cursor, int visible_region) {
+    return startBlackHoleById(screen_cursor, hitTest(screen_cursor, visible_region));
+}
+
+bool Universe::startBlackHoleById(Vec2 screen_cursor, uint64_t id) {
     if (!m_config.black_hole || m_rewinding)
         return false;
-    const uint64_t id = hitTest(screen_cursor);
     const auto found = std::find_if(m_bodies.begin(), m_bodies.end(), [&](const Body& body) { return body.id == id; });
     if (found == m_bodies.end())
         return false;
