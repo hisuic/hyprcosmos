@@ -16,6 +16,11 @@ double finiteClamp(double value, double low, double high, double fallback) {
 double lengthSquared(Vec2 value) { return value.x * value.x + value.y * value.y; }
 double length(Vec2 value) { return std::hypot(value.x, value.y); }
 double dot(Vec2 a, Vec2 b) { return a.x * b.x + a.y * b.y; }
+double cross(Vec2 a, Vec2 b) { return a.x * b.y - a.y * b.x; }
+double smoothProgress(double value, double begin) {
+    const double progress = std::clamp((value - begin) / (1.0 - begin), 0.0, 1.0);
+    return progress * progress * (3.0 - 2.0 * progress);
+}
 Vec2 rotate(Vec2 value, double angle) {
     const double cosine = std::cos(angle), sine = std::sin(angle);
     return {value.x * cosine - value.y * sine, value.x * sine + value.y * cosine};
@@ -154,6 +159,14 @@ void Universe::normalizeBody(Body& body, bool initialize_velocity) {
     body.cooldown = finiteClamp(body.cooldown, 0.0, 20.0, 0.0);
     body.sink_progress = finiteClamp(body.sink_progress, 0.0, 1.0, 0.0);
     body.sink_center = safeVector(body.sink_center, body.position);
+    body.sink_start_offset = safeVector(body.sink_start_offset);
+    body.sink_entry_axis = safeVector(body.sink_entry_axis, {1.0, 0.0});
+    body.sink_arc = finiteClamp(body.sink_arc, 0.0, 100000.0, 0.0);
+    body.sink_start_angle = finiteClamp(body.sink_start_angle, -TAU, TAU, body.angle);
+    body.sink_turn_sign = body.sink_turn_sign < 0.0 ? -1.0 : 1.0;
+    body.sink_duration = finiteClamp(body.sink_duration, 0.0, 40000.0, 0.0);
+    body.sink_camera_center = safeVector(body.sink_camera_center, region.center());
+    body.sink_camera_zoom = finiteClamp(body.sink_camera_zoom, 0.02, 1.0, 1.0);
     if (initialize_velocity) {
         if (body.id == m_focused_id)
             body.mass = std::min(100.0, body.mass * 3.5);
@@ -264,7 +277,31 @@ bool Universe::startBlackHoleById(Vec2 screen_cursor, uint64_t id) {
     // This center is captured once: later mouse motion does not drag the hole.
     found->sink_center = screenToWorld(screen_cursor, found->region);
     found->original_scale = found->scale;
-    found->cooldown = m_config.sink_duration + m_config.wormhole_cooldown;
+    found->sink_start_offset = found->position - found->sink_center;
+    const double distance = length(found->sink_start_offset);
+    found->sink_entry_axis = distance > 1e-6 ? found->sink_start_offset / distance
+        : length(found->velocity) > 1e-6 ? found->velocity / length(found->velocity)
+        : rotate({1.0, 0.0}, static_cast<double>(found->id % 4096) / 4096.0 * TAU);
+    found->sink_start_angle = found->angle;
+    const double momentum = cross(found->sink_start_offset, found->velocity);
+    found->sink_turn_sign = std::abs(momentum) > 1e-6 ? (momentum < 0.0 ? -1.0 : 1.0)
+                                                   : (found->id % 2 ? 1.0 : -1.0);
+    const Camera* camera = cameraFor(found->region);
+    found->sink_camera_center = camera ? camera->center : regionFor(found->region).center();
+    found->sink_camera_zoom = camera ? camera->zoom : 1.0;
+    const double visible_size = std::max(found->width, found->height) * found->scale * found->sink_camera_zoom;
+    const auto& region = regionFor(found->region);
+    const double excursion = std::min(std::clamp(visible_size * 0.18, 36.0, 100.0),
+                                     std::min(region.width, region.height) * 0.10);
+    // sin(pi*p)*(1-p) peaks at approximately 0.58. Even an exact center
+    // selection gets a visible take-in arc, with no displacement at activation.
+    found->sink_arc = excursion / (0.58 * found->sink_camera_zoom);
+    // Conservative analytic speed bounds for the radial and tangential terms.
+    // Extend only durations that would make the requested path exceed the cap.
+    const double radial_bound = 2.0 * distance + (PI + 1.0) * found->sink_arc;
+    const double angular_bound = 3.0 * PI * (0.34 * distance + 0.60 * found->sink_arc);
+    found->sink_duration = std::max(m_config.sink_duration, std::hypot(radial_bound, angular_bound) / m_config.max_speed);
+    found->cooldown = found->sink_duration + m_config.wormhole_cooldown;
     return true;
 }
 
@@ -407,16 +444,43 @@ void Universe::integrate(double dt) {
         if (body.stored)
             continue;
         if (body.sink_progress > 0.0) {
-            body.sink_progress = std::min(1.0, body.sink_progress + dt / m_config.sink_duration);
+            const double previous_scale = body.scale;
+            const double duration = std::max(m_config.fixed_step, body.sink_duration);
+            body.sink_progress = std::min(1.0, body.sink_progress + dt / duration);
             const double progress = body.sink_progress;
-            const Vec2 relative = body.position - body.sink_center;
-            const double spin = 1.3 + 8.0 * progress * progress;
-            body.position = body.sink_center + rotate(relative, spin * dt) * std::exp(-(0.8 + progress * 9.0) * dt);
-            body.velocity = limited((body.sink_center - body.position) * (2.0 + progress * 10.0), m_config.max_speed);
-            body.angle = std::remainder(body.angle + (2.0 + progress * 22.0) * dt, TAU);
-            body.scale = body.original_scale * std::pow(1.0 - progress, 1.7);
-            body.stretch = m_config.spaghetti ? 1.0 + std::sin(progress * PI) * 5.0 : 1.0;
-            body.twist = m_config.spaghetti ? progress * 6.0 : 0.0;
+            const double remaining = 1.0 - progress;
+            const double phase = body.sink_turn_sign * 3.0 * PI * (0.2 * progress + 0.8 * progress * progress);
+            const double phase_derivative = body.sink_turn_sign * 3.0 * PI * (0.2 + 1.6 * progress);
+            const double kick = std::sin(PI * progress) * remaining;
+            const double kick_derivative = PI * std::cos(PI * progress) * remaining - std::sin(PI * progress);
+            const Vec2 relative = body.sink_start_offset * (remaining * remaining) + body.sink_entry_axis * (body.sink_arc * kick);
+            const Vec2 radial_velocity = body.sink_start_offset * (-2.0 * remaining) + body.sink_entry_axis * (body.sink_arc * kick_derivative);
+            const Vec2 tangent_velocity{-relative.y * phase_derivative, relative.x * phase_derivative};
+            body.position = body.sink_center + rotate(relative, phase);
+            body.velocity = limited(rotate(radial_velocity + tangent_velocity, phase) / duration, m_config.max_speed);
+            body.angle = std::remainder(body.sink_start_angle + body.sink_turn_sign * TAU *
+                                       (1.2 * progress + 3.0 * progress * progress), TAU);
+            const double scale_envelope = 1.0 - progress * progress;
+            body.scale = body.original_scale * scale_envelope * scale_envelope;
+            body.stretch = m_config.spaghetti ? 1.0 + std::sin(smoothProgress(progress, 0.10) * PI) * 3.0 : 1.0;
+            body.twist = m_config.spaghetti ? smoothProgress(progress, 0.20) * 6.0 : 0.0;
+            const auto& region = regionFor(body.region);
+            const Vec2 display = region.center() + (body.position - body.sink_camera_center) * body.sink_camera_zoom;
+            // Bound the actual shader's rotated/stretched/twisted rectangle,
+            // rather than its smaller collision-circle approximation. Twisting
+            // a normalized square can expand each axis up to sqrt(2).
+            const double winding = std::min(PI * 0.25, std::abs(body.twist));
+            const double normalized_extent = std::cos(winding) + std::sin(winding);
+            const double half_x = body.width * body.stretch * normalized_extent * 0.5;
+            const double half_y = body.height / body.stretch * normalized_extent * 0.5 + body.height * progress * 0.24;
+            const double cosine = std::abs(std::cos(body.angle)), sine = std::abs(std::sin(body.angle));
+            const double bound_x = (half_x * cosine + half_y * sine) * body.sink_camera_zoom;
+            const double bound_y = (half_x * sine + half_y * cosine) * body.sink_camera_zoom;
+            const double available_x = std::min(display.x - region.x, region.x + region.width - display.x) - 4.0;
+            const double available_y = std::min(display.y - region.y, region.y + region.height - display.y) - 4.0;
+            body.scale = std::min(body.scale, previous_scale);
+            if (available_x > 0.0 && available_y > 0.0)
+                body.scale = std::min({body.scale, available_x / bound_x, available_y / bound_y});
             if (progress >= 1.0) {
                 body.stored = true;
                 body.position = body.sink_center;
@@ -526,6 +590,16 @@ void Universe::integrate(double dt) {
 void Universe::updateCameras(double dt) {
     for (auto& camera : m_cameras) {
         const auto& region = regionFor(camera.region);
+        const auto sinking = std::find_if(m_bodies.begin(), m_bodies.end(), [&](const Body& body) {
+            return body.region == camera.region && body.sink_progress > 0.0 && !body.stored;
+        });
+        if (sinking != m_bodies.end()) {
+            // Preserve the activation's screen-space anchor and apparent scale.
+            // The seeds live in Body, so rewind restores this camera too.
+            camera.center = sinking->sink_camera_center;
+            camera.zoom = sinking->sink_camera_zoom;
+            continue;
+        }
         double minimum_x = region.x, maximum_x = region.x + region.width;
         double minimum_y = region.y, maximum_y = region.y + region.height;
         for (const auto& body : m_bodies) {
