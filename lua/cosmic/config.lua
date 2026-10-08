@@ -29,7 +29,7 @@ M.defaults = {
         fullscreen = true, idle_inhibit = true, screenshare = true,
         classes = { "^steam_app_", "^steam$", "^gamescope$", "^mpv$" },
     },
-    rendering = { particles = 96, stars = 120, background = 0.16 },
+    rendering = { particles = 96, stars = 120, background = 0.16, snapshot_mb = 128 },
     -- Dedicated keys avoid modifier preambles: ordinary modifier presses must
     -- restore immediately, including modifiers used by input methods.
     controls = {
@@ -39,23 +39,24 @@ M.defaults = {
 }
 
 local ranges = {
-    idle_timeout = { 0.1, 86400 }, seed = { 0, 0xFFFFFFFF, true },
-    max_windows = { 1, 64, true }, fps = { 10, 120, true },
-    snapshot_hz = { 0.1, 30 }, history_seconds = { 0.1, 120 },
-    history_hz = { 1, 120 }, history_mb = { 1, 128 },
-    ["physics.fixed_step"] = { 1 / 1000, 1 / 20 },
-    ["physics.max_substeps"] = { 1, 32, true },
+    idle_timeout = { 0.25, 3600 }, seed = { 0, 0xFFFFFFFF, true },
+    max_windows = { 1, 48, true }, fps = { 10, 120, true },
+    snapshot_hz = { 0.25, 30 }, history_seconds = { 0.1, 60 },
+    history_hz = { 1, 120 }, history_mb = { 1, 64 },
+    ["physics.fixed_step"] = { 1 / 240, 1 / 20 },
+    ["physics.max_substeps"] = { 1, 16, true },
     ["physics.cursor_strength"] = { 0, 100000000 },
-    ["physics.mutual_strength"] = { 0, 100000000 },
-    ["physics.softening"] = { 1, 10000 },
-    ["physics.max_acceleration"] = { 1, 100000 },
-    ["physics.max_speed"] = { 1, 10000 }, ["physics.damping"] = { 0, 100 },
+    ["physics.mutual_strength"] = { 0, 10000000 },
+    ["physics.softening"] = { 1, 1000 },
+    ["physics.max_acceleration"] = { 1, 10000 },
+    ["physics.max_speed"] = { 1, 5000 }, ["physics.damping"] = { 0, 10 },
     ["physics.restitution"] = { 0, 1 }, ["physics.collision_strength"] = { 0, 1 },
-    ["physics.expansion_rate"] = { 0, 0.2 }, ["physics.sink_duration"] = { 0.1, 60 },
-    ["physics.wormhole_cooldown"] = { 0.1, 60 },
-    ["physics.explosion_strength"] = { 0, 10000 },
-    ["rendering.particles"] = { 0, 1024, true },
+    ["physics.expansion_rate"] = { 0, 0.1 }, ["physics.sink_duration"] = { 0.2, 30 },
+    ["physics.wormhole_cooldown"] = { 0.1, 10 },
+    ["physics.explosion_strength"] = { 0, 5000 },
+    ["rendering.particles"] = { 0, 384, true },
     ["rendering.stars"] = { 0, 1024, true }, ["rendering.background"] = { 0, 1 },
+    ["rendering.snapshot_mb"] = { 16, 512 },
 }
 
 function M.copy(value)
