@@ -7,7 +7,11 @@ hl.config({
     animations = { enabled = false },
     input = { follow_mouse = 1 },
     misc = { disable_hyprland_logo = true, force_default_wallpaper = 0,
-             background_color = "rgb(682345)", enable_anr_dialog = false },
+             background_color = "rgb(682345)", enable_anr_dialog = false,
+             -- Lifecycle checks explicitly choose their reload boundary. An
+             -- inotify reload during config generation would test a race in
+             -- the harness instead of an active direct plugin unload.
+             disable_autoreload = true },
     debug = { disable_logs = false },
 })
 
