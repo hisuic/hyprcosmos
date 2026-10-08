@@ -28,7 +28,9 @@ M.defaults = {
         fullscreen = true, idle_inhibit = true, screenshare = true,
         classes = { "^steam_app_", "^steam$", "^gamescope$", "^mpv$" },
     },
-    rendering = { particles = 96, stars = 120, background = 0.16, snapshot_mb = 128 },
+    -- Cosmic replaces the wallpaper only while active. Explicit values below
+    -- one opt back into transparency; zero stars also disables meteors.
+    rendering = { particles = 96, stars = 240, background = 1, snapshot_mb = 128 },
     -- Dedicated keys avoid modifier preambles: ordinary modifier presses must
     -- restore immediately, including modifiers used by input methods.
     controls = {
