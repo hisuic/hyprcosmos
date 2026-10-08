@@ -141,6 +141,7 @@ client_a=$!
 env -u HYPRLAND_INSTANCE_SIGNATURE WAYLAND_DISPLAY="$socket" "$output/wayland-probe" --window 1 > "$output/client-b.jsonl" 2>&1 &
 client_b=$!
 sleep 1
+eval_lua 'local s=require("cosmic").status(); assert(s.module_initialized and s.error==nil)'
 ctl -j clients > "$output/normal-clients.json"
 capture normal
 measure_cpu normal 2
