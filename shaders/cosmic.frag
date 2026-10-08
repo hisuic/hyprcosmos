@@ -38,7 +38,7 @@ float skyRandom(uint value) {
     return float(skyHash(value) >> 8u) / 16777216.0;
 }
 
-// Original 5x7 ASCII pixel glyphs: '.', '+', '*', and '\\' for meteor tails.
+// Original 5x7 ASCII pixel glyphs: '.', '+', '*', '\\', '/', '-', and '|'.
 // No font lookup, texture upload, per-star draw call or neighbor-cell search.
 float asciiGlyph(vec2 offset, int glyph, float inkSize) {
     vec2 ink = offset / inkSize + vec2(2.5, 3.5);
@@ -56,8 +56,14 @@ float asciiGlyph(vec2 offset, int glyph, float inkSize) {
         if (cell.y == 1 || cell.y == 5) row = 17u;
         if (cell.y == 2 || cell.y == 4) row = 10u;
         if (cell.y == 3) row = 31u;
-    } else {
+    } else if (glyph == 3) {
         if (cell.y >= 1 && cell.y <= 5) row = 1u << uint(cell.y - 1);
+    } else if (glyph == 4) {
+        if (cell.y >= 1 && cell.y <= 5) row = 1u << uint(5 - cell.y);
+    } else if (glyph == 5) {
+        if (cell.y == 3) row = 31u;
+    } else if (glyph == 6) {
+        if (cell.y >= 1 && cell.y <= 5) row = 4u;
     }
     if ((row & (1u << uint(cell.x))) == 0u) return 0.0;
     vec2 edge = min(fract(ink), 1.0 - fract(ink));
@@ -90,23 +96,36 @@ vec3 asciiStars(vec2 logical, vec2 canvas) {
 
 vec3 asciiMeteor(vec2 logical, vec2 canvas) {
     if (uStars <= 0.0) return vec3(0.0);
-    // One bounded event per epoch, with randomized onset: no global RNG,
-    // timers, accumulated particles, or state to leak when Cosmic stops.
-    float epoch = floor(uTime / 12.0);
+    // Much rarer than the star twinkle: first onset 18..42 seconds, then
+    // 48..96 seconds between events. No timers or accumulated particle state.
+    float epoch = floor(uTime / 72.0);
     uint key = skyHash(uint(epoch) ^ uSeed ^ 0x4d455445u);
-    float age = mod(uTime, 12.0) - (3.0 + skyRandom(key) * 4.0);
-    if (age < 0.0 || age > 1.8) return vec3(0.0);
-    vec2 origin = canvas * vec2(0.12 + skyRandom(key + 1u) * 0.20,
-                                0.12 + skyRandom(key + 2u) * 0.20);
-    vec2 travel = canvas * vec2(0.52, 0.24);
-    vec2 direction = normalize(travel);
-    vec2 head = origin + travel * (age / 1.8);
-    float segment = floor(dot(head - logical, direction) / 12.0 + 0.5);
+    float age = mod(uTime, 72.0) - (18.0 + skyRandom(key) * 24.0);
+    float lifetime = 1.3 + skyRandom(key + 6u) * 0.9;
+    if (age < 0.0 || age > lifetime) return vec3(0.0);
+    float angle = skyRandom(key + 1u) * 6.2831853;
+    vec2 direction = vec2(cos(angle), sin(angle));
+    vec2 midpoint = canvas * vec2(0.30 + skyRandom(key + 2u) * 0.40,
+                                  0.30 + skyRandom(key + 3u) * 0.40);
+    // A centered chord in logical space preserves the sampled angle on both
+    // portrait and ultrawide outputs, and keeps the entire head path visible.
+    float chord = min(canvas.x / max(abs(direction.x), 0.001),
+                      canvas.y / max(abs(direction.y), 0.001));
+    vec2 travel = direction * chord * (0.28 + skyRandom(key + 4u) * 0.16);
+    float size = min(0.7 + skyRandom(key + 5u) * 1.1,
+                     max(0.45, min(canvas.x, canvas.y) / 80.0));
+    vec2 head = midpoint + travel * (age / lifetime - 0.5);
+    float spacing = 12.0 * size;
+    float segment = floor(dot(head - logical, direction) / spacing + 0.5);
     if (segment < 0.0 || segment > 9.0) return vec3(0.0);
-    vec2 offset = logical - (head - direction * segment * 12.0);
-    int glyph = segment < 0.5 ? 2 : (segment < 5.5 ? 3 : 0);
-    float inkSize = segment < 0.5 ? 1.8 : 1.35;
-    float envelope = smoothstep(0.0, 0.16, age) * (1.0 - smoothstep(1.25, 1.8, age));
+    vec2 offset = logical - (head - direction * segment * spacing);
+    // Keep ASCII upright, with a slash/line matching the actual trail heading.
+    int trailGlyph = abs(direction.y) < abs(direction.x) * 0.4 ? 5 :
+                     (abs(direction.x) < abs(direction.y) * 0.4 ? 6 :
+                      (direction.x * direction.y >= 0.0 ? 3 : 4));
+    int glyph = segment < 0.5 ? 2 : (segment < 5.5 ? trailGlyph : 0);
+    float inkSize = (segment < 0.5 ? 1.8 : 1.35) * size;
+    float envelope = smoothstep(0.0, 0.16, age) * (1.0 - smoothstep(lifetime - 0.55, lifetime, age));
     float trail = pow(1.0 - segment / 10.0, 1.6);
     return vec3(0.70, 0.87, 1.0) * envelope * trail * asciiGlyph(offset, glyph, inkSize);
 }
