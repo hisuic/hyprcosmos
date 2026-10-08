@@ -8,8 +8,8 @@ namespace cosmic {
 
 // A long-lived IME keyboard grab is an input route, not proof of activity.
 // Never inspect or retain the user's preedit text in this policy helper.
-constexpr bool activeIMEComposition(bool focusedTextInput, bool nonemptyPreedit) noexcept {
-    return focusedTextInput && nonemptyPreedit;
+constexpr bool activeIMEComposition(bool enabledFocusedTextInput, bool preeditCommitted, bool nonemptyPreedit) noexcept {
+    return enabledFocusedTextInput && preeditCommitted && nonemptyPreedit;
 }
 
 namespace desktop_ui_detail {
