@@ -59,8 +59,10 @@ class Cosmic;
 Cosmic* instance = nullptr;
 using RenderWindowFn = void (*)(Render::IHyprRenderer*, PHLWINDOW, PHLMONITOR, const Time::steady_tp&, bool, Render::eRenderPassMode, bool, bool);
 void renderWindowHook(Render::IHyprRenderer*, PHLWINDOW, PHLMONITOR, const Time::steady_tp&, bool, Render::eRenderPassMode, bool, bool);
-using ScreenshareActiveFn = bool (*)(Screenshare::CScreenshareSession*);
-bool screenshareActiveHook(Screenshare::CScreenshareSession*);
+// Keep the exact C++ return type so the compiler supplies the same hidden
+// structure-return argument as CScreenshareSession::nextFrame(bool).
+using ScreenshareFrameFn = UP<Screenshare::CScreenshareFrame> (*)(Screenshare::CScreenshareSession*, bool);
+UP<Screenshare::CScreenshareFrame> screenshareFrameHook(Screenshare::CScreenshareSession*, bool);
 
 class Cosmic {
   public:
@@ -72,13 +74,13 @@ class Cosmic {
     CHyprSignalListener reload;
     SP<CEventLoopTimer> timer;
     CFunctionHook* hook = nullptr;
-    CFunctionHook* shareStateHook = nullptr;
+    CFunctionHook* shareFrameHook = nullptr;
     bool initialized = false, active = false, capturing = false, alternateRegion = false;
     bool previousScanoutBlocked = false;
     bool notified = false;
-    bool probingShares = false, probedActiveShare = false;
     std::string reason = "not initialized";
 Clock::time_point lastInput = Clock::now(), lastTick = lastInput, lastCapture = lastInput;
+    Clock::time_point lastShareRequest{}, shareObservationUntil{};
     std::size_t refreshIndex = 0, snapshotBytes = 0;
     uint64_t physicsSteps = 0;
     double lastBootTime = bootTime();
@@ -136,17 +138,17 @@ Clock::time_point lastInput = Clock::now(), lastTick = lastInput, lastCapture = 
     bool sharesActive() {
         const auto& monitors = State::monitorState()->monitors();
         if (monitors.empty()) return false;
-        // 0.56.2 exposes no all-session accessor: isOutputBeingSSd excludes
-        // window captures. Its public outputCopyFBState query, however, calls
-        // public isActive() on EVERY session before filtering capture types.
-        // Observe those return values without reading private object layouts.
-        // The detour is mandatory; uncertainty must prevent automatic entry.
-        if (!shareStateHook || !shareStateHook->m_original) return true;
-        probingShares = true;
-        probedActiveShare = false;
-        struct ProbeGuard { bool& flag; ~ProbeGuard() { flag = false; } } guard{probingShares};
-        (void)Screenshare::mgr()->outputCopyFBState(monitors.front());
-        return probedActiveShare;
+        if (!shareFrameHook || !shareFrameHook->m_original) return true;
+        const auto now = Clock::now();
+        // The compositor marks sharing stopped after 500 ms without frames.
+        // Allow that timeout plus a normal 250 ms polling interval, without
+        // confusing a long-lived session with ongoing sharing.
+        if (std::chrono::duration<double>(now - lastShareRequest).count() < .75) return true;
+        for (const auto& monitor : monitors) {
+            const auto state = Screenshare::mgr()->outputCopyFBState(monitor);
+            if (state.sharingSessions > 0 || state.pendingFrames > 0) return true;
+        }
+        return false;
     }
     bool blocked() {
         if (g_pSessionLockManager->isSessionLocked() || g_pInputManager->isConstrained() || g_pInputManager->isLocked()) return true;
@@ -173,7 +175,7 @@ Clock::time_point lastInput = Clock::now(), lastTick = lastInput, lastCapture = 
             if (control.symbol == symbol && control.mods == mods) return true;
         return false;
     }
-    void stop(const std::string& why, bool refreshPointer = false) {
+    void stop(const std::string& why, bool refreshPointer = false, bool shareKnownActive = false) {
         const bool wasActive = active;
         active = false; // BEFORE any input hit testing or seat delivery.
         reason = why;
@@ -182,10 +184,11 @@ Clock::time_point lastInput = Clock::now(), lastTick = lastInput, lastCapture = 
             universe.reset({}, {}, cursor());
             snapshots.clear();
             snapshotBytes = 0;
-            bool shareBlocked = sharesActive();
+            // A nextFrame callback already knows a share is starting. Avoid
+            // querying compositor share state while handling that request.
+            bool shareBlocked = shareKnownActive || sharesActive();
             for (const auto& monitor : State::monitorState()->monitors())
-                shareBlocked = shareBlocked || Screenshare::mgr()->isOutputBeingSSd(monitor) ||
-                    Screenshare::mgr()->outputCopyFBState(monitor).needsCopyFB();
+                shareBlocked = shareBlocked || Screenshare::mgr()->outputCopyFBState(monitor).pendingFrames > 0;
             g_pHyprRenderer->m_directScanoutBlocked = previousScanoutBlocked || shareBlocked;
             damage();
             if (refreshPointer) g_pInputManager->simulateMouseMovement();
@@ -205,12 +208,12 @@ Clock::time_point lastInput = Clock::now(), lastTick = lastInput, lastCapture = 
             HyprlandAPI::removeFunctionHook(pluginHandle, hook);
             hook = nullptr;
         }
-        if (shareStateHook) {
-            shareStateHook->unhook();
-            HyprlandAPI::removeFunctionHook(pluginHandle, shareStateHook);
-            shareStateHook = nullptr;
+        if (shareFrameHook) {
+            shareFrameHook->unhook();
+            HyprlandAPI::removeFunctionHook(pluginHandle, shareFrameHook);
+            shareFrameHook = nullptr;
         }
-        probingShares = probedActiveShare = false;
+        lastShareRequest = shareObservationUntil = Clock::time_point{};
         if (g_pHyprRenderer && g_pHyprRenderer->glBackend()) {
             g_pHyprRenderer->glBackend()->makeEGLCurrent();
             renderer.release();
@@ -248,6 +251,9 @@ Clock::time_point lastInput = Clock::now(), lastTick = lastInput, lastCapture = 
     }
     void start(bool preview) {
         if (!initialized || !options.enabled || active || blocked()) return;
+        // Observe existing window streams for the compositor's 500 ms stop
+        // timeout plus one poll. This gate does not extend ordinary idle time.
+        if (options.excludeShare && Clock::now() < shareObservationUntil) return;
         if (!preview && held()) return;
         g_pHyprRenderer->glBackend()->makeEGLCurrent();
         if (!renderer.initialize()) { fail(renderer.error()); return; }
@@ -346,13 +352,13 @@ Clock::time_point lastInput = Clock::now(), lastTick = lastInput, lastCapture = 
     void initialize() {
         if (initialized) return;
         if (!g_pHyprRenderer->glBackend()) throw std::runtime_error("OpenGL renderer required");
-        for (const auto& match : HyprlandAPI::findFunctionsByName(pluginHandle, "isActive")) {
-            if (match.demangled.find("Screenshare::CScreenshareSession::isActive()") == std::string::npos) continue;
-            shareStateHook = HyprlandAPI::createFunctionHook(pluginHandle, match.address, reinterpret_cast<void*>(screenshareActiveHook));
+        for (const auto& match : HyprlandAPI::findFunctionsByName(pluginHandle, "nextFrame")) {
+            if (match.demangled.find("Screenshare::CScreenshareSession::nextFrame(bool)") == std::string::npos) continue;
+            shareFrameHook = HyprlandAPI::createFunctionHook(pluginHandle, match.address, reinterpret_cast<void*>(screenshareFrameHook));
             break;
         }
-        if (!shareStateHook || !shareStateHook->hook())
-            throw std::runtime_error("complete screenshare-state observation could not be installed");
+        if (!shareFrameHook || !shareFrameHook->hook())
+            throw std::runtime_error("screenshare-frame observation could not be installed");
         const auto matches = HyprlandAPI::findFunctionsByName(pluginHandle, "renderWindow");
         for (const auto& match : matches) {
             if (match.demangled.find("IHyprRenderer::renderWindow(") == std::string::npos) continue;
@@ -398,6 +404,8 @@ Clock::time_point lastInput = Clock::now(), lastTick = lastInput, lastCapture = 
         }, nullptr);
         g_pEventLoopManager->addTimer(timer);
         lastInput = lastTick = Clock::now();
+        lastShareRequest = Clock::time_point{};
+        shareObservationUntil = lastInput + std::chrono::milliseconds(750);
         lastBootTime = bootTime();
         initialized = true;
         reason = "waiting for idle";
@@ -428,10 +436,12 @@ void renderWindowHook(Render::IHyprRenderer* self, PHLWINDOW window, PHLMONITOR 
     reinterpret_cast<RenderWindowFn>(instance->hook->m_original)(self, window, monitor, time, decorate, mode, ignorePosition, standalone);
 }
 
-bool screenshareActiveHook(Screenshare::CScreenshareSession* session) {
-    const bool result = reinterpret_cast<ScreenshareActiveFn>(instance->shareStateHook->m_original)(session);
-    if (instance->probingShares && result) instance->probedActiveShare = true;
-    return result; // Ordinary compositor queries always retain their exact result.
+UP<Screenshare::CScreenshareFrame> screenshareFrameHook(Screenshare::CScreenshareSession* session, bool overlayCursor) {
+    // Only two timestamps are retained, not session pointers or an unbounded
+    // cache. Stop BEFORE the compositor creates/copies the first shared frame.
+    instance->lastShareRequest = Clock::now();
+    if (instance->options.excludeShare && instance->active) instance->stop("screen sharing", false, true);
+    return reinterpret_cast<ScreenshareFrameFn>(instance->shareFrameHook->m_original)(session, overlayCursor);
 }
 
 int setup(lua_State* L) {
