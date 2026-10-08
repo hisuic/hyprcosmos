@@ -29,6 +29,24 @@ local calm = assert(Config.normalize({ preset = "calm" }, demo))
 check(calm.physics.cursor_strength == Config.defaults.physics.cursor_strength, "switching presets resets preset physics")
 local chords = assert(Config.normalize({ controls = { preview = "alt + super + c" } }))
 check(chords.controls.preview == "SUPER+ALT+C", "controls normalize case, whitespace and modifier order before native parsing")
+-- These limits match both the native setup parser and Universe::configure;
+-- successful options must retain their value rather than silently clamp later.
+for _, boundary in ipairs({
+    { "cursor_strength", 0, 20000000 }, { "mutual_strength", 0, 2000000 },
+    { "softening", 10, 2000 }, { "max_acceleration", 10, 10000 },
+    { "max_speed", 10, 5000 }, { "fixed_step", 1 / 240, 1 / 30 },
+    { "sink_duration", 0.3, 20 }, { "wormhole_cooldown", 0.2, 10 },
+    { "explosion_strength", 0, 3000 },
+}) do
+    local name, low, high = boundary[1], boundary[2], boundary[3]
+    local minimum = assert(Config.normalize({ physics = { [name] = low } }))
+    local maximum = assert(Config.normalize({ physics = { [name] = high } }))
+    check(minimum.physics[name] == low and maximum.physics[name] == high, name .. " accepts effective boundaries")
+    check(not Config.normalize({ physics = { [name] = low - 0.00001 } }), name .. " rejects below its effective minimum")
+    check(not Config.normalize({ physics = { [name] = high + 0.00001 } }), name .. " rejects above its effective maximum")
+end
+check(Config.normalize({ history_hz = 60 }).history_hz == 60 and
+    not Config.normalize({ history_hz = 60.01 }), "history frequency matches the simulation's sixty Hz cap")
 
 local original_open = io.open
 local function mock(mode)
