@@ -196,6 +196,14 @@ function M.enable()
         if not ok then warn(message); return nil, message end
         return bind_controls()
     end
+    if native_ready() then return initialize() end
+    if not plugin_requested then
+        return nil, last_error or "cosmic: native plugin is unavailable; install it and reload Hyprland"
+    end
+    -- An explicit enable retries a previous availability deadline. Repeated
+    -- calls while a probe is already pending keep the same bounded attempt.
+    if not initialization_timer then initialization_attempts = 0 end
+    await_plugin()
     return true
 end
 
