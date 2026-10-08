@@ -103,6 +103,7 @@ local function load_config_file()
     if config_read then return not config_file_error, config_file_error end
     local api = native()
     if not api or type(api.read_user_config) ~= "function" then
+        if api then call("disable") end
         return nil, "native plugin is unavailable or lacks the safe user settings reader"
     end
     config_read = true
