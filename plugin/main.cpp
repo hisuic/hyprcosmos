@@ -18,7 +18,6 @@
 #include <cmath>
 #include <regex>
 #include <stdexcept>
-#include <unordered_set>
 #include "physics.hpp"
 #include "renderer.hpp"
 
@@ -60,6 +59,8 @@ class Cosmic;
 Cosmic* instance = nullptr;
 using RenderWindowFn = void (*)(Render::IHyprRenderer*, PHLWINDOW, PHLMONITOR, const Time::steady_tp&, bool, Render::eRenderPassMode, bool, bool);
 void renderWindowHook(Render::IHyprRenderer*, PHLWINDOW, PHLMONITOR, const Time::steady_tp&, bool, Render::eRenderPassMode, bool, bool);
+using ScreenshareActiveFn = bool (*)(Screenshare::CScreenshareSession*);
+bool screenshareActiveHook(Screenshare::CScreenshareSession*);
 
 class Cosmic {
   public:
@@ -71,10 +72,11 @@ class Cosmic {
     CHyprSignalListener reload;
     SP<CEventLoopTimer> timer;
     CFunctionHook* hook = nullptr;
+    CFunctionHook* shareStateHook = nullptr;
     bool initialized = false, active = false, capturing = false, alternateRegion = false;
     bool previousScanoutBlocked = false;
     bool notified = false;
-    std::unordered_set<std::string> shares;
+    bool probingShares = false, probedActiveShare = false;
     std::string reason = "not initialized";
 Clock::time_point lastInput = Clock::now(), lastTick = lastInput, lastCapture = lastInput;
     std::size_t refreshIndex = 0, snapshotBytes = 0;
@@ -131,14 +133,29 @@ Clock::time_point lastInput = Clock::now(), lastTick = lastInput, lastCapture = 
         }
         return false;
     }
-    bool blocked() const {
+    bool sharesActive() {
+        const auto& monitors = State::monitorState()->monitors();
+        if (monitors.empty()) return false;
+        // 0.56.2 exposes no all-session accessor: isOutputBeingSSd excludes
+        // window captures. Its public outputCopyFBState query, however, calls
+        // public isActive() on EVERY session before filtering capture types.
+        // Observe those return values without reading private object layouts.
+        // The detour is mandatory; uncertainty must prevent automatic entry.
+        if (!shareStateHook || !shareStateHook->m_original) return true;
+        probingShares = true;
+        probedActiveShare = false;
+        struct ProbeGuard { bool& flag; ~ProbeGuard() { flag = false; } } guard{probingShares};
+        (void)Screenshare::mgr()->outputCopyFBState(monitors.front());
+        return probedActiveShare;
+    }
+    bool blocked() {
         if (g_pSessionLockManager->isSessionLocked() || g_pInputManager->isConstrained() || g_pInputManager->isLocked()) return true;
         for (const auto& m : State::monitorState()->monitors()) {
             if (!m->m_dpmsStatus) return true;
-            // Covers shares that predate require/setup or a configuration reload.
-            if (options.excludeShare && Screenshare::mgr()->isOutputBeingSSd(m)) return true;
         }
-        if (options.excludeShare && !shares.empty()) return true;
+        // Current compositor state also covers window sharing that predates
+        // loading/enable, and cannot retain stale begin/end events across disable.
+        if (options.excludeShare && sharesActive()) return true;
         for (const auto& w : Desktop::windowState()->windows()) {
             if (!w->m_isMapped || w->isHidden() || !g_pHyprRenderer->shouldRenderWindow(w)) continue;
             if (options.excludeInhibit && g_pInputManager->isWindowInhibiting(w, false)) return true;
@@ -165,7 +182,7 @@ Clock::time_point lastInput = Clock::now(), lastTick = lastInput, lastCapture = 
             universe.reset({}, {}, cursor());
             snapshots.clear();
             snapshotBytes = 0;
-            bool shareBlocked = false;
+            bool shareBlocked = sharesActive();
             for (const auto& monitor : State::monitorState()->monitors())
                 shareBlocked = shareBlocked || Screenshare::mgr()->isOutputBeingSSd(monitor) ||
                     Screenshare::mgr()->outputCopyFBState(monitor).needsCopyFB();
@@ -188,6 +205,12 @@ Clock::time_point lastInput = Clock::now(), lastTick = lastInput, lastCapture = 
             HyprlandAPI::removeFunctionHook(pluginHandle, hook);
             hook = nullptr;
         }
+        if (shareStateHook) {
+            shareStateHook->unhook();
+            HyprlandAPI::removeFunctionHook(pluginHandle, shareStateHook);
+            shareStateHook = nullptr;
+        }
+        probingShares = probedActiveShare = false;
         if (g_pHyprRenderer && g_pHyprRenderer->glBackend()) {
             g_pHyprRenderer->glBackend()->makeEGLCurrent();
             renderer.release();
@@ -323,6 +346,13 @@ Clock::time_point lastInput = Clock::now(), lastTick = lastInput, lastCapture = 
     void initialize() {
         if (initialized) return;
         if (!g_pHyprRenderer->glBackend()) throw std::runtime_error("OpenGL renderer required");
+        for (const auto& match : HyprlandAPI::findFunctionsByName(pluginHandle, "isActive")) {
+            if (match.demangled.find("Screenshare::CScreenshareSession::isActive()") == std::string::npos) continue;
+            shareStateHook = HyprlandAPI::createFunctionHook(pluginHandle, match.address, reinterpret_cast<void*>(screenshareActiveHook));
+            break;
+        }
+        if (!shareStateHook || !shareStateHook->hook())
+            throw std::runtime_error("complete screenshare-state observation could not be installed");
         const auto matches = HyprlandAPI::findFunctionsByName(pluginHandle, "renderWindow");
         for (const auto& match : matches) {
             if (match.demangled.find("IHyprRenderer::renderWindow(") == std::string::npos) continue;
@@ -348,9 +378,7 @@ Clock::time_point lastInput = Clock::now(), lastTick = lastInput, lastCapture = 
         listeners.push_back(events.workspace.specialActive.listen([this] { stop("special workspace changed"); }));
         listeners.push_back(g_pSessionLockManager->m_events.lock.listen([this] { stop("session locked"); }));
         listeners.push_back(g_pSessionLockManager->m_events.unlock.listen([this] { stop("session unlocked"); }));
-        listeners.push_back(events.screenshare.state.listen([this](bool state, uint8_t type, const std::string& name) {
-            const auto key = std::to_string(type) + ":" + name;
-            if (state) shares.insert(key); else shares.erase(key);
+        listeners.push_back(events.screenshare.state.listen([this](bool state, uint8_t, const std::string&) {
             if (options.excludeShare && state) stop("screen sharing");
         }));
         // The screenshare manager clears this flag on output commits. Reassert
@@ -394,6 +422,12 @@ Clock::time_point lastInput = Clock::now(), lastTick = lastInput, lastCapture = 
 void renderWindowHook(Render::IHyprRenderer* self, PHLWINDOW window, PHLMONITOR monitor, const Time::steady_tp& time, bool decorate, Render::eRenderPassMode mode, bool ignorePosition, bool standalone) {
     if (instance->active && !instance->capturing && std::ranges::any_of(instance->snapshots, [&](const auto& shot) { return shot.id == window->m_stableID; })) return;
     reinterpret_cast<RenderWindowFn>(instance->hook->m_original)(self, window, monitor, time, decorate, mode, ignorePosition, standalone);
+}
+
+bool screenshareActiveHook(Screenshare::CScreenshareSession* session) {
+    const bool result = reinterpret_cast<ScreenshareActiveFn>(instance->shareStateHook->m_original)(session);
+    if (instance->probingShares && result) instance->probedActiveShare = true;
+    return result; // Ordinary compositor queries always retain their exact result.
 }
 
 int setup(lua_State* L) {
