@@ -72,8 +72,8 @@ end
 
 local function canonical_chord(chord, path)
     local parts = {}
-    for word in (chord .. "+"):gmatch("(.-)%+") do
-        word = word:gsub("^%s+", ""):gsub("%s+$", ""):upper()
+    for component in (chord .. "+"):gmatch("(.-)%+") do
+        local word = component:gsub("^%s+", ""):gsub("%s+$", ""):upper()
         if word == "" then fail(path, "contains an empty key/modifier") end
         parts[#parts + 1] = word
     end
