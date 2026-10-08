@@ -165,7 +165,11 @@ Clock::time_point lastInput = Clock::now(), lastTick = lastInput, lastCapture = 
             universe.reset({}, {}, cursor());
             snapshots.clear();
             snapshotBytes = 0;
-            g_pHyprRenderer->m_directScanoutBlocked = previousScanoutBlocked;
+            bool shareBlocked = false;
+            for (const auto& monitor : State::monitorState()->monitors())
+                shareBlocked = shareBlocked || Screenshare::mgr()->isOutputBeingSSd(monitor) ||
+                    Screenshare::mgr()->outputCopyFBState(monitor).needsCopyFB();
+            g_pHyprRenderer->m_directScanoutBlocked = previousScanoutBlocked || shareBlocked;
             damage();
             if (refreshPointer) g_pInputManager->simulateMouseMovement();
         }
@@ -348,6 +352,11 @@ Clock::time_point lastInput = Clock::now(), lastTick = lastInput, lastCapture = 
             const auto key = std::to_string(type) + ":" + name;
             if (state) shares.insert(key); else shares.erase(key);
             if (options.excludeShare && state) stop("screen sharing");
+        }));
+        // The screenshare manager clears this flag on output commits. Reassert
+        // before direct-scanout checks on EVERY frame, including app-driven ones.
+        listeners.push_back(events.render.preChecks.listen([this](PHLMONITOR) {
+            if (active) g_pHyprRenderer->m_directScanoutBlocked = true;
         }));
         listeners.push_back(events.render.stage.listen([this](eRenderStage stage) {
             if (!active || capturing || stage != RENDER_POST_WINDOWS) return;
