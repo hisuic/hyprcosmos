@@ -408,7 +408,7 @@ int setup(lua_State* L) {
         next.physics.max_bodies = static_cast<std::size_t>(number(L, 1, "max_windows", 24, 1, 48));
         next.physics.seed = static_cast<uint64_t>(number(L, 1, "seed", 12606492, 0, 4294967295.0));
         next.physics.history_seconds = number(L, 1, "history_seconds", 12, .1, 60);
-        next.physics.history_hz = number(L, 1, "history_hz", 30, 1, 120);
+        next.physics.history_hz = number(L, 1, "history_hz", 30, 1, 60);
         const auto historyBytes = number(L, 1, "history_mb", 16, 1, 64) * 1024 * 1024;
         next.physics.history_seconds = std::min(next.physics.history_seconds, historyBytes / (sizeof(Body) * next.physics.max_bodies * next.physics.history_hz));
         lua_getfield(L, 1, "effects");
@@ -424,11 +424,11 @@ int setup(lua_State* L) {
         if (lua_istable(L, -1)) {
             int t = lua_gettop(L);
 #define PARAM(name, low, high) next.physics.name = number(L, t, #name, next.physics.name, low, high)
-            PARAM(cursor_strength, 0, 1e8); PARAM(mutual_strength, 0, 1e7); PARAM(softening, 1, 1000);
-            PARAM(max_acceleration, 1, 10000); PARAM(max_speed, 1, 5000); PARAM(damping, 0, 10);
+            PARAM(cursor_strength, 0, 2e7); PARAM(mutual_strength, 0, 2e6); PARAM(softening, 10, 2000);
+            PARAM(max_acceleration, 10, 10000); PARAM(max_speed, 10, 5000); PARAM(damping, 0, 10);
             PARAM(restitution, 0, 1); PARAM(collision_strength, 0, 1); PARAM(expansion_rate, 0, .1);
-            PARAM(sink_duration, .2, 30); PARAM(wormhole_cooldown, .1, 10); PARAM(explosion_strength, 0, 5000);
-            PARAM(fixed_step, 1.0 / 240.0, .05); PARAM(max_substeps, 1, 16);
+            PARAM(sink_duration, .3, 20); PARAM(wormhole_cooldown, .2, 10); PARAM(explosion_strength, 0, 3000);
+            PARAM(fixed_step, 1.0 / 240.0, 1.0 / 30.0); PARAM(max_substeps, 1, 16);
 #undef PARAM
         }
         lua_pop(L, 1);
