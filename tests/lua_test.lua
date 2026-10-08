@@ -15,6 +15,8 @@ for _, invalid in ipairs({ false, "invalid", { idle_timeout = 0 }, { max_windows
     { physics = { fixed_step = 0 } }, { physics = { max_speed = math.huge } },
     { rendering = { particles = -1 } }, { unknown = true }, { effects = { orbit = 1 } },
     { controls = { preview = "F6" } }, { exclusions = { classes = { [2] = "game" } } },
+    { controls = { preview = "SUPER+ALT+C", emergency = "ALT+SUPER+C" } },
+    { controls = { preview = "HYPER+F11" } }, { controls = { preview = "SUPER++F11" } },
     { plugin_path = "relative.so" }, { preset = "invalid" } }) do
     local result, message = Config.normalize(invalid, previous)
     check(result == nil and type(message) == "string", "invalid options are rejected")
@@ -25,6 +27,8 @@ check(demo.physics.cursor_strength == 2100000 and demo.physics.expansion_rate ==
     demo.physics.sink_duration == 3 and demo.idle_timeout == 8, "preset and explicit overrides compose")
 local calm = assert(Config.normalize({ preset = "calm" }, demo))
 check(calm.physics.cursor_strength == Config.defaults.physics.cursor_strength, "switching presets resets preset physics")
+local chords = assert(Config.normalize({ controls = { preview = "alt + super + c" } }))
+check(chords.controls.preview == "SUPER+ALT+C", "controls normalize case, whitespace and modifier order before native parsing")
 
 local original_open = io.open
 local function mock(mode)
@@ -37,6 +41,7 @@ local function mock(mode)
     local api = {
         setup = function(options)
             state.setups = state.setups + 1
+            if state.fail_setup then state.initialized = false; state.enabled = false; return nil, "runtime setup failure" end
             if mode == "nil-error" then return nil, "test initialization failure" end
             if mode == "throw" then error("test exception") end
             state.options = Config.copy(options)
@@ -48,7 +53,7 @@ local function mock(mode)
         disable = function() state.disable = state.disable + 1; state.enabled = false; state.initialized = false; return true end,
         shutdown = function() state.shutdown = state.shutdown + 1; state.enabled = false; state.initialized = false; return true end,
         action = function(action) state.actions[#state.actions + 1] = action; return true end,
-        status = function() return { enabled = state.enabled, initialized = state.initialized, active = false } end,
+        status = function() return { enabled = state.enabled, initialized = state.initialized, active = false, input_watchers = state.initialized and 1 or 0 } end,
     }
     _G.hl = {
         plugin = { load = function(path) state.loads[#state.loads + 1] = path end,
@@ -115,7 +120,17 @@ check(state.shutdown == 1 and state.live_bindings() == 0 and state.live_events()
 check(not cosmic.enable(), "enable after full shutdown requires setup")
 check(cosmic.setup({ enabled = false }) == cosmic and state.setups == 3 and state.live_bindings() == 0, "setup restarts ownership after shutdown without enabling consuming controls")
 state.fire("hyprland.shutdown")
-check(state.live_bindings() == 0 and state.live_events() == 0, "compositor shutdown cleans module ownership")
+check(state.live_bindings() == 0 and state.live_events() == 0 and cosmic.status().input_watchers == 0, "compositor shutdown cleans module ownership and exposes native counters")
+
+local recovering, recovery = mock("success")
+recovery.fire("config.reloaded")
+recovery.fail_setup = true
+check(not recovering.setup({ idle_timeout = 11 }) and recovery.live_bindings() == 0 and
+    recovering.status().config.idle_timeout == 5, "native reconfiguration failure releases old consuming controls and keeps accepted options")
+recovery.fail_setup = false
+check(recovering.setup({ idle_timeout = 7 }) == recovering and recovery.live_bindings() == 7 and
+    recovering.status().initialized, "valid setup recovers after a native failure without a reload")
+recovering.shutdown()
 
 for _, mode in ipairs({ "nil-error", "throw", "missing" }) do
     local failed, failure = mock(mode)
