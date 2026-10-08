@@ -13,7 +13,9 @@ dry_run=false
 usage() {
     printf '%s\n' 'Usage: scripts/install.sh [--config FILE] [--build-dir DIR] [--state-dir DIR]' \
         '                          [--no-build] [--dry-run] [--reload --instance SIGNATURE]' \
-        'The module and plugin remain in this repository; only owned symlinks and a require block are installed.'
+        'The module and plugin remain in this repository; owned symlinks and a require block are installed.' \
+        'A missing hyprcosmos.lua is created beside --config; existing readable user settings are never overwritten.' \
+        'User settings are retained across reinstall, update and uninstall.'
 }
 die() { printf 'Install: %s\n' "$*" >&2; exit 1; }
 
@@ -38,6 +40,9 @@ config=$(realpath -ms -- "$config")
 [[ -f "$config" ]] || die "configuration does not exist: $config"
 real_config=$(realpath -e -- "$config")
 config_dir=$(dirname -- "$config")
+settings_file="$config_dir/hyprcosmos.lua"
+settings_template="$repository/examples/hyprcosmos.lua"
+settings_action=create
 build_dir=$(realpath -ms -- "$build_dir")
 module_link="$config_dir/cosmic"
 module_target="$repository/lua/cosmic"
@@ -72,6 +77,19 @@ check_link "$module_link" "$module_target"
 check_link "$plugin_link" "$plugin_target"
 [[ -f "$module_target/init.lua" ]] || die 'Lua entry point is missing from this checkout'
 
+check_settings() {
+    if [[ -e "$settings_file" || -L "$settings_file" ]]; then
+        [[ -f "$settings_file" && -r "$settings_file" ]] || die "user settings must be a readable regular file (or a symlink to one); preserving: $settings_file"
+        settings_action=preserve
+    else
+        settings_action=create
+    fi
+}
+check_settings
+if [[ "$settings_action" == create ]]; then
+    [[ -f "$settings_template" && -r "$settings_template" ]] || die "user settings template is missing or unreadable: $settings_template"
+fi
+
 markers=$(awk '/^-- hyprcosmos:begin$/ { begin++ } /^-- hyprcosmos:end$/ { end++ } END { print begin+0, end+0 }' "$real_config")
 [[ "$markers" == '0 0' || "$markers" == '1 1' ]] || die 'configuration has malformed or duplicated hyprcosmos markers'
 if [[ "$markers" == '1 1' ]] && ! awk '
@@ -94,6 +112,7 @@ fi
 
 printf 'Configuration: %s (edits target %s)\nLua link: %s -> %s\nPlugin link: %s -> %s\n' \
     "$config" "$real_config" "$module_link" "$module_target" "$plugin_link" "$plugin_target"
+printf 'User settings: %s (%s; retained across update/uninstall)\n' "$settings_file" "$settings_action"
 if "$dry_run"; then
     printf 'Dry run: build=%s, append require=%s, reload=%s; no files changed.\n' "$build" "$append" "$reload"
     exit 0
@@ -102,12 +121,34 @@ if "$build"; then "$repository/scripts/build.sh" --build-dir "$build_dir"; fi
 [[ -f "$plugin_target" ]] || die "plugin is missing; run scripts/build.sh first: $plugin_target"
 [[ -w "$real_config" && -w "$config_dir" ]] || die 'configuration or module directory is not writable'
 
+manifest_tmp=""
+settings_tmp=""
+trap 'for temporary in "${manifest_tmp:-}" "${settings_tmp:-}"; do if [[ -n "$temporary" && -f "$temporary" ]]; then rm -- "$temporary"; fi; done' EXIT
+# Publish complete private defaults without ever replacing an existing path.
+# This file belongs to the user immediately, not to the removal manifest.
+check_settings
+if [[ "$settings_action" == create ]]; then
+    settings_tmp=$(mktemp "$config_dir/.hyprcosmos-settings.XXXXXX")
+    cp -- "$settings_template" "$settings_tmp"
+    chmod 600 -- "$settings_tmp"
+    if ln -T -- "$settings_tmp" "$settings_file" 2>/dev/null; then
+        printf 'Created user settings: %s\n' "$settings_file"
+    else
+        # Another process may have created settings since preflight. Keep a
+        # readable regular winner; never follow or replace any other type.
+        check_settings
+        [[ "$settings_action" == preserve ]] || die "cannot publish user settings without overwriting: $settings_file"
+        printf 'Preserved concurrently created user settings: %s\n' "$settings_file"
+    fi
+    rm -- "$settings_tmp"
+    settings_tmp=""
+fi
+
 # Record ownership before changing anything, so a failed/partial installation
 # remains recoverable with uninstall.sh. This file is data, never sourced.
 mkdir -p -- "$state_dir"
 chmod 700 -- "$state_dir"
 manifest_tmp=$(mktemp "$state_dir/.installation.XXXXXX")
-trap 'if [[ -n ${manifest_tmp:-} && -f "$manifest_tmp" ]]; then rm -- "$manifest_tmp"; fi' EXIT
 printf '%s\n' hyprcosmos-v1 "$repository" "$config" "$real_config" "$module_link" \
     "$module_target" "$plugin_link" "$plugin_target" "$owned_block" > "$manifest_tmp"
 chmod 600 -- "$manifest_tmp"
