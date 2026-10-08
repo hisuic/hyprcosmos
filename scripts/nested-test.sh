@@ -28,9 +28,10 @@ instance=""
 compositor_pid=""
 client_a=""
 client_b=""
+client_c=""
 held_input=""
 cleanup() {
-    for pid in "$held_input" "$client_a" "$client_b" "$compositor_pid"; do
+    for pid in "$held_input" "$client_a" "$client_b" "$client_c" "$compositor_pid"; do
         if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then kill -TERM "$pid" 2>/dev/null || true; fi
     done
     if [[ -n "$native_socket" && -L "$XDG_RUNTIME_DIR/$socket" && $(readlink -- "$XDG_RUNTIME_DIR/$socket") == "$native_socket" ]]; then
@@ -108,6 +109,17 @@ capture() {
         env -u HYPRLAND_INSTANCE_SIGNATURE WAYLAND_DISPLAY="$socket" grim "$output/$1.png" || true
     fi
 }
+measure_cpu() {
+    local mode=$1 duration=$2 before after start end ticks
+    ticks=$(getconf CLK_TCK)
+    before=$(awk '{print $14+$15}' "/proc/$compositor_pid/stat")
+    start=$(awk '{print $1}' /proc/uptime)
+    sleep "$duration"
+    after=$(awk '{print $14+$15}' "/proc/$compositor_pid/stat")
+    end=$(awk '{print $1}' /proc/uptime)
+    python3 -c 'import sys; mode,a,b,hz,t0,t1=sys.argv[1:]; elapsed=float(t1)-float(t0); print(f"{mode}: {(int(b)-int(a))/float(hz)/elapsed*100:.2f}% of one CPU core over {elapsed:.2f}s")' \
+        "$mode" "$before" "$after" "$ticks" "$start" "$end" | tee -a "$output/cpu-usage.txt"
+}
 ctl -j version > "$output/version.json"
 ctl -j monitors > "$output/monitors.json"
 errors=$(ctl configerrors)
@@ -120,9 +132,11 @@ client_b=$!
 sleep 1
 ctl -j clients > "$output/normal-clients.json"
 capture normal
+measure_cpu normal 2
 eval_lua 'assert(require("cosmic").enable()); assert(require("cosmic")==require("cosmic"))'
 wait_active
 sleep 0.4
+measure_cpu cosmic 2
 status > "$output/idle-status.txt"
 capture universe
 
@@ -138,6 +152,20 @@ probe key 48 2200 & held_input=$!
 sleep 1.3
 eval_lua 'assert(not require("cosmic").status().active)'
 wait "$held_input"; held_input=""
+wait_active
+probe key 64
+eval_lua 'local s=require("cosmic").status(); assert(s.active and s.gravity_mode==1)'
+probe key 68
+eval_lua 'local s=require("cosmic").status(); assert(s.active and s.alternate_region)'
+capture virtual-region
+probe key 68
+eval_lua 'local s=require("cosmic").status(); assert(s.active and not s.alternate_region)'
+probe key 88
+eval_lua 'assert(not require("cosmic").status().active)'
+probe key 87
+eval_lua 'assert(require("cosmic").status().active)'
+probe key 87
+eval_lua 'assert(not require("cosmic").status().active)'
 wait_active
 probe ctrl-key 46
 eval_lua 'assert(not require("cosmic").status().active)'
@@ -177,6 +205,61 @@ capture supernova
 eval_lua 'require("cosmic").action("rewind"); assert(require("cosmic").status().rewinding)'
 sleep 0.2
 capture rewind
+
+# A controlled native sink exercises real GL stretching/twisting and virtual
+# storage, followed by replay of the same living application imagery.
+eval_lua 'require("cosmic").setup({enabled=true, physics={sink_duration=1.2}, effects={cursor_gravity=false,orbit=false,binary=false,collisions=false,wormholes=false,supernova=false,expansion=false}})'
+wait_active
+sleep 0.5
+read -r body_x body_y <<< "$(ctl repl 'local s=require("cosmic").status(); for _,b in ipairs(s.objects) do if b.region<1000000 then print(math.floor(b.x).." "..math.floor(b.y)); break end end')"
+read -r extent_x extent_y <<< "$(ctl -j monitors | python3 -c 'import json,sys; m=json.load(sys.stdin)[0]; print(m["width"],m["height"])')"
+[[ "$body_x" =~ ^[0-9]+$ && "$body_y" =~ ^[0-9]+$ ]] || { printf 'Could not resolve a virtual sink target.\n' >&2; exit 1; }
+probe move "$body_x" "$body_y" "$extent_x" "$extent_y"
+eval_lua 'require("cosmic").action("black_hole"); local s=require("cosmic").status(); local found=false; for _,b in ipairs(s.objects) do found=found or b.sink_progress>0 end; assert(s.active and found)'
+sleep 0.65
+eval_lua 'local s=require("cosmic").status(); local found=false; for _,b in ipairs(s.objects) do found=found or (b.stretch>1.5 and b.twist>0 and b.scale<0.42) end; assert(s.active and found)'
+capture black-hole
+sleep 0.85
+eval_lua 'assert(require("cosmic").status().stored>=1)'
+capture stored
+status > "$output/stored-status.txt"
+eval_lua 'require("cosmic").action("rewind"); assert(require("cosmic").status().rewinding)'
+sleep 0.45
+capture black-hole-rewind
+sleep 1.6
+eval_lua 'local s=require("cosmic").status(); assert(s.active and s.stored==0)'
+
+# Actual window creation emits a shockwave; closing it removes every historical
+# reference so replay cannot resurrect an exited client.
+eval_lua 'require("cosmic").setup({enabled=true,effects={supernova=true}})'
+wait_active
+env -u HYPRLAND_INSTANCE_SIGNATURE WAYLAND_DISPLAY="$socket" "$output/wayland-probe" --window 2 > "$output/client-c.jsonl" 2>&1 &
+client_c=$!
+sleep 0.35
+eval_lua 'local s=require("cosmic").status(); assert(s.active and s.bodies==3 and s.waves>0)'
+capture newborn-supernova
+kill -TERM "$client_c"
+wait "$client_c" 2>/dev/null || true
+client_c=""
+sleep 0.3
+eval_lua 'local s=require("cosmic").status(); assert(s.active and s.bodies==2); require("cosmic").action("rewind")'
+sleep 0.3
+eval_lua 'assert(require("cosmic").status().bodies==2)'
+
+# Hotplug and scale changes affect only this compositor's user-created output.
+if hotplug=$(ctl output create headless COSMIC-TEST-MONITOR 2>&1) && [[ "$hotplug" == ok ]]; then
+    sleep 0.25
+    eval_lua 'assert(not require("cosmic").status().active)'
+    eval_lua 'hl.monitor({output="COSMIC-TEST-MONITOR",mode="640x480@60",position="1280x0",scale=2})'
+    sleep 0.25
+    ctl -j monitors > "$output/mixed-scale-monitors.json"
+    python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); assert any(x["name"]=="COSMIC-TEST-MONITOR" and x["scale"]==2 for x in m); assert any(x["scale"]==1 for x in m)' "$output/mixed-scale-monitors.json"
+    ctl output remove COSMIC-TEST-MONITOR > "$output/hotplug-remove.txt"
+    sleep 0.2
+else
+    printf 'SKIP: headless hotplug unavailable: %s\n' "$hotplug" | tee "$output/hotplug-skip.txt"
+fi
+
 eval_lua 'require("cosmic").action("emergency"); require("cosmic").shutdown(); assert(not require("cosmic").status().initialized)'
 ctl reload > "$output/reload.txt"
 sleep 0.3
@@ -185,7 +268,7 @@ sed '/require("cosmic")/,$d' "$repository/tests/nested.lua" > "$output/config/hy
 ctl reload > "$output/remove-require.txt"
 sleep 0.3
 eval_lua 'assert(hl.plugin.cosmic == nil)'
-printf '%s\n' 'PASS: nested real GL capture/deformation, first key/button/scroll, holds, modifiers, mouse focus, geometry, lifecycle and require removal.' | tee "$output/result.txt"
+printf '%s\n' 'PASS: nested real GL rotation/deformation/store/rewind, first key/button/scroll, dedicated controls, holds, modifiers, mouse focus, geometry, actual window creation/closure, lifecycle and require removal. Hotplug result and CPU measurements are in adjacent files.' | tee "$output/result.txt"
 if "$keep_open"; then
     printf 'Dedicated nested compositor remains until Ctrl-C.\n'
     while kill -0 "$compositor_pid" 2>/dev/null; do sleep 1; done
