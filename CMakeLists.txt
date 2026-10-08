@@ -24,7 +24,10 @@ if(COSMIC_BUILD_PLUGIN)
   file(READ shaders/cosmic.frag COSMIC_FRAGMENT_SHADER)
   configure_file(plugin/shaders.hpp.in generated/shaders.hpp @ONLY)
   add_library(cosmic MODULE plugin/main.cpp plugin/renderer.cpp)
-  set_target_properties(cosmic PROPERTIES PREFIX "" OUTPUT_NAME "cosmic")
+  # Link into an unpublished path. build.sh publishes immutable, content-addressed
+  # artifacts so rebuilding cannot truncate a compositor's loaded shared object.
+  set_target_properties(cosmic PROPERTIES PREFIX "" OUTPUT_NAME "cosmic"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/link")
   target_include_directories(cosmic PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
   target_compile_options(cosmic PRIVATE -Wall -Wextra -Wno-unused-parameter -fno-gnu-unique)
   target_link_libraries(cosmic PRIVATE cosmic_physics PkgConfig::HYPRLAND PkgConfig::DEPS)
