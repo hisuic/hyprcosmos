@@ -490,6 +490,22 @@ int status(lua_State* L) {
     n("bodies", instance->universe.bodies().size()); n("snapshots", instance->snapshots.size()); n("snapshot_bytes", instance->snapshotBytes);
     n("history_frames", instance->universe.historyFrames()); n("history_limit", instance->universe.historyLimit()); n("input_watchers", instance->listeners.size()); n("physics_steps", instance->physicsSteps);
     n("stored", std::ranges::count_if(instance->universe.bodies(), [](const auto& body) { return body.stored; }));
+    n("particles", instance->universe.particles().size()); n("waves", instance->universe.waves().size());
+    n("gravity_mode", static_cast<std::size_t>(instance->universe.gravityMode()));
+    b("alternate_region", instance->alternateRegion);
+    lua_newtable(L);
+    int index = 1;
+    for (const auto& body : instance->universe.bodies()) {
+        lua_newtable(L);
+        auto value = [&](const char* key, double number) { lua_pushnumber(L, number); lua_setfield(L, -2, key); };
+        const auto display = instance->universe.worldToScreen(body.position, body.region);
+        value("id", body.id); value("x", display.x); value("y", display.y);
+        value("angle", body.angle); value("scale", body.scale); value("stretch", body.stretch);
+        value("twist", body.twist); value("region", body.region); value("sink_progress", body.sink_progress);
+        lua_pushboolean(L, body.stored); lua_setfield(L, -2, "stored");
+        lua_rawseti(L, -2, index++);
+    }
+    lua_setfield(L, -2, "objects");
     lua_pushstring(L, instance->reason.c_str()); lua_setfield(L, -2, "last_reason");
     lua_pushstring(L, GIT_COMMIT_HASH); lua_setfield(L, -2, "hyprland_commit");
     lua_pushstring(L, "bounded refreshed snapshots"); lua_setfield(L, -2, "capture_mode");
