@@ -8,6 +8,15 @@ include(CTest)
 option(COSMIC_BUILD_PLUGIN "Build the Hyprland 0.56.2 plugin" ON)
 option(COSMIC_SANITIZERS "Enable sanitizers for standalone simulation tests" OFF)
 
+# Production and offscreen rendering tests compile the exact same embedded
+# shaders, including standalone builds that do not load a compositor plugin.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/cosmic.vert"
+  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/cosmic.frag")
+file(READ shaders/cosmic.vert COSMIC_VERTEX_SHADER)
+file(READ shaders/cosmic.frag COSMIC_FRAGMENT_SHADER)
+configure_file(plugin/shaders.hpp.in generated/shaders.hpp @ONLY)
+
 add_library(cosmic_physics STATIC plugin/physics.cpp)
 set_target_properties(cosmic_physics PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_compile_options(cosmic_physics PRIVATE -Wall -Wextra -Wpedantic)
@@ -17,12 +26,6 @@ if(COSMIC_BUILD_PLUGIN)
   find_package(PkgConfig REQUIRED)
   pkg_check_modules(HYPRLAND REQUIRED IMPORTED_TARGET hyprland=0.56.2)
   pkg_check_modules(DEPS REQUIRED IMPORTED_TARGET hyprutils hyprgraphics aquamarine lua wayland-server glesv2 pixman-1 libdrm)
-  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/cosmic.vert"
-    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/cosmic.frag")
-  file(READ shaders/cosmic.vert COSMIC_VERTEX_SHADER)
-  file(READ shaders/cosmic.frag COSMIC_FRAGMENT_SHADER)
-  configure_file(plugin/shaders.hpp.in generated/shaders.hpp @ONLY)
   add_library(cosmic MODULE plugin/main.cpp plugin/renderer.cpp)
   # Link into an unpublished path. build.sh publishes immutable, content-addressed
   # artifacts so rebuilding cannot truncate a compositor's loaded shared object.
@@ -34,6 +37,20 @@ if(COSMIC_BUILD_PLUGIN)
 endif()
 
 if(BUILD_TESTING)
+  find_package(PkgConfig QUIET)
+  if(PkgConfig_FOUND)
+    pkg_check_modules(SKY_TEST_DEPS QUIET IMPORTED_TARGET egl glesv2)
+    if(SKY_TEST_DEPS_FOUND)
+      add_executable(starfield_test tests/starfield_test.cpp)
+      target_include_directories(starfield_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
+      target_compile_options(starfield_test PRIVATE -Wall -Wextra -Wpedantic)
+      target_link_libraries(starfield_test PRIVATE PkgConfig::SKY_TEST_DEPS)
+      add_test(NAME starfield COMMAND starfield_test)
+      set_tests_properties(starfield PROPERTIES SKIP_RETURN_CODE 77)
+    else()
+      message(STATUS "EGL/GLES development files unavailable: offscreen sky test omitted")
+    endif()
+  endif()
   add_executable(physics_test tests/physics_test.cpp)
   if(COSMIC_SANITIZERS)
     # Keep instrumentation confined to the test executable, independently of
