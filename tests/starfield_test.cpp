@@ -248,11 +248,14 @@ float smooth(float low, float high, float value) {
     return phase * phase * (3.0F - 2.0F * phase);
 }
 float glyphCoverage(float x, float y, int glyph, float size, float scale) {
-    constexpr std::array<std::array<std::uint32_t, 7>, 4> bitmaps = {{
+    constexpr std::array<std::array<std::uint32_t, 7>, 7> bitmaps = {{
         {0, 0, 0, 4, 4, 0, 0},
         {0, 4, 4, 31, 4, 4, 0},
         {0, 17, 10, 31, 10, 17, 0},
         {0, 1, 2, 4, 8, 16, 0},
+        {0, 16, 8, 4, 2, 1, 0},
+        {0, 0, 0, 31, 0, 0, 0},
+        {0, 4, 4, 4, 4, 4, 0},
     }};
     const float inkX = x / size + 2.5F, inkY = y / size + 3.5F;
     const int column = static_cast<int>(std::floor(inkX));
@@ -290,43 +293,76 @@ Color starColor(float x, float y, const Settings& settings) {
     for (auto& channel : tint) channel *= brightness * twinkle * coverage;
     return tint;
 }
-float meteorOnset(const Settings& settings, std::uint32_t epoch = 0) {
-    return float(epoch) * 12.0F + 3.0F + random(hash(epoch ^ settings.seed ^ 0x4d455445U)) * 4.0F;
-}
-Color meteorColor(float x, float y, const Settings& settings) {
-    if (settings.stars <= 0) return {};
-    const auto epoch = static_cast<std::uint32_t>(std::floor(settings.time / 12.0F));
+struct Meteor {
+    float onset = 0, lifespan = 0, size = 0, age = 0;
+    float directionX = 0, directionY = 0, travelX = 0, travelY = 0;
+    float headX = 0, headY = 0;
+    int tailGlyph = 0;
+    bool active = false;
+};
+Meteor meteorFor(const Settings& settings, std::uint32_t epoch) {
     const auto key = hash(epoch ^ settings.seed ^ 0x4d455445U);
-    const float age = settings.time - meteorOnset(settings, epoch);
-    if (age < 0 || age > 1.8F) return {};
+    Meteor meteor;
+    const float delay = 18.0F + random(key) * 24.0F;
+    meteor.onset = float(epoch) * 72.0F + delay;
+    meteor.age = (settings.time - float(epoch) * 72.0F) - delay;
+    meteor.lifespan = 1.3F + 0.9F * random(key + 6U);
     const float width = settings.sky[2] / settings.scale;
     const float height = settings.sky[3] / settings.scale;
-    const float travelX = width * 0.52F, travelY = height * 0.24F;
-    const float distance = std::hypot(travelX, travelY);
-    const float directionX = travelX / distance, directionY = travelY / distance;
-    const float headX = width * (0.12F + random(key + 1U) * 0.20F) + travelX * age / 1.8F;
-    const float headY = height * (0.12F + random(key + 2U) * 0.20F) + travelY * age / 1.8F;
-    const float segment = std::floor(((headX - x) * directionX + (headY - y) * directionY) / 12.0F + 0.5F);
+    meteor.size = std::min(0.7F + 1.1F * random(key + 5U), std::max(0.45F, std::min(width, height) / 80.0F));
+    const float angle = random(key + 1U) * 6.2831853F;
+    meteor.directionX = std::cos(angle);
+    meteor.directionY = std::sin(angle);
+    const float chord = std::min(width / std::max(std::abs(meteor.directionX), 0.001F),
+                                 height / std::max(std::abs(meteor.directionY), 0.001F));
+    const float distance = chord * (0.28F + 0.16F * random(key + 4U));
+    meteor.travelX = meteor.directionX * distance;
+    meteor.travelY = meteor.directionY * distance;
+    meteor.headX = width * (0.30F + 0.40F * random(key + 2U)) +
+                   meteor.travelX * (meteor.age / meteor.lifespan - 0.5F);
+    meteor.headY = height * (0.30F + 0.40F * random(key + 3U)) +
+                   meteor.travelY * (meteor.age / meteor.lifespan - 0.5F);
+    if (std::abs(meteor.directionY) < std::abs(meteor.directionX) * 0.4F) meteor.tailGlyph = 5;
+    else if (std::abs(meteor.directionX) < std::abs(meteor.directionY) * 0.4F) meteor.tailGlyph = 6;
+    else meteor.tailGlyph = meteor.directionX * meteor.directionY >= 0 ? 3 : 4;
+    meteor.active = settings.stars > 0 && meteor.age >= 0 && meteor.age <= meteor.lifespan;
+    return meteor;
+}
+Meteor meteorFor(const Settings& settings) {
+    return meteorFor(settings, static_cast<std::uint32_t>(std::floor(settings.time / 72.0F)));
+}
+Color meteorColor(float x, float y, const Settings& settings, const Meteor& meteor) {
+    if (!meteor.active) return {};
+    const float spacing = 14.0F * meteor.size;
+    const float segment = std::floor(((meteor.headX - x) * meteor.directionX +
+                                      (meteor.headY - y) * meteor.directionY) / spacing + 0.5F);
     if (segment < 0 || segment > 9) return {};
-    const int glyph = segment == 0 ? 2 : (segment < 6 ? 3 : 0);
-    const float ink = segment == 0 ? 1.8F : 1.35F;
-    const float coverage = glyphCoverage(x - (headX - directionX * segment * 12.0F),
-                                        y - (headY - directionY * segment * 12.0F), glyph, ink, settings.scale);
-    const float envelope = smooth(0, 0.16F, age) * (1.0F - smooth(1.25F, 1.8F, age));
+    const int glyph = segment == 0 ? 2 : (segment < 6 ? meteor.tailGlyph : 0);
+    const float ink = (segment == 0 ? 1.8F : 1.35F) * meteor.size;
+    const float coverage = glyphCoverage(x - (meteor.headX - meteor.directionX * segment * spacing),
+                                        y - (meteor.headY - meteor.directionY * segment * spacing), glyph, ink, settings.scale);
+    const float envelope = smooth(0, 0.16F, meteor.age) *
+                           (1.0F - smooth(meteor.lifespan - 0.55F, meteor.lifespan, meteor.age));
     const float tail = std::pow(1.0F - segment / 10.0F, 1.6F);
     return {0.70F * coverage * envelope * tail, 0.87F * coverage * envelope * tail,
             coverage * envelope * tail};
 }
 void checkGlyphPixels(const Image& actual, const Image& base, const Settings& settings) {
+    const auto meteor = meteorFor(settings);
     for (int y = 0; y < actual.height; ++y)
         for (int x = 0; x < actual.width; ++x) {
+            if (float(x) + 0.5F < settings.clip[0] || float(y) + 0.5F < settings.clip[1] ||
+                float(x) + 0.5F > settings.clip[2] || float(y) + 0.5F > settings.clip[3]) {
+                check(actual.at(x, y) == base.at(x, y), "clipped star and meteor pixels preserve the underlying canvas");
+                continue;
+            }
             const float logicalX = (float(x) + 0.5F - settings.sky[0]) / settings.scale;
             const float logicalY = (float(y) + 0.5F - settings.sky[1]) / settings.scale;
             const auto star = starColor(logicalX, logicalY, settings);
-            const auto meteor = meteorColor(logicalX, logicalY, settings);
+            const auto meteorPixel = meteorColor(logicalX, logicalY, settings, meteor);
             for (int channel = 0; channel < 3; ++channel) {
                 const int expected = static_cast<int>(std::lround(std::clamp(
-                    float(base.at(x, y)[channel]) + 255.0F * (star[channel] + meteor[channel]), 0.0F, 255.0F)));
+                    float(base.at(x, y)[channel]) + 255.0F * (star[channel] + meteorPixel[channel]), 0.0F, 255.0F)));
                 if (std::abs(int(actual.at(x, y)[channel]) - expected) > 2) {
                     std::cerr << "oracle mismatch at " << x << ',' << y << " channel " << channel
                               << " scale " << settings.scale << " time " << settings.time
@@ -360,7 +396,7 @@ void backgroundAndDeterminism(Renderer& renderer) {
     settings.stars = 0;
     settings.time = 0;
     const auto noStars = renderer.draw(settings).normal;
-    for (const float time : {4.0F, 6.0F, 9.0F, 16.0F, 29.0F, 53.0F}) {
+    for (const float time : {4.0F, 17.0F, 29.0F, 42.0F, 53.0F, 98.0F, 180.0F}) {
         settings.time = time;
         check(noStars == renderer.draw(settings).normal, "zero stars disables both twinkle and shooting stars");
     }
@@ -401,6 +437,17 @@ void logicalDpiAndInset(Renderer& renderer) {
     check(std::ranges::count(hidpiMask, true) > std::ranges::count(logicalMask, true) * 3,
           "2x keeps readable logical-size glyphs instead of shrinking them to physical-size stars");
 
+    settings.width = 960;
+    settings.height = 540;
+    settings.scale = 1.5F;
+    settings.sky = {0, 0, 960, 540};
+    settings.clip = settings.sky;
+    const auto fractional = renderer.draw(settings).normal;
+    settings.stars = 0;
+    const auto fractionalBase = renderer.draw(settings).normal;
+    settings.stars = 120;
+    checkGlyphPixels(fractional, fractionalBase, settings);
+
     settings = Settings{};
     settings.time = 1;
     const auto local = renderer.draw(settings).normal;
@@ -422,48 +469,155 @@ void logicalDpiAndInset(Renderer& renderer) {
         }
 }
 
+struct MeteorReadback {
+    double x = 0, y = 0, extentX = 0, extentY = 0;
+    int headPixels = 0;
+};
+MeteorReadback readMeteorHead(const Image& image, const Image& base, const Settings& settings) {
+    const auto meteor = meteorFor(settings);
+    double weight = 0, weightedX = 0, weightedY = 0;
+    double minimumX = image.width, minimumY = image.height, maximumX = 0, maximumY = 0;
+    int count = 0;
+    for (int y = 0; y < image.height; ++y)
+        for (int x = 0; x < image.width; ++x) {
+            const float logicalX = (float(x) + 0.5F - settings.sky[0]) / settings.scale;
+            const float logicalY = (float(y) + 0.5F - settings.sky[1]) / settings.scale;
+            const float segment = std::floor(((meteor.headX - logicalX) * meteor.directionX +
+                                              (meteor.headY - logicalY) * meteor.directionY) /
+                                             (14.0F * meteor.size) + 0.5F);
+            if (segment != 0) continue;
+            const auto star = starColor(logicalX, logicalY, settings);
+            const double residual = int(image.at(x, y)[2]) - int(base.at(x, y)[2]) - star[2] * 255.0;
+            if (residual <= 8) continue;
+            weight += residual;
+            weightedX += residual * logicalX;
+            weightedY += residual * logicalY;
+            minimumX = std::min(minimumX, double(logicalX));
+            maximumX = std::max(maximumX, double(logicalX));
+            minimumY = std::min(minimumY, double(logicalY));
+            maximumY = std::max(maximumY, double(logicalY));
+            ++count;
+        }
+    check(weight > 100 && count >= 4, "rendered meteor head remains visible after removing star twinkle");
+    return {weightedX / weight, weightedY / weight,
+            maximumX - minimumX + 1.0 / settings.scale, maximumY - minimumY + 1.0 / settings.scale, count};
+}
+
 void meteorLifecycle(Renderer& renderer) {
     Settings settings;
     settings.stars = 0;
     const auto base = renderer.draw(settings).normal;
     settings.stars = 120;
-    const float onset = meteorOnset(settings);
-    check(onset >= 3 && onset < 7, "shooting star waits several seconds after entering Cosmic mode");
-    for (const float age : {-0.1F, 0.6F, 1.0F, 1.9F}) {
-        settings.time = onset + age;
+    const auto event = meteorFor(settings, 0);
+    check(event.onset >= 18 && event.onset < 42, "shooting stars are rare and do not appear immediately after Cosmic begins");
+    check(event.lifespan >= 1.3F && event.lifespan < 2.2F, "shooting-star lifespan is seeded and bounded");
+    for (const float age : {-0.1F, 0.35F * event.lifespan, 0.6F * event.lifespan, event.lifespan + 0.1F}) {
+        settings.time = event.onset + age;
         const auto actual = renderer.draw(settings).normal;
         checkGlyphPixels(actual, base, settings);
+        const auto frameMeteor = meteorFor(settings);
         int litMeteorPixels = 0;
         for (int y = 0; y < actual.height; ++y)
             for (int x = 0; x < actual.width; ++x)
-                if (meteorColor(float(x) + 0.5F, float(y) + 0.5F, settings)[2] > 0.03F)
+                if (meteorColor(float(x) + 0.5F, float(y) + 0.5F, settings, frameMeteor)[2] > 0.03F)
                     ++litMeteorPixels;
-        check(age > 0 && age < 1.8F ? litMeteorPixels > 20 : litMeteorPixels == 0,
+        check(age > 0 && age < event.lifespan ? litMeteorPixels > 20 : litMeteorPixels == 0,
               "meteor has an actual ASCII head and tail only during its bounded lifetime");
     }
-    settings.time = onset + 0.6F;
+    settings.time = 17;
+    checkGlyphPixels(renderer.draw(settings).normal, base, settings);
+    check(!meteorFor(settings).active, "first seventeen seconds contain no meteor");
+    settings.time = event.onset + 0.35F * event.lifespan;
     const auto firstPosition = renderer.draw(settings).normal;
     const Settings firstSettings = settings;
-    settings.time = onset + 1.0F;
+    settings.time = event.onset + 0.60F * event.lifespan;
     const auto nextPosition = renderer.draw(settings).normal;
-    const auto meteorCenter = [&](const Image& image, const Settings& frame) {
-        double weight = 0, weightedX = 0, weightedY = 0;
-        for (int y = 0; y < image.height; ++y)
-            for (int x = 0; x < image.width; ++x) {
-                const auto star = starColor(float(x) + 0.5F, float(y) + 0.5F, frame);
-                const double residual = int(image.at(x, y)[2]) - int(base.at(x, y)[2]) - star[2] * 255.0;
-                if (residual <= 8) continue;
-                weight += residual;
-                weightedX += residual * x;
-                weightedY += residual * y;
-            }
-        check(weight > 100, "rendered meteor remains visible after removing static stars and their twinkle");
-        return std::array<double, 2>{weightedX / weight, weightedY / weight};
-    };
-    const auto firstCenter = meteorCenter(firstPosition, firstSettings);
-    const auto nextCenter = meteorCenter(nextPosition, settings);
-    check(nextCenter[0] - firstCenter[0] > 60 && nextCenter[1] - firstCenter[1] > 10,
-          "actual meteor pixels move diagonally independently of ordinary star twinkle");
+    const auto firstCenter = readMeteorHead(firstPosition, base, firstSettings);
+    const auto nextCenter = readMeteorHead(nextPosition, base, settings);
+    check(std::abs(nextCenter.x - firstCenter.x - event.travelX * 0.25F) < 4 &&
+          std::abs(nextCenter.y - firstCenter.y - event.travelY * 0.25F) < 4,
+          "actual meteor pixels travel along their seeded random direction independently of star twinkle");
+    check(nextPosition == renderer.draw(settings).normal, "meteor seed, time and size yield byte-identical repeat renders");
+}
+
+void meteorVariety(Renderer& renderer) {
+    Settings settings;
+    settings.width = 400;
+    settings.height = 240;
+    settings.sky = {0, 0, 400, 240};
+    settings.clip = settings.sky;
+    settings.stars = 0;
+    const auto base = renderer.draw(settings).normal;
+    settings.stars = 120;
+    std::array<bool, 4> quadrants{}, tailGlyphs{};
+    double smallExtent = 1000, largeExtent = 0;
+    int rendered = 0;
+    for (std::uint32_t seed = 1; seed <= 64; ++seed) {
+        settings.seed = seed;
+        const auto event = meteorFor(settings, seed % 3U);
+        const int quadrant = (event.directionX < 0 ? 1 : 0) + (event.directionY < 0 ? 2 : 0);
+        const bool needed = !quadrants[quadrant] || !tailGlyphs[event.tailGlyph - 3] ||
+                            (event.size < 0.85F && smallExtent == 1000) || (event.size > 1.65F && largeExtent == 0);
+        if (!needed) continue;
+        settings.time = event.onset + event.lifespan * 0.35F;
+        const auto actual = renderer.draw(settings).normal;
+        checkGlyphPixels(actual, base, settings);
+        const auto head = readMeteorHead(actual, base, settings);
+        check(std::abs(head.x - meteorFor(settings).headX) < 3 &&
+              std::abs(head.y - meteorFor(settings).headY) < 3,
+              "random direction and size put the visible ASCII head at the seeded location");
+        quadrants[quadrant] = true;
+        tailGlyphs[event.tailGlyph - 3] = true;
+        if (event.size < 0.85F) smallExtent = head.extentX + head.extentY;
+        if (event.size > 1.65F) largeExtent = head.extentX + head.extentY;
+        settings.time = event.onset + event.lifespan * 0.60F;
+        const auto moving = renderer.draw(settings).normal;
+        checkGlyphPixels(moving, base, settings);
+        const auto movedHead = readMeteorHead(moving, base, settings);
+        check(std::abs(movedHead.x - head.x - event.travelX * 0.25F) < 4 &&
+              std::abs(movedHead.y - head.y - event.travelY * 0.25F) < 4,
+              "actual meteor motion follows all sampled quadrants rather than one fixed direction");
+        ++rendered;
+    }
+    check(std::ranges::all_of(quadrants, [](bool covered) { return covered; }),
+          "actual rendered meteors cover all four travel quadrants");
+    check(std::ranges::all_of(tailGlyphs, [](bool covered) { return covered; }),
+          "actual rendered meteor tails cover backslash, slash, horizontal and vertical ASCII glyphs");
+    check(rendered >= 4 && largeExtent > smallExtent * 1.5,
+          "seeded meteor sizes change the apparent rendered head size, not only a hidden uniform");
+
+    for (const float scale : {1.0F, 1.5F, 2.0F}) {
+        settings.width = static_cast<int>(240 * scale);
+        settings.height = static_cast<int>(400 * scale);
+        settings.scale = scale;
+        settings.sky = {0, 0, float(settings.width), float(settings.height)};
+        settings.clip = settings.sky;
+        settings.stars = 0;
+        const auto portraitBase = renderer.draw(settings).normal;
+        settings.stars = 120;
+        const auto event = meteorFor(settings, 0);
+        settings.time = event.onset + event.lifespan * 0.5F;
+        const auto portrait = renderer.draw(settings).normal;
+        checkGlyphPixels(portrait, portraitBase, settings);
+        const auto head = readMeteorHead(portrait, portraitBase, settings);
+        check(std::abs(head.x - meteorFor(settings).headX) < 3 &&
+              std::abs(head.y - meteorFor(settings).headY) < 3,
+              "portrait meteors retain their logical position and size at 1x, fractional and 2x DPI");
+    }
+
+    for (const std::array<float, 2> size : {std::array<float, 2>{176, 110}, {18, 12}}) {
+        settings = Settings{};
+        settings.sky = {420, 40, size[0], size[1]};
+        settings.clip = {420, 40, 420 + size[0], 40 + size[1]};
+        settings.stars = 0;
+        const auto insetBase = renderer.draw(settings).normal;
+        settings.stars = 120;
+        const auto event = meteorFor(settings, 0);
+        settings.time = event.onset + event.lifespan * 0.5F;
+        checkGlyphPixels(renderer.draw(settings).normal, insetBase, settings);
+        check(event.size <= std::max(0.45F, std::min(size[0], size[1]) / 80.0F),
+              "peer and tiny canvases cap meteor size and clip its tail without leaking into surrounding UI");
+    }
 }
 
 } // namespace
@@ -475,6 +629,7 @@ int main() {
         backgroundAndDeterminism(renderer);
         logicalDpiAndInset(renderer);
         meteorLifecycle(renderer);
+        meteorVariety(renderer);
         std::cout << "starfield: " << assertions << " rendered-pixel checks passed\n";
         return EXIT_SUCCESS;
     } catch (const Unavailable& error) {
