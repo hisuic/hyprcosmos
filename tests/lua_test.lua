@@ -106,14 +106,14 @@ check(not ok and message and state.setups == count and cosmic.status().config.id
 local status = cosmic.status()
 status.config.effects.orbit = false
 check(cosmic.status().config.effects.orbit, "status returns independent configuration data")
-check(cosmic.disable() and not cosmic.status().initialized and cosmic.status().module_initialized, "disable reports native watcher teardown")
-check(cosmic.enable() and cosmic.status().initialized, "enable restores native watcher state")
+check(cosmic.disable() and not cosmic.status().initialized and cosmic.status().module_initialized and state.live_bindings() == 0, "disable releases native watchers and consuming controls")
+check(cosmic.enable() and cosmic.status().initialized and state.live_bindings() == 6, "enable restores one set of watchers and controls")
 check(cosmic.action("black_hole") and state.actions[1] == "black_hole", "dedicated actions reach native API")
 check(not cosmic.action("invalid"), "unknown actions are rejected")
 check(cosmic.shutdown() and cosmic.shutdown(), "shutdown is repeatable")
 check(state.shutdown == 1 and state.live_bindings() == 0 and state.live_events() == 0, "shutdown releases all Lua ownership once")
 check(not cosmic.enable(), "enable after full shutdown requires setup")
-check(cosmic.setup({ enabled = false }) == cosmic and state.setups == 3 and state.live_bindings() == 6, "setup restarts ownership after shutdown")
+check(cosmic.setup({ enabled = false }) == cosmic and state.setups == 3 and state.live_bindings() == 0, "setup restarts ownership after shutdown without enabling consuming controls")
 state.fire("hyprland.shutdown")
 check(state.live_bindings() == 0 and state.live_events() == 0, "compositor shutdown cleans module ownership")
 
