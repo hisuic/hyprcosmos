@@ -9,6 +9,18 @@ local function check(condition, message)
     assert(condition, message)
 end
 
+local default_idle = assert(Config.normalize())
+check(default_idle.idle_timeout == 20 and Config.defaults.idle_timeout == 20,
+    "the default cosmic idle activation delay is twenty seconds")
+local short_idle = assert(Config.normalize({ idle_timeout = 5 }))
+local explicit_idle = assert(Config.normalize({ idle_timeout = 20 }))
+check(short_idle.idle_timeout == 5 and explicit_idle.idle_timeout == 20,
+    "explicit five- and twenty-second idle delays retain their requested values")
+local idle_demo = assert(Config.normalize({ preset = "demo" }, short_idle))
+local idle_calm = assert(Config.normalize({ preset = "calm" }, idle_demo))
+check(idle_demo.idle_timeout == 5 and idle_calm.idle_timeout == 5,
+    "switching presets preserves the explicitly configured idle delay")
+
 local previous = Config.normalize({ idle_timeout = 8, effects = { orbit = false } })
 check(previous.idle_timeout == 8 and previous.effects.binary and not previous.effects.orbit, "nested partial setup preserves defaults")
 for _, invalid in ipairs({ false, "invalid", { idle_timeout = 0 }, { max_windows = 49 },
@@ -206,7 +218,7 @@ local recovering, recovery = mock("success")
 recovery.fire("config.reloaded")
 recovery.fail_setup = true
 check(not recovering.setup({ idle_timeout = 11 }) and recovery.live_bindings() == 0 and
-    recovering.status().config.idle_timeout == 5, "native reconfiguration failure releases old consuming controls and keeps accepted options")
+    recovering.status().config.idle_timeout == Config.defaults.idle_timeout, "native reconfiguration failure releases old consuming controls and keeps accepted options")
 recovery.fail_setup = false
 check(recovering.setup({ idle_timeout = 7 }) == recovering and recovery.live_bindings() == 7 and
     recovering.status().initialized, "valid setup recovers after a native failure without a reload")
@@ -220,7 +232,7 @@ check(not reenabling.enable() and reenable.setups == 3 and reenable.live_binding
     not reenabling.status().initialized, "enable reports a continuing native initialization failure")
 reenable.fail_setup = false
 check(reenabling.enable() and reenable.setups == 4 and reenable.live_bindings() == 7 and
-    reenabling.status().initialized and reenable.options.idle_timeout == 5,
+    reenabling.status().initialized and reenable.options.idle_timeout == Config.defaults.idle_timeout,
     "enable reinitializes accepted configuration after native failure")
 reenabling.shutdown()
 check(not reenabling.enable() and reenable.setups == 4, "enable still requires setup after full shutdown")
