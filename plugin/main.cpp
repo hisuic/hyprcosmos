@@ -111,6 +111,17 @@ Clock::time_point lastInput = Clock::now(), lastTick = lastInput, lastCapture = 
         }
         return universe.regions().empty() ? 0 : universe.regions().front().id;
     }
+    std::optional<std::pair<Vec2, int>> actionLocation() const {
+        const auto point = cursor();
+        const int region = viewedRegion();
+        if (const auto inset = peerViewLayout(universe, region); inset && inset->contains(point)) {
+            // The visible inset must never select an occluded main-view image.
+            // Its caption/frame deliberately does not fall through either.
+            if (!inset->containsContent(point)) return std::nullopt;
+            return std::pair{inset->toRegionScreen(point), inset->region.id};
+        }
+        return std::pair{point, region};
+    }
     void damage() {
         for (const auto& m : State::monitorState()->monitors())
             if (m->m_dpmsStatus) g_pHyprRenderer->damageMonitor(m);
@@ -416,12 +427,14 @@ Clock::time_point lastInput = Clock::now(), lastTick = lastInput, lastCapture = 
         if (name == "preview") { if (active) stop("preview ended"); else start(true); return; }
         if (!active) return;
         if (name == "gravity") universe.cycleGravity();
-        else if (name == "black_hole") universe.startBlackHole(cursor(), viewedRegion());
+        else if (name == "black_hole") {
+            if (const auto location = actionLocation()) universe.startBlackHole(location->first, location->second);
+        }
         else if (name == "rewind") universe.setRewinding(!universe.rewinding());
         else if (name == "region") alternateRegion = !alternateRegion;
         else if (name == "supernova") {
-            const int region = viewedRegion();
-            universe.supernova(universe.screenToWorld(cursor(), region), region);
+            if (const auto location = actionLocation())
+                universe.supernova(universe.screenToWorld(location->first, location->second), location->second);
         }
         damage();
     }
@@ -601,6 +614,22 @@ int status(lua_State* L) {
         lua_rawseti(L, -2, index++);
     }
     lua_setfield(L, -2, "wormholes");
+    lua_newtable(L);
+    index = 1;
+    for (const auto& monitor : State::monitorState()->monitors()) {
+        const int mainRegion = static_cast<int>(monitor->m_id) + (instance->alternateRegion ? 1000000 : 0);
+        const auto inset = peerViewLayout(instance->universe, mainRegion);
+        if (!inset) continue;
+        lua_newtable(L);
+        auto value = [&](const char* key, double number) { lua_pushnumber(L, number); lua_setfield(L, -2, key); };
+        value("region", inset->region.id); value("x", inset->origin.x); value("y", inset->origin.y);
+        value("width", inset->size.x); value("height", inset->size.y);
+        value("content_x", inset->contentOrigin.x); value("content_y", inset->contentOrigin.y);
+        value("content_width", inset->contentSize.x); value("content_height", inset->contentSize.y);
+        value("scale", inset->scale);
+        lua_rawseti(L, -2, index++);
+    }
+    lua_setfield(L, -2, "peer_views");
     lua_pushstring(L, instance->reason.c_str()); lua_setfield(L, -2, "last_reason");
     lua_pushstring(L, GIT_COMMIT_HASH); lua_setfield(L, -2, "hyprland_commit");
     lua_pushstring(L, "bounded refreshed snapshots"); lua_setfield(L, -2, "capture_mode");
