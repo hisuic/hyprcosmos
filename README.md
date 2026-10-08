@@ -46,6 +46,21 @@ require("cosmic")
 インストーラー自体はセッションを暗黙に再読み込みしません。同時に行う場合は
 `--reload --instance <hyprctl instances に表示される signature>` を指定します。
 
+ビルド済みのプラグインは内容ハッシュ付きの読み取り専用ファイルへ公開し、
+`build/cosmic.so` は原子的に切り替えるリンクです。再ビルドで使用中の共有
+ライブラリーを上書きしません。C++コード更新を反映する場合は、同じパスの
+読み込みを本体が保持するため、一度解除・再読み込みしてから再導入します。
+
+```sh
+./scripts/uninstall.sh
+hyprctl reload
+./scripts/install.sh
+hyprctl reload
+```
+
+設定を手動編集した管理ブロックは先に自分で取り除いてください。
+Luaの設定変更だけなら通常の `hyprctl reload` で反映できます。
+
 ## 操作
 
 | キー | 操作 |
