@@ -1,4 +1,5 @@
 PROMPT.md
+/docs/
 /build/
 /artifacts/
 *.so
