@@ -50,7 +50,7 @@ check(Config.normalize({ history_hz = 60 }).history_hz == 60 and
 
 local original_open = io.open
 local function mock(mode)
-    local state = { events = {}, bindings = {}, setups = 0, notifications = 0, loads = {},
+    local state = { events = {}, bindings = {}, timers = {}, setups = 0, notifications = 0, loads = {},
         enable = 0, disable = 0, shutdown = 0, actions = {}, initialized = false, enabled = false }
     io.open = function(path)
         if mode == "missing" then return nil, "missing test plugin" end
@@ -75,7 +75,7 @@ local function mock(mode)
     }
     _G.hl = {
         plugin = { load = function(path) state.loads[#state.loads + 1] = path end,
-            cosmic = mode ~= "missing" and api or nil },
+            cosmic = (mode ~= "missing" and mode ~= "delayed") and api or nil },
         notification = { create = function() state.notifications = state.notifications + 1 end },
         on = function(event, callback)
             local subscription = { active = true, callback = callback }
@@ -89,6 +89,13 @@ local function mock(mode)
             function binding:remove() self.active = false end
             state.bindings[#state.bindings + 1] = binding
             return binding
+        end,
+        timer = function(callback, timer_options)
+            check(timer_options.type == "oneshot" and timer_options.timeout == 100, "initialization uses bounded one-shot probes")
+            local timer = { active = true, callback = callback, timeout = timer_options.timeout }
+            function timer:set_timeout(timeout) self.timeout = timeout; self.active = true end
+            state.timers[#state.timers + 1] = timer
+            return timer
         end,
     }
     function state.fire(event)
@@ -108,6 +115,12 @@ local function mock(mode)
         end
         return count
     end
+    function state.fire_timers()
+        local timers = {}
+        for _, timer in ipairs(state.timers) do if timer.active then timers[#timers + 1] = timer end end
+        for _, timer in ipairs(timers) do timer.active = false; timer.callback() end
+    end
+    function state.publish_native() hl.plugin.cosmic = api end
     package.loaded.cosmic = nil
     return require("cosmic"), state
 end
@@ -149,6 +162,41 @@ recovery.fail_setup = false
 check(recovering.setup({ idle_timeout = 7 }) == recovering and recovery.live_bindings() == 7 and
     recovering.status().initialized, "valid setup recovers after a native failure without a reload")
 recovering.shutdown()
+
+local delayed, deferred = mock("delayed")
+deferred.fire("config.reloaded")
+deferred.fire("config.reloaded")
+check(#deferred.timers == 1 and delayed.status().initialization_pending and deferred.notifications == 0,
+    "early startup reload starts one probe without a false unavailable warning")
+deferred.fire_timers()
+check(#deferred.timers == 2 and deferred.setups == 0 and deferred.notifications == 0,
+    "plugin availability probes remain silent before their deadline")
+deferred.publish_native()
+deferred.fire_timers()
+check(deferred.setups == 1 and deferred.notifications == 0 and not delayed.status().initialization_pending,
+    "late plugin availability initializes exactly once and stops probing")
+deferred.fire_timers()
+check(deferred.setups == 1, "completed initialization schedules no further probes")
+delayed.shutdown()
+
+local canceled, cancellation = mock("delayed")
+cancellation.fire("config.reloaded")
+canceled.shutdown()
+check(cancellation.timers[1].timeout == 1 and not canceled.status().initialization_pending,
+    "shutdown cancels pending initialization work and drains its one-shot reference")
+cancellation.publish_native()
+cancellation.fire_timers()
+check(cancellation.setups == 0 and cancellation.live_events() == 0 and cancellation.live_bindings() == 0,
+    "a canceled probe cannot initialize even if the native plugin later becomes available")
+
+local timed_out, unavailable = mock("delayed")
+unavailable.fire("config.reloaded")
+for _ = 1, 50 do unavailable.fire_timers() end
+check(#unavailable.timers == 50 and unavailable.notifications == 1 and not timed_out.status().initialization_pending,
+    "unavailable plugin reports once after fifty bounded probes and stops all scheduling")
+unavailable.fire("config.reloaded")
+check(#unavailable.timers == 50 and unavailable.notifications == 1, "the failed deadline does not create a perpetual retry timer")
+timed_out.shutdown()
 
 for _, mode in ipairs({ "nil-error", "throw", "missing" }) do
     local failed, failure = mock(mode)
