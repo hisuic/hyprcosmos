@@ -39,6 +39,9 @@ hyprctl reload
 
 初回はプラグインをビルドしてテストし、設定ディレクトリーにリポジトリ内の
 Lua モジュールと `build/cosmic.so` へのシンボリックリンクを作ります。
+同じディレクトリーに設定ファイル `hyprcosmos.lua` を、存在しない場合だけ作成します。
+これは編集用の通常ファイルで、既存の設定ファイルやそのシンボリックリンクは
+上書きしません。更新・再導入・解除でもユーザー設定は残します。
 `hyprland.lua` の実体をバックアップしてから、マーカー付きで次の一行を追記します。
 
 ```lua
@@ -77,8 +80,10 @@ hyprctl instances
 通常の許可画面が出ます。許可失敗・消灯中・所有外のrequireなどでは解除前に停止し、
 本体の再起動は行いません。手動編集済みrequireは自動更新せず、個別に確認してください。
 
-設定を手動編集した管理ブロックは先に自分で取り除いてください。
-Luaの設定変更だけなら通常の `hyprctl reload` で反映できます。
+通常の設定変更は下記の `hyprcosmos.lua` で行ってください。
+設定変更だけなら再ビルドやプラグインの解除は不要で、`hyprctl reload` で反映できます。
+以前に管理ブロックを手動編集した場合は、自動解除の前にそのブロックを
+自分で取り除く必要があります。
 
 ## 操作
 
@@ -122,12 +127,14 @@ fcitx5などが入力経路用のgrabを保持しているだけの状態では�
 
 ## 設定
 
-インストーラーの require 行を、例えば次のように編集できます。
-設定の手動編集後は自動解除スクリプトがその編集済みブロックを保護するため、
-解除時には編集した require ブロックを自分で削除してください。
+設定ファイルは通常 `~/.config/hypr/hyprcosmos.lua` です。
+`XDG_CONFIG_HOME` やインストーラーの `--config` を指定した場合は、配置した
+`cosmic` モジュール・`cosmic.so` と同じディレクトリーになります。
+`hyprland.lua` の `require("cosmic")` は変更しません。
+設定ファイルはLuaのtableを `return` してください。例:
 
 ```lua
-require("cosmic").setup({
+return {
     idle_timeout = 60,
     max_windows = 24,
     seed = 0xC05C1C,
@@ -143,11 +150,37 @@ require("cosmic").setup({
     },
     rendering = { particles = 96, stars = 240, background = 1,
                   snapshot_mb = 128, hide_desktop_ui = true },
-})
+}
 ```
 
-部分設定は現在の設定へマージします。設定値・未知のキー・重複操作キーを
-検証します。初期設定は穏やかな軌道です。派手なプリセット:
+`idle_timeout` は秒単位で、`20` は20秒、`60` は1分、`300` は5分です。
+編集後に次を実行すると、専用ファイルを読み直して反映します。本体の再起動は不要です。
+
+```sh
+hyprctl reload
+```
+
+優先順位は **既定値 → 専用設定ファイル → 明示的な `setup()`** です。
+設定ファイルの省略項目は既定値を使い、後からの部分 `setup()` は現在の設定へ
+マージします。ファイルがない場合も既定値で動作します。
+文法エラー、tableを返さないファイル、無効な値・未知のキー・重複操作キーでは
+Cosmicだけを停止し、一度通知します。ファイルを直してreloadしてください。
+通常のHyprland設定の評価は止めません。
+ファイルは最大1 MiBのテキストLuaで、通常のLua権限で実行します。
+信頼できる自分の設定を置いてください。常時監視はせず、require／reload時に読みます。
+
+有効な明示 `setup()` でファイルエラーから復旧することもできます。
+`status()` の `config_file`・`config_file_loaded`・`config_file_error` で
+読み込み先と結果を確認できます。現在の動作はdaemonではなく、Hyprland自身の
+プロセス内で動くLua＋C++プラグインです。
+
+初期設定は穏やかな軌道です。専用ファイルで派手なプリセットを選ぶ場合:
+
+```lua
+return { preset = "demo", idle_timeout = 60 }
+```
+
+プログラムから一時変更する場合も、従来のAPIを使用できます:
 
 ```lua
 local cosmic = require("cosmic")
@@ -215,7 +248,7 @@ hyprctl reload
 ```
 
 所有記録と一致するリンク・未編集の管理ブロックだけを削除します。
-設定のバックアップ、リポジトリ、ビルド成果物、無関係な設定は残ります。
+専用ユーザー設定、設定のバックアップ、リポジトリ、ビルド成果物、無関係な設定は残ります。
 同じ導入先への再インストール・解除済みの再解除は安全に繰り返せます。
 導入時に元からあったユーザー自身の require 行は削除しません。
 
@@ -233,6 +266,7 @@ hyprctl reload
 ./scripts/build.sh
 ctest --test-dir build --output-on-failure
 ./scripts/fullscreen-test.sh
+./scripts/user-config-test.sh
 ```
 
 全画面の実検証にはGTK 3・gtk-layer-shell・libpng・grimの開発／実行環境も必要です。
@@ -240,6 +274,8 @@ ctest --test-dir build --output-on-failure
 復帰入力、保護レイヤー、描画直後の解除・require削除、1分（60秒）の開始待機を確認し、
 親セッションの設定や有効状態は変更しません。既存の宇宙現象・入力・共有回帰は
 `scripts/nested-test.sh` で確認できます。
+専用設定の実検証は `scripts/user-config-test.sh` で、独立した子セッションだけの
+ファイル作成・編集・reload・無効設定からの復帰と、require削除を確認します。
 
 [実環境とAPI調査](docs/environment.md)、[設計](docs/architecture.md)、
 [実際の検証結果](docs/validation.md) に、確認範囲と制約を記録します。
