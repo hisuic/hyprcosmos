@@ -2,10 +2,12 @@
 -- Native initialization runs after configuration/plugin loading. At compositor
 -- startup config.reloaded may precede construction of the plugin manager.
 local Config = require("cosmic.config")
+local UserConfig = require("cosmic.user_config")
 local M = {}
 local options = Config.copy(Config.defaults)
 local initialized, stopped, warned, configuration_ready = false, false, false, false
 local last_error, plugin_path
+local config_file, config_file_loaded, config_file_error
 local subscriptions, bindings = {}, {}
 local initialization_timer, initialization_generation = nil, 0
 local initialization_attempts, plugin_requested = 0, false
@@ -35,8 +37,9 @@ local function warn(message)
     last_error = tostring(message)
     if warned then return end
     warned = true
-    local text = "Cosmic stopped safely: " .. last_error ..
+    local hint = config_file_error and (". Fix " .. config_file .. ", then reload Hyprland.") or
         ". Build/install with hyprcosmos/scripts/install.sh, then reload Hyprland."
+    local text = "Cosmic stopped safely: " .. last_error .. hint
     if type(hl) == "table" and hl.notification and hl.notification.create then
         pcall(hl.notification.create, { text = text, timeout = 10000, color = "rgb(f6c177)", icon = "warning" })
     else
@@ -79,7 +82,7 @@ local function bind_controls()
     return true
 end
 
-local function resolve_plugin()
+local function resolve_config_directory()
     local module_file = package.searchpath and package.searchpath("cosmic", package.path)
     if not module_file and debug and debug.getinfo then
         local source = debug.getinfo(1, "S").source
@@ -89,13 +92,14 @@ local function resolve_plugin()
         local directory = module_file:match("^(.*)/init%.lua$")
         -- Remove the final component lexically. Using cosmic/../ would follow
         -- the module symlink first and incorrectly resolve inside the checkout.
-        if directory then return (directory:match("^(.*)/[^/]+$") or ".") .. "/cosmic.so" end
+        if directory then return directory:match("^(.*)/[^/]+$") or "." end
     end
     local config_home = os.getenv("XDG_CONFIG_HOME") or ((os.getenv("HOME") or "") .. "/.config")
-    return config_home .. "/hypr/cosmic.so"
+    return config_home .. "/hypr"
 end
 
 local function initialize()
+    if config_file_error then return nil, config_file_error end
     if initialized or stopped then return initialized end
     cancel_initialization()
     local ok, message = call("setup", Config.copy(options))
@@ -108,7 +112,7 @@ local function initialize()
 end
 
 local function await_plugin()
-    if stopped or initialized then return end
+    if stopped or initialized or config_file_error then return end
     if native_ready() then
         initialize()
         return
@@ -139,7 +143,7 @@ local function attach()
         await_plugin()
     end)
     subscriptions[#subscriptions + 1] = hl.on("hyprland.shutdown", function() M.shutdown() end)
-    plugin_path = resolve_plugin()
+    plugin_path = resolve_config_directory() .. "/cosmic.so"
     local file = io.open(plugin_path, "rb")
     if not file then
         warn("plugin file is missing: " .. plugin_path)
@@ -155,6 +159,9 @@ end
 function M.setup(update)
     local validated, message = Config.normalize(update, options)
     if not validated then return nil, message end
+    -- A valid explicit setup can recover from a file error. It remains the
+    -- highest-priority override; reloading re-reads the file from defaults.
+    config_file_error = nil
     if initialized then
         local ok
         ok, message = call("setup", Config.copy(validated))
@@ -190,6 +197,7 @@ end
 
 function M.enable()
     if stopped then return nil, "cosmic: call setup() to restart after shutdown()" end
+    if config_file_error then return nil, config_file_error end
     options.enabled = true
     if initialized then
         local ok, message = call("enable")
@@ -230,6 +238,9 @@ function M.status()
     result.error = last_error
     result.config = Config.copy(options)
     result.plugin_path = plugin_path
+    result.config_file = config_file
+    result.config_file_loaded = config_file_loaded
+    result.config_file_error = config_file_error
     return result
 end
 
@@ -249,5 +260,17 @@ function M.preset(name)
     return Config.preset(name)
 end
 
+config_file = resolve_config_directory() .. "/hyprcosmos.lua"
+local file_options, file_error, file_found = UserConfig.load(config_file)
+config_file_loaded = file_found and file_options ~= nil
+if file_options then
+    options = file_options
+else
+    config_file_error = file_error
+    -- A retained native plugin may exist after a config reload. A broken
+    -- user file must never keep that previous universe/input hook running.
+    if native() then call("disable") end
+    warn(file_error)
+end
 attach()
 return M
