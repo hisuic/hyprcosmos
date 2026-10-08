@@ -25,7 +25,6 @@ Hyprland 本体の更新・再ビルドは不要です。他の版への対応�
 旧版には解除後の描画パスが残ってクラッシュする不具合があり、今回修正しました。
 旧プラグインは修正版の終了処理を使えないため、更新時には先に停止し、
 旧版がロードされたまま通常フレームが完了したことを確認してから解除します。
-経緯と確認範囲は [検証結果](docs/validation.md) を参照してください。
 
 必要なもの: `Hyprland` と対応する開発ヘッダー、GCC（本体と同じコンパイラー）、
 CMake、pkg-config、Lua 5.5、hyprutils、hyprgraphics、Aquamarine、Wayland、
@@ -263,7 +262,7 @@ hyprctl reload
 削除して `hyprctl reload` を使います。Hyprland 更新後は、その版への対応を
 確認してから対応ヘッダーでビルドし直してください。
 
-## 検証と設計資料
+## 検証
 
 ```sh
 ./scripts/build.sh
@@ -280,8 +279,6 @@ ctest --test-dir build --output-on-failure
 専用設定の実検証は `scripts/user-config-test.sh` で、独立した子セッションだけの
 ファイル作成・編集・reload・無効設定からの復帰と、特殊ファイルの拒否、require削除を確認します。
 
-[実環境とAPI調査](docs/environment.md)、[設計](docs/architecture.md)、
-[実際の検証結果](docs/validation.md) に、確認範囲と制約を記録します。
 数値計算のテストは発散防止・履歴再生・個別現象を検証し、Lua のテストは
 設定検証・初期化・解除・失敗処理を検証します。描画・入力の検証は本体の
-ビルド成功と区別し、入れ子セッションと通常セッションの結果を別に記録します。
+ビルド成功と区別し、独立した子セッションで実際の描画・入力を検証します。
