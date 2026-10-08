@@ -9,6 +9,9 @@
 小さなASCIIの `.`・`+`・`*` が銀青色に瞬き、ときどきASCIIの尾を引く
 流れ星が横切ります。通常入力で星空も即座に消え、元の壁紙へ戻ります。
 壁紙のファイルや壁紙アプリの設定は変更しません。
+Cosmic中はWaybarや通常の通知・ウィジェット・OSDなどのlayer-shell UIも
+描画だけを隠し、画面全体を宇宙にします。プロセス停止、パネルの予約領域や
+アプリの配置変更は行わず、最初の通常入力で元のUIへ戻します。
 
 対応対象は **Hyprland 0.56.2**、コミット
 `efb50993780079460b0cbed1363e2166a2de1d9f` と一致する開発ヘッダーです。
@@ -18,10 +21,10 @@ Hyprland 本体の更新・再ビルドは不要です。他の版への対応�
 
 ## 導入
 
-注意（2026-10-08）: 20秒設定の反映中、既存プラグインの解除・再読み込みで
-Hyprlandがクラッシュした。解除時の描画パスの後片付けは未修正のため、以下の
-再読み込み・更新・解除手順を現在の作業セッションで実行しないでください。
-20秒版はビルド・単体検証済みですが、実セッションでは未ロードです。
+旧版からの更新には、下記の `scripts/update.sh` を使用してください。
+旧版には解除後の描画パスが残ってクラッシュする不具合があり、今回修正しました。
+旧プラグインは修正版の終了処理を使えないため、更新時には先に停止し、
+旧版がロードされたまま通常フレームが完了したことを確認してから解除します。
 経緯と確認範囲は [検証結果](docs/validation.md) を参照してください。
 
 必要なもの: `Hyprland` と対応する開発ヘッダー、GCC（本体と同じコンパイラー）、
@@ -60,14 +63,19 @@ require("cosmic")
 ビルド済みのプラグインは内容ハッシュ付きの読み取り専用ファイルへ公開し、
 `build/cosmic.so` は原子的に切り替えるリンクです。再ビルドで使用中の共有
 ライブラリーを上書きしません。C++コード更新を反映する場合は、同じパスの
-読み込みを本体が保持するため、一度解除・再読み込みしてから再導入します。
+読み込みを本体が保持するため、安全な更新スクリプトで解除・再導入します。
 
 ```sh
-./scripts/uninstall.sh
-hyprctl reload
-./scripts/install.sh
-hyprctl reload
+hyprctl instances
+./scripts/update.sh --instance <更新するsignature> --dry-run
+./scripts/update.sh --instance <更新するsignature>
+# ビルド済みなら --no-build を追加
 ```
+
+更新には `python3`・`grim`・`timeout` が必要です。選択したセッションの全出力で
+フレーム完了を確認しますが、画面画像は保存・出力しません。撮影許可が必要な場合は
+通常の許可画面が出ます。許可失敗・消灯中・所有外のrequireなどでは解除前に停止し、
+本体の再起動は行いません。手動編集済みrequireは自動更新せず、個別に確認してください。
 
 設定を手動編集した管理ブロックは先に自分で取り除いてください。
 Luaの設定変更だけなら通常の `hyprctl reload` で反映できます。
@@ -104,6 +112,10 @@ F10を押さなくても行き先を確認できます。転送後も対象が�
 アイドル時間を延長します。キー長押し・リピート・ボタン保持・ドラッグ中は
 自動開始しません。ロック、画面消灯、復帰、ワークスペース／モニター構成の
 変更では演出を解除します。
+ロック画面、認証・モーダル画面、キーボード操作を要求するランチャーなどは
+宇宙表示より優先し、Cosmicを停止／開始抑止します。安全上の警告、Hyprland自身の
+通知やIME表示、重力操作用のカーソルは隠しません。IMEが入力grabを保持している間も
+開始を抑止するため、一部IMEではその状態が長く続くことがあります。
 
 ## 設定
 
@@ -126,7 +138,8 @@ require("cosmic").setup({
         fullscreen = true, idle_inhibit = true, screenshare = true,
         classes = { "^steam_app_", "^steam$", "^gamescope$", "^mpv$" },
     },
-    rendering = { particles = 96, stars = 240, background = 1, snapshot_mb = 128 },
+    rendering = { particles = 96, stars = 240, background = 1,
+                  snapshot_mb = 128, hide_desktop_ui = true },
 })
 ```
 
@@ -138,6 +151,12 @@ local cosmic = require("cosmic")
 cosmic.setup(cosmic.preset("demo"))
 -- 初期設定へ戻す: cosmic.setup(cosmic.preset("calm"))
 ```
+
+`rendering.hide_desktop_ui = false` を指定すると、Cosmic中も通常のバーなどを
+表示できます。安全上の開始抑止は、この設定を無効にしても残ります。
+保護用namespace・認証classの名前判定は補助的なもので、すべての独自UIを
+自動分類する保証はありません。通常のxdgウィンドウで作られたウィジェットは
+layer-shell UIとは異なり、ほかのアプリと同じく宇宙内の映像として扱います。
 
 `physics` で引力・緩和距離・加速度／速度上限・減衰・反発・吸い込み時間・
 ワームホールのクールダウンを変更できます。全項目と範囲は
@@ -210,7 +229,14 @@ hyprctl reload
 ```sh
 ./scripts/build.sh
 ctest --test-dir build --output-on-failure
+./scripts/fullscreen-test.sh
 ```
+
+全画面の実検証にはGTK 3・gtk-layer-shell・libpng・grimの開発／実行環境も必要です。
+このスクリプトは独立した子Hyprlandとheadless出力でバー・通知の実画像、
+復帰入力、保護レイヤー、描画直後の解除・require削除、20秒の開始待機を確認し、
+親セッションの設定や有効状態は変更しません。既存の宇宙現象・入力・共有回帰は
+`scripts/nested-test.sh` で確認できます。
 
 [実環境とAPI調査](docs/environment.md)、[設計](docs/architecture.md)、
 [実際の検証結果](docs/validation.md) に、確認範囲と制約を記録します。
