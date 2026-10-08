@@ -10,6 +10,8 @@ uniform vec4 uColor;
 uniform float uTime;
 uniform float uRadius;
 uniform float uPhase;
+uniform float uStars;
+uniform float uBackground;
 uniform vec2 uResolution;
 out vec4 fragColor;
 
@@ -31,13 +33,14 @@ void main() {
         vec2 grid = p * vec2(aspect, 1.0) * 180.0;
         vec2 cell = floor(grid);
         vec2 spot = fract(grid) - vec2(hash(cell), hash(cell + 17.0));
-        float rarity = step(0.975, hash(cell + 7.0));
+        float rarity = step(1.0 - uStars / (aspect * 32400.0), hash(cell + 7.0));
         float star = exp(-dot(spot, spot) * 650.0) * rarity;
         float twinkle = 0.68 + 0.32 * sin(uTime * (0.3 + hash(cell) * 0.9) + hash(cell + 3.0) * 6.28);
         color += vec3(0.62, 0.77, 1.0) * star * twinkle;
         color *= 1.0 - 0.25 * smoothstep(0.3, 1.0, length(q));
-        fragColor = vec4(color, 0.96);
+        fragColor = vec4(color * uBackground, uBackground);
     } else if (uMode == 1) {
+        if (any(lessThan(vUV, vec2(0.0))) || any(greaterThan(vUV, vec2(1.0)))) discard;
         vec4 texel = texture(uTexture, vUV);
         // Captured framebuffer pixels already use premultiplied alpha.
         fragColor = texel * uColor.a;
