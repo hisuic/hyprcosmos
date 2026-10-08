@@ -288,6 +288,7 @@ Clock::time_point lastInput = Clock::now(), lastTick = lastInput, lastCapture = 
         if (bodies.empty()) { reason = "no visible windows within snapshot budget"; return; }
         auto focused = Desktop::focusState()->window();
         universe.reset(std::move(bodies), std::move(regions), cursor(), focused ? focused->m_stableID : 0);
+        renderer.beginScene();
         active = true;
         alternateRegion = false;
         lastTick = lastCapture = Clock::now();
@@ -494,13 +495,13 @@ int setup(lua_State* L) {
         }
         lua_pop(L, 1);
         lua_getfield(L, 1, "rendering");
-        std::size_t stars = 120;
-        double background = .16;
+        std::size_t stars = 240;
+        double background = 1;
         if (lua_istable(L, -1)) {
             next.physics.max_particles = static_cast<std::size_t>(number(L, -1, "particles", 96, 0, 384));
             next.snapshotBudget = static_cast<std::size_t>(number(L, -1, "snapshot_mb", 128, 16, 512) * 1024 * 1024);
-            stars = static_cast<std::size_t>(number(L, -1, "stars", 120, 0, 1024));
-            background = number(L, -1, "background", .16, 0, 1);
+            stars = static_cast<std::size_t>(number(L, -1, "stars", 240, 0, 1024));
+            background = number(L, -1, "background", 1, 0, 1);
         }
         lua_pop(L, 1);
         lua_getfield(L, 1, "exclusions");
