@@ -135,10 +135,20 @@ check(explicit_demo_sky.rendering.background == 0.25 and explicit_demo_sky.rende
     "explicit sky overrides compose with a preset change")
 
 local original_open = io.open
-local function mock(mode)
+local function mock(mode, user_config_source)
     local state = { events = {}, bindings = {}, timers = {}, setups = 0, notifications = 0, loads = {},
-        enable = 0, disable = 0, shutdown = 0, actions = {}, initialized = false, enabled = false }
+        enable = 0, disable = 0, shutdown = 0, actions = {}, initialized = false, enabled = false,
+        config_opens = 0, user_config_source = user_config_source }
     io.open = function(path)
+        if path:match("/hyprcosmos%.lua$") then
+            state.config_opens = state.config_opens + 1
+            state.config_path = path
+            if state.user_config_source == nil then return nil, "No such file or directory", 2 end
+            return {
+                read = function(_, count) return state.user_config_source:sub(1, count) end,
+                close = function() return true end,
+            }
+        end
         if mode == "missing" then return nil, "missing test plugin" end
         return { close = function() end }
     end
@@ -162,7 +172,10 @@ local function mock(mode)
     _G.hl = {
         plugin = { load = function(path) state.loads[#state.loads + 1] = path end,
             cosmic = (mode ~= "missing" and mode ~= "delayed") and api or nil },
-        notification = { create = function() state.notifications = state.notifications + 1 end },
+        notification = { create = function(notification)
+            state.notifications = state.notifications + 1
+            state.notification_text = notification.text
+        end },
         on = function(event, callback)
             local subscription = { active = true, callback = callback }
             function subscription:remove() self.active = false end
@@ -322,6 +335,83 @@ for _, mode in ipairs({ "nil-error", "throw", "missing" }) do
     failed.shutdown()
     check(failure.live_events() == 0, "failed module can be shut down completely")
 end
+
+local file_module, file_state = mock("success", [[
+    return { idle_timeout = 91, rendering = { stars = 127 }, effects = { orbit = false } }
+]])
+check(file_module.status().config_file == root .. "/lua/hyprcosmos.lua" and
+    file_state.config_path == file_module.status().config_file,
+    "user settings resolve beside the module without following its symlink")
+check(file_module.status().config_file_loaded and not file_module.status().config_file_error and
+    file_module.status().config.idle_timeout == 91 and not file_module.status().config.effects.orbit,
+    "valid user settings are visible before native plugin initialization")
+check(file_module.status().config.rendering.stars == 127 and file_module.status().config.effects.binary,
+    "nested user settings preserve unspecified defaults")
+file_state.fire("config.reloaded")
+check(file_state.options.idle_timeout == 91 and file_state.options.rendering.stars == 127 and
+    file_state.setups == 1, "user settings reach native setup on the reload boundary")
+file_state.user_config_source = "return {idle_timeout=37}"
+check(require("cosmic") == file_module and file_state.config_opens == 1 and
+    file_module.status().config.idle_timeout == 91,
+    "repeated require does not reread a changed user file or duplicate initialization")
+file_state.fire_timers()
+check(file_state.config_opens == 1, "normal lifecycle timers do not poll the configuration file")
+check(file_module.setup({ idle_timeout = 23 }) == file_module and file_state.options.idle_timeout == 23 and
+    file_state.options.rendering.stars == 127 and not file_state.options.effects.orbit,
+    "explicit setup overrides file values while preserving its other nested settings")
+file_module.shutdown()
+
+local reloaded_file, reloaded_state = mock("success", "return { idle_timeout=37, rendering={stars=211} }")
+reloaded_state.fire("config.reloaded")
+check(reloaded_state.options.idle_timeout == 37 and reloaded_state.options.rendering.stars == 211,
+    "a fresh module lifecycle reads the edited user settings instead of cached prior values")
+reloaded_file.shutdown()
+
+local disabled_file, disabled_state = mock("success", "return { enabled=false, idle_timeout=92 }")
+disabled_state.fire("config.reloaded")
+check(disabled_file.status().module_initialized and not disabled_file.status().enabled and
+    not disabled_file.status().initialized and disabled_state.live_bindings() == 0 and
+    disabled_state.options.idle_timeout == 92,
+    "enabled=false user settings are accepted without enabling input watchers or controls")
+disabled_file.shutdown()
+
+for _, source in ipairs({
+    "return {", "error('test user settings failure')", "return nil", "return false", "return 42",
+    "return {idle_timeout=0}", "return {unknown=true}", "return {controls={preview='F12'}}",
+}) do
+    local rejected_file, rejected_state = mock("success", source)
+    rejected_state.fire("config.reloaded")
+    rejected_state.fire("config.reloaded")
+    local rejected_status = rejected_file.status()
+    check(not rejected_status.config_file_loaded and rejected_status.config_file_error and
+        rejected_status.error and rejected_status.error:find("hyprcosmos.lua", 1, true),
+        "file errors report the precise user file without escaping into Hyprland configuration evaluation")
+    check(rejected_state.setups == 0 and rejected_state.disable == 1 and
+        not rejected_status.initialized and rejected_state.live_bindings() == 0 and
+        rejected_state.notifications == 1 and #rejected_state.timers == 0,
+        "invalid user settings stop native operation once without registering controls or retry timers")
+    check(rejected_state.notification_text:find("Fix " .. rejected_state.config_path, 1, true) and
+        not rejected_state.notification_text:find("Build/install", 1, true),
+        "a file error recommends editing settings, not rebuilding the plugin")
+    check(not rejected_file.enable() and rejected_state.enable == 0,
+        "enable cannot silently bypass a rejected user settings file")
+    check(not rejected_file.setup({idle_timeout=-1}) and rejected_file.status().config_file_error,
+        "invalid explicit overrides keep file-error protection intact")
+    check(rejected_file.setup({idle_timeout=33}) == rejected_file and rejected_state.setups == 1 and
+        rejected_state.options.idle_timeout == 33 and not rejected_file.status().config_file_error and
+        not rejected_file.status().error and rejected_state.notifications == 1,
+        "a valid explicit setup can intentionally recover without duplicate warnings")
+    rejected_file.shutdown()
+    check(rejected_state.live_events() == 0 and rejected_state.live_bindings() == 0,
+        "file error recovery retains complete lifecycle cleanup")
+end
+
+local missing_file, missing_state = mock("success")
+missing_state.fire("config.reloaded")
+check(not missing_file.status().config_file_loaded and not missing_file.status().config_file_error and
+    missing_state.options.idle_timeout == 60 and missing_state.notifications == 0,
+    "missing optional user settings preserve the one-minute default without a warning")
+missing_file.shutdown()
 io.open = original_open
 _G.hl = nil
 print("Lua configuration/lifecycle: " .. checks .. " checks passed")
