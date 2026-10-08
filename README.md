@@ -5,6 +5,11 @@
 膨張、時間逆行。通常のキー・クリック・スクロールで即座に作業へ戻ります。
 アプリの配置・サイズ・所属は変更しません。
 
+5秒の無入力で、壁紙を覆う深い紺色の宇宙背景に切り替わります。
+小さなASCIIの `.`・`+`・`*` が銀青色に瞬き、ときどきASCIIの尾を引く
+流れ星が横切ります。通常入力で星空も即座に消え、元の壁紙へ戻ります。
+壁紙のファイルや壁紙アプリの設定は変更しません。
+
 対応対象は **Hyprland 0.56.2**、コミット
 `efb50993780079460b0cbed1363e2166a2de1d9f` と一致する開発ヘッダーです。
 実際に確認した環境は Arch Linux / GCC 16 / OpenGL / 1920×1080 scale=1。
@@ -115,7 +120,7 @@ require("cosmic").setup({
         fullscreen = true, idle_inhibit = true, screenshare = true,
         classes = { "^steam_app_", "^steam$", "^gamescope$", "^mpv$" },
     },
-    rendering = { particles = 96, stars = 120, background = 0.16, snapshot_mb = 128 },
+    rendering = { particles = 96, stars = 240, background = 1, snapshot_mb = 128 },
 })
 ```
 
@@ -135,6 +140,13 @@ cosmic.setup(cosmic.preset("demo"))
 速度上限を守るため、この時間より長くなる場合があります。
 履歴は `history_seconds`、`history_hz`、`history_mb` で制限します。
 物理更新の `fps` は 10〜120、初期値 60 です。
+
+`rendering.background` は宇宙背景の不透明度（0〜1）で、初期値1は壁紙を
+完全に覆います。透かしたい場合だけ小さくしてください。`rendering.stars`
+は星数の目安（0〜1024）です。0では星と流れ星を両方止めます。
+字形はフォントに依存しない5×7ピクセルのASCIIで、モニター倍率に追従します。
+配置は `seed` で再現でき、流れ星は開始3〜7秒後から、以降おおむね8〜16秒間隔で
+約1.8秒間現れます。転送先の小窓にも同じ系統の星空を描画します。
 
 状態と操作をターミナルから確認:
 
