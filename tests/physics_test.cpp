@@ -198,6 +198,168 @@ void blackHoleAndLivingHistory() {
     check(!universe.rewinding(), "reverse playback stops at finite history boundary");
 }
 
+void cinematicBlackHole() {
+    constexpr double pi = 3.14159265358979323846;
+    const Vec2 center{960.0, 540.0};
+    for (const bool zero_velocity : {false, true}) {
+        auto config = Config::calm();
+        if (zero_velocity) config.cursor_strength = 0.0;
+        Universe universe(config);
+        Body target = body(1, center, zero_velocity ? Vec2{} : Vec2{80.0, 0.0});
+        target.width = 1600.0;
+        target.height = 900.0;
+        universe.reset({target}, {Region{}}, center);
+        const Body initial = universe.bodies()[0];
+        check(!zero_velocity || magnitude(initial.velocity) == 0.0, "center fallback is exercised with genuinely zero initial velocity");
+        check(universe.startBlackHole(center), "calm single-window center selection starts a sink");
+        check(magnitude(universe.bodies()[0].position - initial.position) == 0.0, "black-hole activation never jumps position");
+        check(close(universe.bodies()[0].angle, initial.angle) && close(universe.bodies()[0].scale, initial.scale),
+              "black-hole activation preserves displayed angle and scale");
+        check(close(universe.bodies()[0].sink_duration, config.sink_duration), "calm sink retains its requested duration");
+        double previous_scale = initial.scale;
+        double maximum_motion = 0.0;
+        const int frames = static_cast<int>(std::ceil(config.sink_duration * 120.0));
+        for (int frame = 0; frame < frames; ++frame) {
+            const Vec2 before = universe.bodies()[0].position;
+            universe.step(1.0 / 120.0, {1800.0, 900.0});
+            const auto& current = universe.bodies()[0];
+            check(std::isfinite(current.position.x) && std::isfinite(current.velocity.x), "centered sink motion stays finite");
+            check(magnitude(current.position - before) <= config.max_speed / 120.0 + 1e-6, "actual sink displacement obeys the speed cap");
+            check(current.scale <= previous_scale + 1e-12, "visible sink scale decreases monotonically");
+            previous_scale = current.scale;
+            maximum_motion = std::max(maximum_motion, magnitude(universe.worldToScreen(current.position, 0) - center));
+            if (frame == 11) {
+                check(!current.stored && current.scale > initial.scale * 0.95, "early take-in arc retains readable application imagery");
+                check(current.stretch < 1.15 && current.twist < 0.05, "deformation starts gently instead of becoming a needle immediately");
+            }
+            if (frame == 59) {
+                check(magnitude(universe.worldToScreen(current.position, 0) - center) > 20.0, "center selection produces clearly visible screen-space motion");
+                check(!current.stored && current.scale > initial.scale * 0.85, "half-second image remains visible during calm absorption");
+            }
+            if (frame == 239)
+                check(!current.stored && current.scale > initial.scale * 0.15, "application remains visible through the later absorption stage");
+            if (!current.stored)
+                check(magnitude(universe.worldToScreen(current.sink_center, 0) - center) < 1e-7, "screen-space sink center stays fixed while mouse moves");
+        }
+        check(maximum_motion > 35.0, "centered capture has a finite take-in arc");
+        advance(universe, 0.05);
+        check(universe.bodies()[0].stored && close(universe.bodies()[0].scale, 0.0), "continuous sink ends in virtual storage");
+        check(magnitude(universe.bodies()[0].position - center) < 1e-7, "finished path converges to its fixed center");
+    }
+
+    auto config = Config::calm();
+    config.spaghetti = false;
+    Universe universe(config);
+    universe.reset({body(3, center, {60.0, 0.0})}, {Region{}}, center);
+    check(universe.startBlackHole(center), "sink starts with deformation disabled");
+    advance(universe, 0.6);
+    const auto undeformed = universe.bodies()[0];
+    check(magnitude(undeformed.position - center) > 20.0 && undeformed.scale < undeformed.original_scale,
+          "deformation-disabled capture still moves and shrinks");
+    check(std::abs(undeformed.angle) > 0.1 && close(undeformed.stretch, 1.0) && close(undeformed.twist, 0.0),
+          "deformation-disabled capture spins without stretching or twisting");
+
+    // A point away from the image center must keep exactly its original pose at
+    // activation and still follow a nondegenerate spiral.
+    universe.reset({body(5, center, {20.0, 40.0})}, {Region{}}, center);
+    const Vec2 offset_cursor = center + Vec2{20.0, -8.0};
+    check(universe.startBlackHole(offset_cursor), "offset shape selection starts absorption");
+    check(magnitude(universe.bodies()[0].position - center) == 0.0, "offset selection starts without a positional jump");
+    advance(universe, 0.4);
+    check(magnitude(universe.bodies()[0].position - center) > 10.0, "offset selection visibly follows its spiral");
+    check(magnitude(universe.bodies()[0].sink_center - offset_cursor) < 1e-7, "offset selection captures the chosen center exactly");
+
+    // Short requested durations can only finish when they respect the speed cap.
+    config = inert();
+    config.sink_duration = 0.3;
+    config.max_speed = 180.0;
+    universe.configure(config);
+    universe.reset({body(7, center, {50.0, 0.0})}, {Region{}}, center);
+    check(universe.startBlackHole(center + Vec2{25.0, 10.0}), "minimum-duration selection starts");
+    const double effective_duration = universe.bodies()[0].sink_duration;
+    check(effective_duration >= config.sink_duration, "speed-limited sink never shortens its minimum duration");
+    const int frames = static_cast<int>(std::ceil(effective_duration * 120.0)) + 2;
+    for (int frame = 0; frame < frames; ++frame) {
+        const Vec2 previous = universe.bodies()[0].position;
+        universe.step(1.0 / 120.0, {});
+        const auto& current = universe.bodies()[0];
+        check(magnitude(current.velocity) <= config.max_speed + 1e-6, "cinematic sink velocity stays bounded at minimum duration");
+        check(magnitude(current.position - previous) <= config.max_speed / 120.0 + 1e-6, "minimum-duration path also bounds actual displacement");
+    }
+    check(universe.bodies()[0].stored, "speed-limited path still reaches virtual storage");
+
+    // The fixed camera must not cancel movement or change the captured cursor
+    // anchor, including a region whose initial camera was already zoomed out.
+    config = Config::calm();
+    universe.configure(config);
+    const Region compact{42, 0.0, 0.0, 1280.0, 720.0};
+    Body distant = body(9, {2100.0, 360.0}, {-80.0, 0.0});
+    distant.region = compact.id;
+    universe.reset({distant}, {compact}, {640.0, 360.0});
+    const Vec2 anchor = universe.worldToScreen(distant.position, compact.id);
+    const double captured_zoom = universe.cameras()[0].zoom;
+    check(captured_zoom < 1.0, "camera-anchor regression begins with an expanded view");
+    check(universe.startBlackHole(anchor, compact.id), "expanded-view center selection starts");
+    advance(universe, 1.4, {100.0, 100.0});
+    check(close(universe.cameras()[0].zoom, captured_zoom), "absorption camera does not undo presentation shrinking");
+    check(magnitude(universe.worldToScreen(universe.bodies()[0].sink_center, compact.id) - anchor) < 1e-7,
+          "expanded-view black-hole anchor stays at activation screen coordinates");
+
+    // Test the actual shader vertex mapping against a small viewport, including
+    // its twist/stretch/bend. This catches the former collision-radius padding
+    // that clipped both ends of a rotating image.
+    const Region small{77, 0.0, 0.0, 720.0, 480.0};
+    Body large = body(11, small.center(), {60.0, 0.0});
+    large.region = small.id;
+    large.width = 1600.0;
+    large.height = 900.0;
+    universe.reset({large}, {small}, small.center());
+    check(universe.startBlackHole(small.center(), small.id), "small-viewport capture starts");
+    for (int frame = 0; frame < 320; ++frame) {
+        universe.step(1.0 / 120.0, small.center());
+        if (frame % 20 != 0) continue;
+        const auto& current = universe.bodies()[0];
+        for (int x = -2; x <= 2; ++x) for (int y = -2; y <= 2; ++y) {
+            Vec2 normalized{static_cast<double>(x) * 0.5, static_cast<double>(y) * 0.5};
+            const double twist = current.twist * std::min(1.0, magnitude(normalized));
+            Vec2 offset{(normalized.x * std::cos(twist) - normalized.y * std::sin(twist)) * current.width * 0.5 * current.scale * current.stretch,
+                        (normalized.x * std::sin(twist) + normalized.y * std::cos(twist)) * current.height * 0.5 * current.scale / current.stretch};
+            offset.y += std::sin(static_cast<double>(x) * 0.5 * pi) * current.sink_progress * 0.24 * current.height * current.scale;
+            const Vec2 turned{offset.x * std::cos(current.angle) - offset.y * std::sin(current.angle),
+                              offset.x * std::sin(current.angle) + offset.y * std::cos(current.angle)};
+            const Vec2 screen = universe.worldToScreen(current.position + turned, current.region);
+            check(screen.x >= small.x && screen.x <= small.x + small.width &&
+                  screen.y >= small.y && screen.y <= small.y + small.height,
+                  "rotating deformed image remains inside the compact presentation viewport");
+        }
+    }
+
+    config = Config::calm();
+    universe.configure(config);
+    universe.reset({body(13, center, {80.0, 0.0})}, {Region{}}, center);
+    check(universe.startBlackHole(center), "deterministic rewind capture starts");
+    advance(universe, 0.7);
+    Universe expected = universe;
+    const double rewind_target = expected.bodies()[0].sink_progress;
+    advance(universe, 0.5);
+    universe.setRewinding(true);
+    for (int frame = 0; frame < 100 && universe.bodies()[0].sink_progress > rewind_target + 1e-9; ++frame)
+        universe.step(1.0 / 30.0, {});
+    check(close(universe.bodies()[0].sink_progress, rewind_target), "rewind returns to the recorded cinematic progress");
+    universe.setRewinding(false);
+    for (int frame = 0; frame < 120; ++frame) {
+        universe.step(1.0 / 120.0, center);
+        expected.step(1.0 / 120.0, center);
+        const auto& replayed = universe.bodies()[0];
+        const auto& original = expected.bodies()[0];
+        check(magnitude(replayed.position - original.position) < 1e-7 && magnitude(replayed.velocity - original.velocity) < 1e-7,
+              "forward playback after rewind follows the identical seeded absorption path");
+        check(close(replayed.scale, original.scale) && close(replayed.angle, original.angle) &&
+              close(replayed.stretch, original.stretch) && close(replayed.twist, original.twist),
+              "forward playback after rewind preserves the identical visual deformation");
+    }
+}
+
 void supernovaAndCaps() {
     auto config = inert();
     config.max_bodies = 3;
@@ -303,6 +465,7 @@ int main() {
     collisionAndBoundary();
     wormholesAndRegions();
     blackHoleAndLivingHistory();
+    cinematicBlackHole();
     supernovaAndCaps();
     expansionAndStress();
     std::cout << "Cosmic physics: " << assertions << " checks passed\n";
