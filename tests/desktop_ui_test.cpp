@@ -23,27 +23,42 @@ static_assert(!cosmic::protectedDesktopNamespace("waybar"));
 static_assert(!cosmic::authenticationWindowClass("kitty"));
 static_assert(noexcept(cosmic::protectedDesktopNamespace("")));
 static_assert(noexcept(cosmic::authenticationWindowClass("")));
-static_assert(!cosmic::activeIMEComposition(false, false));
-static_assert(!cosmic::activeIMEComposition(false, true));
-static_assert(!cosmic::activeIMEComposition(true, false));
-static_assert(cosmic::activeIMEComposition(true, true));
-static_assert(noexcept(cosmic::activeIMEComposition(true, true)));
+static_assert(!cosmic::activeIMEComposition(false, false, false));
+static_assert(!cosmic::activeIMEComposition(false, false, true));
+static_assert(!cosmic::activeIMEComposition(false, true, false));
+static_assert(!cosmic::activeIMEComposition(false, true, true));
+static_assert(!cosmic::activeIMEComposition(true, false, false));
+static_assert(!cosmic::activeIMEComposition(true, false, true));
+static_assert(!cosmic::activeIMEComposition(true, true, false));
+static_assert(cosmic::activeIMEComposition(true, true, true));
+static_assert(noexcept(cosmic::activeIMEComposition(true, true, true)));
 
 void testIMEComposition() {
-    for (const bool focused : {false, true})
-        for (const bool preedit : {false, true})
-            check(cosmic::activeIMEComposition(focused, preedit) == (focused && preedit),
-                  "only a focused text input with nonempty preedit inhibits idle entry");
+    for (const bool enabledFocusedInput : {false, true})
+        for (const bool committed : {false, true})
+            for (const bool nonempty : {false, true})
+                check(cosmic::activeIMEComposition(enabledFocusedInput, committed, nonempty) ==
+                          (enabledFocusedInput && committed && nonempty),
+                      "only an enabled focused input with committed nonempty preedit inhibits idle entry");
 
     bool focused = true;
     const bool stalePreedit = true;
-    check(cosmic::activeIMEComposition(focused, stalePreedit), "focused composition inhibits Cosmic");
+    check(cosmic::activeIMEComposition(focused, true, stalePreedit), "focused composition inhibits Cosmic");
     focused = false;
-    check(!cosmic::activeIMEComposition(focused, stalePreedit),
+    check(!cosmic::activeIMEComposition(focused, true, stalePreedit),
           "a stale preedit stops inhibiting Cosmic after its text input loses focus");
     const bool persistentKeyboardGrab = true;
-    check(persistentKeyboardGrab && !cosmic::activeIMEComposition(true, false),
+    check(persistentKeyboardGrab && !cosmic::activeIMEComposition(true, false, false),
           "a persistent IME keyboard routing grab does not make empty preedit active composition");
+    const bool fallbackFocusedInput = true;
+    const bool textInputEnabled = false;
+    check(!cosmic::activeIMEComposition(fallbackFocusedInput && textInputEnabled, true, stalePreedit),
+          "a disabled text input returned by the core's focus fallback does not retain active composition");
+    const bool preeditUpdatedInLatestCommit = false;
+    check(!cosmic::activeIMEComposition(true, preeditUpdatedInLatestCommit, stalePreedit),
+          "a commit_string-only transaction may retain stale preedit storage without active composition");
+    check(!cosmic::activeIMEComposition(true, true, false),
+          "an explicit empty preedit transaction clears active composition");
 }
 
 void testLayerNamespaces() {
