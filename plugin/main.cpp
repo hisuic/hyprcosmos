@@ -28,6 +28,7 @@
 #include "physics.hpp"
 #include "renderer.hpp"
 #include "desktop_ui.hpp"
+#include "user_config_reader.hpp"
 
 namespace {
 using Clock = std::chrono::steady_clock;
@@ -705,6 +706,17 @@ int enable(lua_State* L) {
 int disable(lua_State* L) { instance->options.enabled = false; instance->shutdown(); lua_pushboolean(L, true); return 1; }
 int shutdown(lua_State* L) { instance->options.enabled = false; instance->shutdown(); lua_pushboolean(L, true); return 1; }
 int action(lua_State* L) { instance->action(luaL_checkstring(L, 1)); lua_pushboolean(L, true); return 1; }
+int read_user_config(lua_State* L) {
+    std::size_t length = 0;
+    const char* path = luaL_checklstring(L, 1, &length);
+    const auto result = cosmic::readUserConfig(std::string_view(path, length));
+    if (result.source) lua_pushlstring(L, result.source->data(), result.source->size());
+    else lua_pushnil(L);
+    if (result.error.empty()) lua_pushnil(L);
+    else lua_pushlstring(L, result.error.data(), result.error.size());
+    lua_pushboolean(L, result.found);
+    return 3;
+}
 int status(lua_State* L) {
     lua_newtable(L);
     auto b = [&](const char* k, bool v) { lua_pushboolean(L, v); lua_setfield(L, -2, k); };
@@ -792,7 +804,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         HyprlandAPI::getHyprlandVersion(handle).hash != GIT_COMMIT_HASH)
         throw std::runtime_error("Cosmic: Hyprland ABI mismatch; rebuild with the running compositor headers");
     instance = new Cosmic();
-    for (auto [name, callback] : std::initializer_list<std::pair<const char*, PLUGIN_LUA_FN>>{{"setup", setup}, {"enable", enable}, {"disable", disable}, {"shutdown", shutdown}, {"action", action}, {"status", status}}) {
+    for (auto [name, callback] : std::initializer_list<std::pair<const char*, PLUGIN_LUA_FN>>{{"setup", setup}, {"enable", enable}, {"disable", disable}, {"shutdown", shutdown}, {"action", action}, {"status", status}, {"read_user_config", read_user_config}}) {
         if (!HyprlandAPI::addLuaFunction(handle, "cosmic", name, callback)) {
             delete instance; instance = nullptr;
             throw std::runtime_error("Cosmic: Lua callback registration failed");
