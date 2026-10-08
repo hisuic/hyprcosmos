@@ -47,7 +47,7 @@ std::string string(lua_State* L, int table, const char* key, const std::string& 
 
 struct Control { xkb_keysym_t symbol = XKB_KEY_NoSymbol; uint32_t mods = 0; };
 struct Options {
-    Config physics = Config::calm();
+    cosmic::Config physics = cosmic::Config::calm();
     double idleTimeout = 5, fps = 60, snapshotHz = 4;
     bool enabled = true, excludeFullscreen = true, excludeInhibit = true, excludeShare = true;
     std::size_t snapshotBudget = 128 * 1024 * 1024;
@@ -57,8 +57,8 @@ struct Options {
 
 class Cosmic;
 Cosmic* instance = nullptr;
-using RenderWindowFn = void (*)(Render::IHyprRenderer*, PHLWINDOW, PHLMONITOR, const Time::steady_tp&, bool, eRenderPassMode, bool, bool);
-void renderWindowHook(Render::IHyprRenderer*, PHLWINDOW, PHLMONITOR, const Time::steady_tp&, bool, eRenderPassMode, bool, bool);
+using RenderWindowFn = void (*)(Render::IHyprRenderer*, PHLWINDOW, PHLMONITOR, const Time::steady_tp&, bool, Render::eRenderPassMode, bool, bool);
+void renderWindowHook(Render::IHyprRenderer*, PHLWINDOW, PHLMONITOR, const Time::steady_tp&, bool, Render::eRenderPassMode, bool, bool);
 
 class Cosmic {
   public:
@@ -122,9 +122,9 @@ class Cosmic {
             if (options.excludeShare && Screenshare::mgr()->isOutputBeingSSd(m)) return true;
         }
         if (options.excludeShare && !shares.empty()) return true;
-        if (options.excludeInhibit && !g_pInputManager->m_idleInhibitors.empty()) return true;
         for (const auto& w : Desktop::windowState()->windows()) {
             if (!w->m_isMapped || w->isHidden() || !g_pHyprRenderer->shouldRenderWindow(w)) continue;
+            if (options.excludeInhibit && g_pInputManager->isWindowInhibiting(w, false)) return true;
             if (options.excludeFullscreen && Fullscreen::controller()->isFullscreen(w)) return true;
             for (const auto& pattern : options.excluded) if (std::regex_search(w->m_class, pattern)) return true;
         }
@@ -362,7 +362,7 @@ class Cosmic {
     }
 };
 
-void renderWindowHook(Render::IHyprRenderer* self, PHLWINDOW window, PHLMONITOR monitor, const Time::steady_tp& time, bool decorate, eRenderPassMode mode, bool ignorePosition, bool standalone) {
+void renderWindowHook(Render::IHyprRenderer* self, PHLWINDOW window, PHLMONITOR monitor, const Time::steady_tp& time, bool decorate, Render::eRenderPassMode mode, bool ignorePosition, bool standalone) {
     if (instance->active && !instance->capturing && std::ranges::any_of(instance->snapshots, [&](const auto& shot) { return shot.id == window->m_stableID; })) return;
     reinterpret_cast<RenderWindowFn>(instance->hook->m_original)(self, window, monitor, time, decorate, mode, ignorePosition, standalone);
 }
@@ -371,7 +371,7 @@ int setup(lua_State* L) {
     luaL_checktype(L, 1, LUA_TTABLE);
     try {
         Options next;
-        next.physics = string(L, 1, "preset", "calm") == "demo" ? Config::demo() : Config::calm();
+        next.physics = string(L, 1, "preset", "calm") == "demo" ? cosmic::Config::demo() : cosmic::Config::calm();
         next.enabled = boolean(L, 1, "enabled", true);
         next.idleTimeout = number(L, 1, "idle_timeout", 5, .25, 3600);
         next.fps = number(L, 1, "fps", 60, 10, 120);
