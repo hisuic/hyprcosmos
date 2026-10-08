@@ -1,4 +1,7 @@
 -- Dedicated test session. No user configuration, services or application binds.
+-- Limit this first-launch permission to the isolated screenshot executable.
+-- Without a rule the permission path can delay images by more than a second.
+hl.permission({ binary = "^/usr/bin/grim$", type = "screencopy", mode = "allow" })
 hl.monitor({ output = "", mode = "1280x720@60", position = "0x0", scale = 1 })
 hl.config({
     general = { gaps_in = 8, gaps_out = 18, border_size = 2, layout = "dwindle" },
