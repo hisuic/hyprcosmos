@@ -252,13 +252,19 @@ done
 
 # Exercise unload without first shutting Cosmic down. Screenshot delivery proves
 # an actual Cosmic pass has been rendered/retained immediately before unload.
-for ((round=1; round<=unload_rounds; ++round)); do
+    for ((round=1; round<=unload_rounds; ++round)); do
     preview
     capture "direct-active-$round" hidden
+    # unloadPlugin queues an automatic config reload in 0.56.2. Remove require
+    # from the generated child config first, without reloading: Cosmic is still
+    # active at the direct unload, and that queued reload cannot load it again.
+    write_config false
     [[ $(ctl plugin unload "$loaded_plugin") == ok ]] || { printf 'Direct plugin unload failed.\n' >&2; exit 1; }
     check_alive "direct-unloaded-$round"
-    [[ $(ctl plugin load "$loaded_plugin") == ok ]] || { printf 'Direct plugin reload failed.\n' >&2; exit 1; }
-    eval_lua 'require("cosmic").setup({enabled=true})'
+    write_config true
+    [[ $(ctl reload) == ok ]] || { printf 'Direct unload recovery reload failed.\n' >&2; exit 1; }
+    wait_lua 'hl.plugin.cosmic~=nil and require("cosmic").status().module_initialized'
+    eval_lua 'require("cosmic").enable()'
 done
 for ((round=1; round<=3; ++round)); do
     preview
