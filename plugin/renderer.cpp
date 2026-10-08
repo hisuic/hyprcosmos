@@ -95,7 +95,7 @@ class CosmicPass final : public IPassElement {
           m_snapshots(snapshots), m_alternate(alternate) {}
     std::vector<UP<IPassElement>> draw() override {
         if (const auto monitor = m_monitor.lock())
-            m_renderer.draw(monitor, m_universe, m_snapshots, m_alternate);
+            m_renderer.executeDraw(monitor, m_universe, m_snapshots, m_alternate);
         return {};
     }
     bool needsLiveBlur() override { return false; }
@@ -123,6 +123,9 @@ struct CosmicRenderer::Impl {
     GLint projection = -1, resolution = -1, center = -1, size = -1;
     GLint angle = -1, stretch = -1, twist = -1, bend = -1, crop = -1;
     GLint mode = -1, color = -1, time = -1, radius = -1, phase = -1;
+    GLint stars = -1, background = -1;
+    std::size_t starCount = 180;
+    float backgroundAlpha = 0.96F;
     GLsizei gridVertices = 0;
     bool attempted = false;
     std::string error;
@@ -182,6 +185,7 @@ bool CosmicRenderer::initialize() {
         impl.crop = uniform("uCrop"); impl.mode = uniform("uMode");
         impl.color = uniform("uColor"); impl.time = uniform("uTime");
         impl.radius = uniform("uRadius"); impl.phase = uniform("uPhase");
+        impl.stars = uniform("uStars"); impl.background = uniform("uBackground");
 
         std::vector<float> vertices;
         const auto cell = [&](float left, float top, float right, float bottom) {
@@ -218,6 +222,16 @@ bool CosmicRenderer::initialize() {
 
 void CosmicRenderer::draw(PHLMONITOR monitor, const Universe& universe,
                           const std::vector<Snapshot>& snapshots, bool alternateRegion) {
+    g_pHyprRenderer->addPassElement(pass(monitor, universe, snapshots, alternateRegion));
+}
+
+void CosmicRenderer::configure(std::size_t stars, double background) {
+    m_impl->starCount = std::min<std::size_t>(stars, 4096);
+    m_impl->backgroundAlpha = std::clamp(background, 0.0, 1.0);
+}
+
+void CosmicRenderer::executeDraw(PHLMONITOR monitor, const Universe& universe,
+                                 const std::vector<Snapshot>& snapshots, bool alternateRegion) {
     if (!monitor || !initialize()) return;
     GLState state;
     auto& impl = *m_impl;
@@ -243,17 +257,18 @@ void CosmicRenderer::draw(PHLMONITOR monitor, const Universe& universe,
     glUniform2f(impl.resolution, monitorSize.x, monitorSize.y);
     const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - impl.start).count();
     glUniform1f(impl.time, std::fmod(seconds, 10000.0));
+    glUniform1f(impl.stars, impl.starCount);
+    glUniform1f(impl.background, impl.backgroundAlpha);
     glUniform4f(impl.crop, 0, 0, 1, 1);
     impl.quad(monitorSize * 0.5, monitorSize, 0, {1, 1, 1, 1});
 
     const Region* view = nullptr;
     for (const auto& region : universe.regions()) {
-        if (std::abs(region.x - monitor->m_position.x) < 1 &&
-            std::abs(region.y - monitor->m_position.y) < 1) { view = &region; break; }
+        const int wanted = static_cast<int>(monitor->m_id) + (alternateRegion ? 1000000 : 0);
+        if (region.id == wanted) { view = &region; break; }
     }
     if (!view && !universe.regions().empty()) view = &universe.regions().front();
     if (!view) return;
-    if (alternateRegion && universe.regions().size() > 1) view = &universe.regions().back();
     const auto toPixel = [&](Vec2 world, int region) {
         auto point = universe.worldToScreen(world, region);
         if (alternateRegion) return Vec2{(point.x - view->x) * monitorSize.x / view->width,
