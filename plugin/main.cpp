@@ -227,6 +227,12 @@ Clock::time_point lastInput = Clock::now(), lastTick = lastInput, lastCapture = 
         lastShareRequest = shareObservationUntil = Clock::time_point{};
         if (g_pHyprRenderer && g_pHyprRenderer->glBackend()) {
             g_pHyprRenderer->glBackend()->makeEGLCurrent();
+            // Hyprland retains the executed pass until the NEXT beginRender.
+            // Its virtual methods and unique-pointer deleter live in this ELF:
+            // destroy our passes while loaded, before releasing GL resources or
+            // returning to PluginSystem::unloadPlugin's dlclose. Never clear
+            // unrelated compositor passes. Shutdown runs outside pass.draw().
+            g_pHyprRenderer->m_renderPass.removeAllOfType("CosmicUniverse");
             renderer.release();
         }
     }
