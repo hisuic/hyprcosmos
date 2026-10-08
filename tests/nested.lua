@@ -14,5 +14,8 @@ require("cosmic").setup({
     idle_timeout = 0.8,
     fps = 30,
     snapshot_hz = 8,
+    -- grim is itself a real screenshare client. Test rendering with this one
+    -- exclusion disabled; production defaults keep sharing excluded.
+    exclusions = { screenshare = false },
     rendering = { background = 0.95, stars = 180 },
 })
