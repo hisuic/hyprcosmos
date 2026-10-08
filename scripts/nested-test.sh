@@ -30,8 +30,9 @@ client_a=""
 client_b=""
 client_c=""
 held_input=""
+share_pid=""
 cleanup() {
-    for pid in "$held_input" "$client_a" "$client_b" "$client_c" "$compositor_pid"; do
+    for pid in "$share_pid" "$held_input" "$client_a" "$client_b" "$client_c" "$compositor_pid"; do
         if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then kill -TERM "$pid" 2>/dev/null || true; fi
     done
     if [[ -n "$native_socket" && -L "$XDG_RUNTIME_DIR/$socket" && $(readlink -- "$XDG_RUNTIME_DIR/$socket") == "$native_socket" ]]; then
@@ -55,12 +56,23 @@ for protocol in xdg-shell virtual-keyboard virtual-pointer; do
     wayland-scanner client-header "$xml" "$output/protocols/$protocol-client-protocol.h"
     wayland-scanner private-code "$xml" "$output/protocols/$protocol-protocol.c"
 done
+for protocol in toplevel-export foreign-toplevel; do
+    case "$protocol" in
+        toplevel-export) xml="$repository/tests/protocols/hyprland-toplevel-export-v1.xml" ;;
+        foreign-toplevel) xml="$repository/tests/protocols/wlr-foreign-toplevel-management-unstable-v1.xml" ;;
+    esac
+    wayland-scanner client-header "$xml" "$output/protocols/$protocol-client-protocol.h"
+    wayland-scanner private-code "$xml" "$output/protocols/$protocol-protocol.c"
+done
 read -r -a cflags <<< "$(pkg-config --cflags wayland-client xkbcommon)"
 read -r -a libs <<< "$(pkg-config --libs wayland-client xkbcommon)"
 gcc -std=c11 -O2 -Wall -Wextra -Wno-unused-parameter -I"$output/protocols" "${cflags[@]}" \
     "$repository/tests/wayland-probe.c" "$output/protocols/xdg-shell-protocol.c" \
     "$output/protocols/virtual-keyboard-protocol.c" "$output/protocols/virtual-pointer-protocol.c" \
     "${libs[@]}" -o "$output/wayland-probe"
+gcc -std=c11 -O2 -Wall -Wextra -Wno-unused-parameter -I"$output/protocols" "${cflags[@]}" \
+    "$repository/tests/share-probe.c" "$output/protocols/toplevel-export-protocol.c" \
+    "$output/protocols/foreign-toplevel-protocol.c" "${libs[@]}" -o "$output/share-probe"
 cp -- "$repository/tests/nested.lua" "$output/config/hyprland.lua"
 ln -s -- "$repository/lua/cosmic" "$output/config/cosmic"
 ln -s -- "$plugin" "$output/config/cosmic.so"
@@ -115,6 +127,28 @@ normal_center() {
 monitor_extents() {
     ctl -j monitors | python3 -c 'import json,sys; m=json.load(sys.stdin)[0]; print(m["width"],m["height"])'
 }
+start_window_share() {
+    local log=$1 address
+    address=$(ctl -j clients | python3 -c 'import json,sys; print(next(c["address"] for c in json.load(sys.stdin) if c.get("title")=="Cosmic probe A"))')
+    env -u HYPRLAND_INSTANCE_SIGNATURE WAYLAND_DISPLAY="$socket" "$output/share-probe" "$address" > "$log" 2>&1 &
+    share_pid=$!
+    for ((attempt=0; attempt<50; ++attempt)); do
+        kill -0 "$share_pid" 2>/dev/null || { printf 'Window share probe exited:\n' >&2; sed -n '1,30p' "$log" >&2; exit 1; }
+        if [[ $(event_count '"event":"window_frame"' "$log") -ge 3 ]]; then return; fi
+        sleep 0.1
+    done
+    printf 'Window share did not deliver three real frames:\n' >&2
+    sed -n '1,30p' "$log" >&2
+    exit 1
+}
+stop_window_share() {
+    kill -TERM "$share_pid"
+    wait "$share_pid" 2>/dev/null || true
+    share_pid=""
+    # The source's share-stop timer uses 500ms; allow its actual false event
+    # before checking an enable that deliberately missed it while disabled.
+    sleep 0.65
+}
 capture() {
     if command -v grim >/dev/null; then
         env -u HYPRLAND_INSTANCE_SIGNATURE WAYLAND_DISPLAY="$socket" grim "$output/$1.png" || true
@@ -142,6 +176,29 @@ env -u HYPRLAND_INSTANCE_SIGNATURE WAYLAND_DISPLAY="$socket" "$output/wayland-pr
 client_b=$!
 sleep 1
 eval_lua 'local s=require("cosmic").status(); assert(s.module_initialized and s.error==nil)'
+
+# SHARE_WINDOW can predate input/render listeners. Its first real frames happen
+# while Cosmic is disabled, so enable must query current native session state.
+eval_lua 'require("cosmic").setup({enabled=false,exclusions={screenshare=true}})'
+start_window_share "$output/share-before-enable.jsonl"
+eval_lua 'require("cosmic").enable()'
+sleep 1.4
+eval_lua 'local s=require("cosmic").status(); assert(s.initialized and not s.active)'
+status > "$output/share-before-enable-status.txt"
+stop_window_share
+wait_active
+
+# Start under enabled listeners, then end while disabled. A re-enable must not
+# retain a stale start event after the real session has stopped.
+start_window_share "$output/share-ended-while-disabled.jsonl"
+eval_lua 'local s=require("cosmic").status(); assert(s.initialized and not s.active); require("cosmic").disable()'
+stop_window_share
+eval_lua 'require("cosmic").enable()'
+wait_active
+status > "$output/share-after-reenable-status.txt"
+eval_lua 'require("cosmic").setup({enabled=false,exclusions={screenshare=false}})'
+printf '%s\n' 'PASS: real window sharing predating enable blocks idle; sharing ended during disable does not leave stale exclusion.' > "$output/share-regression.txt"
+
 ctl -j clients > "$output/normal-clients.json"
 capture normal
 measure_cpu normal 2
@@ -290,7 +347,7 @@ sed '/require("cosmic")/,$d' "$repository/tests/nested.lua" > "$output/config/hy
 ctl reload > "$output/remove-require.txt"
 sleep 0.3
 eval_lua 'assert(hl.plugin.cosmic == nil)'
-printf '%s\n' 'PASS: nested real GL rotation/deformation/store/rewind, first key/button/scroll, dedicated controls, holds, modifiers, mouse focus, geometry, actual window creation/closure, lifecycle and require removal. Hotplug result and CPU measurements are in adjacent files.' | tee "$output/result.txt"
+printf '%s\n' 'PASS: nested real GL rotation/deformation/store/rewind, first key/button/scroll, dedicated controls, holds, modifiers, mouse focus, geometry, actual window creation/closure, window-share enable/disable regressions, lifecycle and require removal. Hotplug result and CPU measurements are in adjacent files.' | tee "$output/result.txt"
 if "$keep_open"; then
     printf 'Dedicated nested compositor remains until Ctrl-C.\n'
     while kill -0 "$compositor_pid" 2>/dev/null; do sleep 1; done
