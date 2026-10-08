@@ -205,9 +205,13 @@ class Cosmic {
     void start(bool preview) {
         if (!initialized || !options.enabled || active || blocked()) return;
         if (!preview && held()) return;
+        g_pHyprRenderer->glBackend()->makeEGLCurrent();
+        if (!renderer.initialize()) { fail(renderer.error()); return; }
         std::vector<Region> regions;
-        for (const auto& monitor : State::monitorState()->monitors())
+        for (const auto& monitor : State::monitorState()->monitors()) {
             regions.push_back({static_cast<int>(monitor->m_id), monitor->m_position.x, monitor->m_position.y, monitor->m_size.x, monitor->m_size.y});
+            regions.push_back({static_cast<int>(monitor->m_id) + 1000000, monitor->m_position.x, monitor->m_position.y, monitor->m_size.x, monitor->m_size.y});
+        }
         snapshots.clear();
         snapshotBytes = 0;
         std::vector<Body> bodies;
@@ -279,6 +283,7 @@ class Cosmic {
         if (!active) {
             if (std::chrono::duration<double>(now - lastInput).count() >= options.idleTimeout && !held()) start(false);
         } else {
+            if (!renderer.error().empty()) { fail(renderer.error()); return; }
             universe.step(elapsed, cursor());
             ++physicsSteps;
             if (std::chrono::duration<double>(now - lastCapture).count() >= 1.0 / options.snapshotHz) {
