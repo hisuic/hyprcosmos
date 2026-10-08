@@ -70,6 +70,7 @@ void fixedStepAndDeterminism() {
     check(close(first.bodies()[0].position.x, 530.0), "constant velocity uses supplied monotonic time");
     check(close(first.bodies()[0].position.x, second.bodies()[0].position.x), "fixed-step frame-rate independence");
     check(close(first.bodies()[0].angle, second.bodies()[0].angle), "seeded rotations reproducible");
+    check(first.historyFrames() == 31, "history sampling obeys configured frequency without rounding drift");
     const Vec2 before = first.bodies()[0].position;
     first.step(86400.0, {});
     check(magnitude(first.bodies()[0].position - before) < 3.0, "day-long stall discards huge integration interval");
@@ -271,6 +272,16 @@ void expansionAndStress() {
     config.max_bodies = 128;
     universe.configure(config);
     check(universe.historyLimit() < 1000, "maximum history is additionally bounded by 16 MiB memory budget");
+
+    // Reducing targets must not make existing large history allocations exceed
+    // the memory estimate used for subsequent sampling.
+    const auto previous_limit = universe.historyLimit();
+    config.max_bodies = 1;
+    universe.configure(config);
+    check(universe.historyLimit() <= 16U * 1024U * 1024U / (sizeof(Body) * 32),
+          "existing large frames retain their memory accounting after body cap decreases");
+    check(universe.historyLimit() >= previous_limit, "smaller cap can relax history only within actual allocation budget");
+    config.max_bodies = 128;
 
     // Invalid runtime input cannot introduce NaN into rendering transforms.
     config.cursor_strength = std::numeric_limits<double>::infinity();
