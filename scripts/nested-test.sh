@@ -33,6 +33,7 @@ client_c=""
 held_input=""
 share_pid=""
 recorder_pid=""
+recording_name="automatic-portal"
 capture_child=""
 capture_jobs=()
 cleanup() {
@@ -202,18 +203,19 @@ wait_portal() {
 }
 start_portal_recording() {
     local output_name
+    recording_name=${1:-automatic-portal}
     if command -v wf-recorder >/dev/null && command -v ffprobe >/dev/null; then
         output_name=$(ctl -j monitors | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["name"])')
-        printf 'recorder_before_monotonic=%s\n' "$(awk '{print $1}' /proc/uptime)" > "$output/automatic-portal.recording.txt"
+        printf 'recorder_before_monotonic=%s\n' "$(awk '{print $1}' /proc/uptime)" > "$output/$recording_name.recording.txt"
         env -u HYPRLAND_INSTANCE_SIGNATURE WAYLAND_DISPLAY="$socket" wf-recorder --no-dmabuf -D -r 60 \
             -o "$output_name" -c libx264 -p preset=ultrafast -p crf=18 -x yuv420p \
-            -F 'pad=ceil(iw/2)*2:ceil(ih/2)*2' -f "$output/automatic-portal.mp4" > "$output/automatic-portal-recorder.log" 2>&1 &
+            -F 'pad=ceil(iw/2)*2:ceil(ih/2)*2' -f "$output/$recording_name.mp4" > "$output/$recording_name-recorder.log" 2>&1 &
         recorder_pid=$!
         sleep 0.3
         if ! kill -0 "$recorder_pid" 2>/dev/null; then
             wait "$recorder_pid" || true
             recorder_pid=""
-            printf 'SKIP: continuous recording failed; see automatic-portal-recorder.log.\n' >&2
+            printf 'SKIP: continuous recording failed; see %s-recorder.log.\n' "$recording_name" >&2
         fi
     else
         printf 'SKIP: wf-recorder/ffprobe unavailable; native portal and screenshot checks still run.\n' >&2
@@ -224,8 +226,8 @@ stop_portal_recording() {
         kill -INT "$recorder_pid"
         wait "$recorder_pid"
         recorder_pid=""
-        printf 'recorder_after_monotonic=%s\n' "$(awk '{print $1}' /proc/uptime)" >> "$output/automatic-portal.recording.txt"
-        ffprobe -v error -show_entries format=duration:stream=width,height,avg_frame_rate,nb_frames -of json "$output/automatic-portal.mp4" > "$output/automatic-portal-video.json"
+        printf 'recorder_after_monotonic=%s\n' "$(awk '{print $1}' /proc/uptime)" >> "$output/$recording_name.recording.txt"
+        ffprobe -v error -show_entries format=duration:stream=width,height,avg_frame_rate,nb_frames -of json "$output/$recording_name.mp4" > "$output/$recording_name-video.json"
     fi
 }
 measure_cpu() {
@@ -275,6 +277,50 @@ printf '%s\n' 'PASS: real window sharing predating enable blocks idle; sharing e
 
 ctl -j clients > "$output/normal-clients.json"
 capture normal
+
+# Real idle entry into the production ASCII sky, over a deliberately vivid
+# desktop. These controls isolate the background, not a synthetic render mock.
+eval_lua '_cosmic_sky_options=require("cosmic").status().config; require("cosmic").setup({enabled=false,effects={cursor_gravity=false,orbit=false,binary=false,collisions=false,wormholes=false,expansion=false}})'
+start_portal_recording ascii-sky
+eval_lua 'require("cosmic").enable()'
+wait_active
+sky_started=$(awk '{print $1}' /proc/uptime)
+eval_lua 'local s=require("cosmic").status(); assert(s.active and s.last_reason=="idle"); assert(s.config.rendering.background==1 and s.config.rendering.stars==240)'
+sleep 0.25
+capture ascii-sky
+# Independently calculate the first shader meteor's deterministic onset. The
+# observed idle start has <=100ms polling uncertainty; sample well inside life.
+sky_onset=$(ctl -j monitors | python3 -c '
+import json,sys
+def hashed(x):
+    x=(x^(x>>16))*0x7feb352d&0xffffffff
+    x=(x^(x>>15))*0x846ca68b&0xffffffff
+    return x^(x>>16)
+seed=0xC05C1C ^ json.load(sys.stdin)[0]["id"]
+key=hashed(seed ^ 0x4d455445)
+print(3+(hashed(key)>>8)/16777216*4)
+')
+sky_remaining=$(awk -v origin="$sky_started" -v onset="$sky_onset" '{d=origin+onset+0.65-$1; printf "%.3f\n", (d>0?d:0)}' /proc/uptime)
+sleep "$sky_remaining"
+capture ascii-meteor
+sleep 1.4
+capture ascii-after-meteor
+check_distinct_captures ascii-sky ascii-meteor
+check_distinct_captures ascii-meteor ascii-after-meteor
+probe key 30
+eval_lua 'assert(not require("cosmic").status().active); require("cosmic").disable()'
+capture sky-restored
+stop_portal_recording
+eval_lua 'require("cosmic").setup(_cosmic_sky_options); _cosmic_sky_options=nil'
+if command -v ffmpeg >/dev/null && [[ -s "$output/ascii-sky.png" && -s "$output/normal.png" ]]; then
+    # Corner clear color is the actual nested desktop, not an app snapshot.
+    # Compare native captures rather than assuming alpha from a shader string.
+    ffmpeg -v error -i "$output/normal.png" -f rawvideo -pix_fmt rgba "$output/sky-normal.rgba"
+    ffmpeg -v error -i "$output/ascii-sky.png" -f rawvideo -pix_fmt rgba "$output/sky-active.rgba"
+    ffmpeg -v error -i "$output/sky-restored.png" -f rawvideo -pix_fmt rgba "$output/sky-restored.rgba"
+    python3 -c 'import sys; a,b,c=(open(p,"rb").read()[:4] for p in sys.argv[1:]); assert a==c, "Sky did not restore normal background"; assert a[0]>60 and a[2]>30, "Fixture normal background is not vivid"; assert max(b[:3])<35, "Wallpaper leaks into opaque Cosmic sky"; print("PASS: actual idle sky hides vivid normal background; first key restores original background.")' \
+        "$output/sky-normal.rgba" "$output/sky-active.rgba" "$output/sky-restored.rgba" > "$output/ascii-sky-result.txt"
+fi
 measure_cpu normal 2
 eval_lua 'assert(require("cosmic").enable()); assert(require("cosmic")==require("cosmic"))'
 wait_active
