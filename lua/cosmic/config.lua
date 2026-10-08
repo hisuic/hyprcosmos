@@ -146,7 +146,7 @@ local function merge(target, patch, shape, prefix)
     end
 end
 
-function M.normalize(options, previous)
+function M.normalize(options, previous, defer_inherited_controls)
     local result = M.copy(previous or M.defaults)
     local patch = options == nil and {} or options
     if type(patch) == "table" and patch.preset and patch.preset ~= result.preset then
@@ -161,10 +161,15 @@ function M.normalize(options, previous)
     for action, chord in pairs(result.controls) do
         if chord then
             local canonical = canonical_chord(chord, "controls." .. action)
-            if used[canonical] then
-                return nil, "cosmic: controls." .. action .. " duplicates controls." .. used[canonical]
+            -- Before the user file is readable, inherited controls are only
+            -- provisional defaults. Still reject duplicates inside this patch;
+            -- check the complete effective table after loading user settings.
+            if not defer_inherited_controls or (patch.controls and patch.controls[action] ~= nil) then
+                if used[canonical] then
+                    return nil, "cosmic: controls." .. action .. " duplicates controls." .. used[canonical]
+                end
+                used[canonical] = action
             end
-            used[canonical] = action
             result.controls[action] = canonical
         end
     end
