@@ -47,6 +47,11 @@ cleanup() {
     if [[ -n "$native_socket" && -L "$XDG_RUNTIME_DIR/$socket" && $(readlink -- "$XDG_RUNTIME_DIR/$socket") == "$native_socket" ]]; then
         rm -- "$XDG_RUNTIME_DIR/$socket"
     fi
+    if [[ -n "$compositor_pid" ]]; then
+        local child_exit=0
+        wait "$compositor_pid" 2>/dev/null || child_exit=$?
+        printf 'child_exit=%s\n' "$child_exit" > "$output/child-exit.txt"
+    fi
     printf 'Isolated fullscreen test evidence retained: %s\n' "$output"
 }
 trap cleanup EXIT
@@ -170,7 +175,9 @@ preview() {
 check_alive() {
     kill -0 "$compositor_pid" || { printf 'Child compositor crashed during lifecycle regression.\n' >&2; exit 1; }
     eval_lua 'assert(hl.plugin.cosmic==nil)'
-    [[ $(ctl plugin list) == *'No plugins loaded'* || $(ctl -j plugin list) == '[]' ]] || { printf 'Plugin remained loaded after removal.\n' >&2; exit 1; }
+    local plugins
+    plugins=$(ctl -j plugin list 2>&1) || { printf 'Post-unload IPC failed: %s\n' "$plugins" >&2; exit 1; }
+    [[ "$plugins" == '[]' ]] || { printf 'Plugin remained loaded after removal: %s\n' "$plugins" >&2; exit 1; }
     # A successful screencopy after unload forces a real subsequent render pass:
     # mere IPC responsiveness cannot expose a dangling custom-pass deleter.
     capture "$1" visible
