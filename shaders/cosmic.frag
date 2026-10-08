@@ -70,7 +70,10 @@ vec3 asciiStars(vec2 logical, vec2 canvas) {
     const vec2 spacing = vec2(34.0, 30.0);
     vec2 cell = floor(logical / spacing);
     uint key = skyHash(uint(cell.x) ^ (uint(cell.y) * 0x9e3779b9u) ^ uSeed);
-    float slots = max(1.0, ceil(canvas.x / spacing.x) * ceil(canvas.y / spacing.y));
+    // GLES may lower division to a rounded reciprocal. Avoid an extra grid row
+    // at exact cell boundaries (e.g. 360 / 30) or density would jump with DPI.
+    vec2 gridSize = max(vec2(1.0), ceil(canvas / spacing - vec2(0.0001)));
+    float slots = gridSize.x * gridSize.y;
     if (skyRandom(key) >= min(1.0, uStars / slots)) return vec3(0.0);
     vec2 center = (cell + 0.5) * spacing;
     center += vec2(skyRandom(key + 1u) - 0.5, skyRandom(key + 2u) - 0.5) * vec2(18.0, 12.0);
