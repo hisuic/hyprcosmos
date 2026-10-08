@@ -549,7 +549,12 @@ void Universe::updateCameras(double dt) {
 
 void Universe::resizeHistory() {
     const std::size_t requested = static_cast<std::size_t>(std::ceil(m_config.history_seconds * m_config.history_hz)) + 1;
-    const std::size_t frame_bytes = sizeof(Frame) + sizeof(Body) * m_config.max_bodies;
+    // Existing snapshots may have been recorded before a runtime body-limit
+    // reduction. Account for their allocation too, not just the new cap.
+    std::size_t largest_frame = std::max(m_config.max_bodies, m_bodies.size());
+    for (const auto& frame : m_history)
+        largest_frame = std::max(largest_frame, frame.bodies.capacity());
+    const std::size_t frame_bytes = sizeof(Frame) + sizeof(Body) * largest_frame;
     m_history_limit = m_config.rewind && m_config.history_seconds > 0.0
                           ? std::clamp<std::size_t>(requested, 2, std::max<std::size_t>(2, HISTORY_BYTES / frame_bytes)) : 0;
     while (m_history.size() > m_history_limit)
@@ -617,7 +622,10 @@ void Universe::step(double elapsed, Vec2 screen_cursor) {
         m_history_accumulator += m_config.fixed_step;
         const double interval = 1.0 / m_config.history_hz;
         if (m_history_accumulator + 1e-12 >= interval) {
-            m_history_accumulator = std::fmod(m_history_accumulator, interval);
+            // Rounding may leave the accumulator just below interval despite
+            // the epsilon comparison. Clamp that case to zero rather than
+            // retaining a nearly full interval and oversampling next step.
+            m_history_accumulator = m_history_accumulator < interval ? 0.0 : std::fmod(m_history_accumulator, interval);
             recordFrame();
         }
         ++count;
