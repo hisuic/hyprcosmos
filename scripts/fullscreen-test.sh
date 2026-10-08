@@ -189,7 +189,7 @@ check_alive() {
 
 ctl -j version > "$output/version.json"
 wait_lua 'hl.plugin.cosmic~=nil and require("cosmic").status().module_initialized'
-eval_lua 'assert(require("cosmic").status().config.idle_timeout==20)'
+eval_lua 'assert(require("cosmic").status().config.idle_timeout==60)'
 if ! "$nested_window"; then
     mapfile -t disabled_outputs < <(ctl -j monitors | python3 -c 'import json,sys; print("\n".join(m["name"] for m in json.load(sys.stdin)))')
     for name in "${disabled_outputs[@]}"; do
@@ -322,7 +322,7 @@ if "$unload_only"; then
     exit 0
 fi
 
-eval_lua 'require("cosmic").setup({idle_timeout=require("cosmic.config").defaults.idle_timeout}); assert(require("cosmic").status().config.idle_timeout==20)'
+eval_lua 'require("cosmic").setup({idle_timeout=require("cosmic.config").defaults.idle_timeout}); assert(require("cosmic").status().config.idle_timeout==60)'
 # Persistent keyboard grabs are normal for fcitx and are not composition. Keep
 # a genuine grab throughout idle entry and deliver the restoration key to that
 # same IME exactly once. This fixture never launches/replaces the user's daemon.
@@ -336,13 +336,13 @@ done
 eval_lua 'local s=require("cosmic").status(); assert(s.ime_keyboard_grab and not s.ime_composing and not s.entry_blocked)'
 probe move 640 360 1280 720
 printf 'idle_start_monotonic=%s\n' "$(awk '{print $1}' /proc/uptime)" > "$output/idle-timing.txt"
-sleep 5
+sleep 21
 eval_lua 'assert(not require("cosmic").status().active)'
-printf 'inactive_at_5s_monotonic=%s\n' "$(awk '{print $1}' /proc/uptime)" >> "$output/idle-timing.txt"
-sleep 16
+printf 'inactive_at_21s_monotonic=%s\n' "$(awk '{print $1}' /proc/uptime)" >> "$output/idle-timing.txt"
+sleep 40
 eval_lua 'local s=require("cosmic").status(); assert(s.active and s.last_reason=="idle" and s.desktop_ui_hidden and s.ime_keyboard_grab and not s.ime_composing)'
-printf 'active_at_21s_monotonic=%s\n' "$(awk '{print $1}' /proc/uptime)" >> "$output/idle-timing.txt"
-capture idle-21s hidden
+printf 'active_at_61s_monotonic=%s\n' "$(awk '{print $1}' /proc/uptime)" >> "$output/idle-timing.txt"
+capture idle-61s hidden
 before_ime_key=$(event_count '"event":"key","key":30,"state":1' "$output/ime.jsonl")
 before_ime_release=$(event_count '"event":"key","key":30,"state":0' "$output/ime.jsonl")
 probe key 30
@@ -351,4 +351,4 @@ sleep .1
 [[ $(event_count '"event":"key","key":30,"state":1' "$output/ime.jsonl") -eq $((before_ime_key+1)) ]] || { printf 'IME restoration key press was lost or duplicated.\n' >&2; exit 1; }
 [[ $(event_count '"event":"key","key":30,"state":0' "$output/ime.jsonl") -eq $((before_ime_release+1)) ]] || { printf 'IME restoration key release was lost or duplicated.\n' >&2; exit 1; }
 capture idle-restored visible
-printf 'PASS: real TOP/OVERLAY suppression and unmap fadeout, exclusive-zone and geometry preservation, first panel click once, protected/interactive layer safety, optional UI visibility, %s active direct unloads, 3 active require removals, and default 20 s idle activation with a persistent real IME grab and its first key delivered once. Parent session was never changed.\n' "$unload_rounds" | tee "$output/result.txt"
+printf 'PASS: real TOP/OVERLAY suppression and unmap fadeout, exclusive-zone and geometry preservation, first panel click once, protected/interactive layer safety, optional UI visibility, %s active direct unloads, 3 active require removals, and default 60 s idle activation with a persistent real IME grab and its first key delivered once. Parent session was never changed.\n' "$unload_rounds" | tee "$output/result.txt"
