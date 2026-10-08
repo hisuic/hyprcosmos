@@ -104,6 +104,17 @@ wait_active() {
     exit 1
 }
 probe() { env -u HYPRLAND_INSTANCE_SIGNATURE WAYLAND_DISPLAY="$socket" "$output/wayland-probe" --input "$@"; }
+event_count() {
+    local count
+    count=$(rg -c -- "$1" "$2" || true)
+    printf '%s\n' "${count:-0}"
+}
+normal_center() {
+    ctl -j clients | python3 -c 'import json,sys; c=next(c for c in json.load(sys.stdin) if c.get("title")==sys.argv[1]); print(int(c["at"][0]+c["size"][0]/2),int(c["at"][1]+c["size"][1]/2))' "$1"
+}
+monitor_extents() {
+    ctl -j monitors | python3 -c 'import json,sys; m=json.load(sys.stdin)[0]; print(m["width"],m["height"])'
+}
 capture() {
     if command -v grim >/dev/null; then
         env -u HYPRLAND_INSTANCE_SIGNATURE WAYLAND_DISPLAY="$socket" grim "$output/$1.png" || true
@@ -176,23 +187,33 @@ rg -q '"event":"modifiers","depressed":0' "$output/client-a.jsonl" "$output/clie
 # button/axis events are delivered after normal hit testing at restored geometry.
 wait_active
 ctl -j activewindow > "$output/focus-before-motion.json"
-probe move 900 350 1280 720
+read -r pointer_x pointer_y <<< "$(normal_center 'Cosmic probe A')"
+read -r extent_x extent_y <<< "$(monitor_extents)"
+probe move "$pointer_x" "$pointer_y" "$extent_x" "$extent_y"
 eval_lua 'assert(require("cosmic").status().active)'
 ctl -j activewindow > "$output/focus-after-motion.json"
 python3 -c 'import json,sys; a=json.load(open(sys.argv[1])); b=json.load(open(sys.argv[2])); assert a.get("address")==b.get("address"), "Mouse motion changed keyboard focus"' "$output/focus-before-motion.json" "$output/focus-after-motion.json"
+buttons_a=$(event_count '"event":"button","button":272,"state":1' "$output/client-a.jsonl")
+buttons_b=$(event_count '"event":"button","button":272,"state":1' "$output/client-b.jsonl")
 probe click 272
 eval_lua 'assert(not require("cosmic").status().active)'
 sleep 0.1
-rg -q '"event":"button","button":272,"state":1' "$output/client-a.jsonl" "$output/client-b.jsonl"
+[[ $(event_count '"event":"button","button":272,"state":1' "$output/client-a.jsonl") -eq $((buttons_a + 1)) &&
+   $(event_count '"event":"button","button":272,"state":1' "$output/client-b.jsonl") -eq "$buttons_b" ]] || { printf 'First click was lost, duplicated or delivered to the wrong normal window.\n' >&2; exit 1; }
 probe click 272 2200 & held_input=$!
 sleep 1.3
 eval_lua 'assert(not require("cosmic").status().active)'
 wait "$held_input"; held_input=""
 wait_active
+read -r pointer_x pointer_y <<< "$(normal_center 'Cosmic probe B')"
+probe move "$pointer_x" "$pointer_y" "$extent_x" "$extent_y"
+axes_a=$(event_count '"event":"axis"' "$output/client-a.jsonl")
+axes_b=$(event_count '"event":"axis"' "$output/client-b.jsonl")
 probe scroll 15
 eval_lua 'assert(not require("cosmic").status().active)'
 sleep 0.1
-rg -q '"event":"axis"' "$output/client-a.jsonl" "$output/client-b.jsonl"
+[[ $(event_count '"event":"axis"' "$output/client-a.jsonl") -eq "$axes_a" &&
+   $(event_count '"event":"axis"' "$output/client-b.jsonl") -eq $((axes_b + 1)) ]] || { printf 'First scroll was lost, duplicated or delivered to the wrong normal window.\n' >&2; exit 1; }
 eval_lua 'require("cosmic").disable(); assert(not require("cosmic").status().initialized)'
 ctl -j clients > "$output/restored-clients.json"
 python3 -c 'import json,sys; a=json.load(open(sys.argv[1])); b=json.load(open(sys.argv[2])); shape=lambda c:sorted((x["address"],x["at"],x["size"],x["workspace"]["id"]) for x in c); assert shape(a)==shape(b), "Cosmic altered normal geometry or workspace"' "$output/normal-clients.json" "$output/restored-clients.json"
@@ -212,7 +233,7 @@ eval_lua 'require("cosmic").setup({enabled=true, physics={sink_duration=1.2}, ef
 wait_active
 sleep 0.5
 read -r body_x body_y <<< "$(ctl repl 'local s=require("cosmic").status(); for _,b in ipairs(s.objects) do if b.region<1000000 then print(math.floor(b.x).." "..math.floor(b.y)); break end end')"
-read -r extent_x extent_y <<< "$(ctl -j monitors | python3 -c 'import json,sys; m=json.load(sys.stdin)[0]; print(m["width"],m["height"])')"
+read -r extent_x extent_y <<< "$(monitor_extents)"
 [[ "$body_x" =~ ^[0-9]+$ && "$body_y" =~ ^[0-9]+$ ]] || { printf 'Could not resolve a virtual sink target.\n' >&2; exit 1; }
 probe move "$body_x" "$body_y" "$extent_x" "$extent_y"
 eval_lua 'require("cosmic").action("black_hole"); local s=require("cosmic").status(); local found=false; for _,b in ipairs(s.objects) do found=found or b.sink_progress>0 end; assert(s.active and found)'
