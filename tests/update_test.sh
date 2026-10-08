@@ -62,9 +62,10 @@ repository=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 sandbox=$(mktemp -d /tmp/hyprcosmos-update-test.XXXXXX)
 trap 'if [[ "$sandbox" == /tmp/hyprcosmos-update-test.* && -d "$sandbox" ]]; then rm -rf -- "$sandbox"; fi' EXIT
 fixture="$sandbox/repository"
-mkdir -p -- "$fixture/scripts" "$fixture/lua/cosmic" "$fixture/build" "$sandbox/bin"
+mkdir -p -- "$fixture/scripts" "$fixture/lua/cosmic" "$fixture/examples" "$fixture/build" "$sandbox/bin"
 cp -- "$repository/scripts/update.sh" "$repository/scripts/install.sh" "$repository/scripts/uninstall.sh" "$fixture/scripts/"
 cp -- "$repository/lua/cosmic/init.lua" "$fixture/lua/cosmic/init.lua"
+cp -- "$repository/examples/hyprcosmos.lua" "$fixture/examples/hyprcosmos.lua"
 printf 'non-loadable updater test fixture\n' > "$fixture/build/cosmic.so"
 for program in hyprctl grim; do ln -s -- "$repository/tests/update_test.sh" "$sandbox/bin/$program"; done
 ln -s -- "$repository/tests/update_test.sh" "$fixture/scripts/build.sh"
@@ -86,6 +87,10 @@ fresh_install() {
     config="$config_dir/hyprland.lua"
     printf -- '-- unrelated configuration; must be preserved\n' > "$config"
     "$fixture/scripts/install.sh" --config "$config" --state-dir "$state_dir" --no-build > "$sandbox/install.log"
+    printf 'return { idle_timeout = 87, rendering = { stars = 17 } }\n' > "$config_dir/hyprcosmos.lua"
+    chmod 640 -- "$config_dir/hyprcosmos.lua"
+    cp -- "$config_dir/hyprcosmos.lua" "$sandbox/settings-before"
+    settings_inode=$(stat -c %i -- "$config_dir/hyprcosmos.lua")
     cp -- "$config" "$sandbox/before"
     cp -- "$state_dir/installation" "$sandbox/ownership-before"
     export MOCK_CONFIG="$config" MOCK_OUTPUTS=awake MOCK_FRAME_FAIL=false MOCK_DISABLE_FAIL=false MOCK_LOAD_FAIL=false MOCK_CHANGED_PID=false MOCK_CONFIG_ERRORS=ok MOCK_UNLOAD_RETAINS_API=false
@@ -100,6 +105,9 @@ unchanged_installation() {
     check cmp -s "$state_dir/installation" "$sandbox/ownership-before"
     check test -L "$config_dir/cosmic"
     check test -L "$config_dir/cosmic.so"
+    check cmp -s "$config_dir/hyprcosmos.lua" "$sandbox/settings-before"
+    check test "$(stat -c %i -- "$config_dir/hyprcosmos.lua")" = "$settings_inode"
+    check test "$(stat -c %a -- "$config_dir/hyprcosmos.lua")" = 640
 }
 no_transition() {
     checks=$((checks+1))
@@ -161,9 +169,27 @@ check test "$(rg -c '^old_api_gone$' "$MOCK_LOG")" = 1
 
 fresh_install
 update_fixture --instance selected-signature
+unchanged_installation
 check rg -q '^build$' "$MOCK_LOG"
 sequence=$(awk '/^(build|disable|frame:|unload|load|verify)/ { print }' "$MOCK_LOG")
 check test "$sequence" = $'build\ndisable\nframe:OUTPUT-A\nframe:OUTPUT-B\nunload\nload\nverify'
+
+# User settings may deliberately live elsewhere through a readable symlink.
+fresh_install
+settings_target="$sandbox/external-settings.lua"
+cp -- "$sandbox/settings-before" "$settings_target"
+chmod 400 -- "$settings_target"
+settings_target_inode=$(stat -c %i -- "$settings_target")
+rm -- "$config_dir/hyprcosmos.lua"
+ln -s -- "$settings_target" "$config_dir/hyprcosmos.lua"
+update_fixture --instance selected-signature --no-build
+check cmp -s "$config" "$sandbox/before"
+check cmp -s "$state_dir/installation" "$sandbox/ownership-before"
+check test -L "$config_dir/hyprcosmos.lua"
+check test "$(readlink -- "$config_dir/hyprcosmos.lua")" = "$settings_target"
+check cmp -s "$settings_target" "$sandbox/settings-before"
+check test "$(stat -c %i -- "$settings_target")" = "$settings_target_inode"
+check test "$(stat -c %a -- "$settings_target")" = 400
 
 fresh_install
 export MOCK_LOAD_FAIL=true
@@ -209,6 +235,10 @@ mkdir -p -- "$config_dir"
 config="$config_dir/hyprland.lua"
 printf 'local cosmic = require("cosmic")\ncosmic.setup({ idle_timeout = 9 })\n' > "$config"
 "$fixture/scripts/install.sh" --config "$config" --state-dir "$state_dir" --no-build > "$sandbox/install.log"
+printf 'return { idle_timeout = 87, rendering = { stars = 17 } }\n' > "$config_dir/hyprcosmos.lua"
+chmod 640 -- "$config_dir/hyprcosmos.lua"
+cp -- "$config_dir/hyprcosmos.lua" "$sandbox/settings-before"
+settings_inode=$(stat -c %i -- "$config_dir/hyprcosmos.lua")
 cp -- "$config" "$sandbox/before"
 cp -- "$state_dir/installation" "$sandbox/ownership-before"
 export MOCK_CONFIG="$config" MOCK_CHANGED_PID=false MOCK_LOAD_FAIL=false
