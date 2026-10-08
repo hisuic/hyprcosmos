@@ -157,6 +157,7 @@ bool CosmicRenderer::initialize() {
     if (impl.program) return true;
     if (impl.attempted) return false;
     impl.attempted = true;
+    impl.error.clear();
     GLState state;
     GLuint vertex = 0, fragment = 0;
     try {
