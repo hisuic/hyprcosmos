@@ -12,7 +12,7 @@ while (($#)); do
         *) printf 'Unknown argument: %s\n' "$1" >&2; exit 2 ;;
     esac
 done
-for command in Hyprland hyprctl python3 sed rg realpath; do
+for command in Hyprland hyprctl python3 sed rg realpath timeout mkfifo truncate awk; do
     command -v "$command" >/dev/null || { printf 'Missing dependency: %s\n' "$command" >&2; exit 1; }
 done
 [[ -f "$plugin" ]] || { printf 'Build Cosmic first: %s\n' "$plugin" >&2; exit 1; }
@@ -32,10 +32,27 @@ socket="hyprcosmos-test-config-$$"
 native_socket=""
 instance=""
 compositor_pid=""
+compositor_birth=""
 disabled_outputs=()
+child_running() {
+    local child_stat
+    local -a fields
+    [[ -n "$compositor_pid" && -r "/proc/$compositor_pid/stat" ]] || return 1
+    child_stat=$(< "/proc/$compositor_pid/stat") || return 1
+    read -r -a fields <<< "${child_stat##*) }"
+    [[ ${fields[0]:-Z} != Z && ${fields[19]:-} == "$compositor_birth" ]]
+}
 cleanup() {
     if [[ -n "$compositor_pid" ]]; then
-        if kill -0 "$compositor_pid" 2>/dev/null; then kill -TERM "$compositor_pid" 2>/dev/null || true; fi
+        if child_running; then kill -TERM "$compositor_pid" 2>/dev/null || true; fi
+        # A regression in FIFO handling may block the child's main thread and
+        # its normal termination path. Bound cleanup and verify PID birth time
+        # before killing only the exact compositor launched by this script.
+        for ((attempt=0; attempt<100; ++attempt)); do
+            child_running || break
+            sleep .02
+        done
+        if child_running; then kill -KILL "$compositor_pid" 2>/dev/null || true; fi
         local child_exit=0
         wait "$compositor_pid" 2>/dev/null || child_exit=$?
         printf 'child_exit=%s\n' "$child_exit" > "$output/child-exit.txt"
@@ -83,6 +100,7 @@ env -u HYPRLAND_INSTANCE_SIGNATURE HYPRLAND_NO_SD_VARS=1 HYPRLAND_NO_SD_NOTIFY=1
     HYPRLAND_NO_CRASHREPORTER=1 AQ_DRM_DEVICES=/dev/null Hyprland --config "$output/config/hyprland.lua" \
     > "$output/compositor.log" 2>&1 &
 compositor_pid=$!
+compositor_birth=$(awk '{print $22}' "/proc/$compositor_pid/stat")
 for ((attempt=0; attempt<200; ++attempt)); do
     kill -0 "$compositor_pid" 2>/dev/null || { tail -n 40 "$output/compositor.log" >&2; exit 1; }
     read -r instance native_socket <<< "$(hyprctl -j instances | python3 -c 'import json,sys; s=next((s for s in json.load(sys.stdin) if s.get("pid")==int(sys.argv[1])), {}); print(s.get("instance", ""), s.get("wl_socket", ""))' "$compositor_pid")"
@@ -93,7 +111,7 @@ done
 [[ ! -e "$XDG_RUNTIME_DIR/$socket" && ! -L "$XDG_RUNTIME_DIR/$socket" ]] || { printf 'Test socket alias already exists.\n' >&2; exit 1; }
 ln -s -- "$native_socket" "$XDG_RUNTIME_DIR/$socket"
 printf 'child_pid=%s\nchild_instance=%s\nchild_socket=%s\nplugin=%s\nsettings=%s\n' "$compositor_pid" "$instance" "$socket" "$plugin" "$settings" | tee "$output/session.txt"
-ctl() { hyprctl -i "$instance" "$@"; }
+ctl() { timeout --kill-after=1s 5s hyprctl -i "$instance" "$@"; }
 eval_lua() {
     local result
     result=$(ctl eval "$1" 2>&1) || { printf 'Lua request failed: %s\n%s\n' "$1" "$result" >&2; exit 1; }
@@ -101,9 +119,11 @@ eval_lua() {
 }
 wait_lua() {
     local predicate=$1
+    local result
     for ((attempt=0; attempt<100; ++attempt)); do
         kill -0 "$compositor_pid" 2>/dev/null || { printf 'Child compositor died; see compositor.log.\n' >&2; exit 1; }
-        if [[ $(ctl repl "print($predicate)" 2>/dev/null) == true ]]; then return; fi
+        result=$(ctl repl "print($predicate)" 2>&1) || { printf 'Child IPC failed or timed out: %s\n' "$result" >&2; exit 1; }
+        if [[ "$result" == true ]]; then return; fi
         sleep .05
     done
     printf 'Timed out waiting for: %s\n' "$predicate" >&2
@@ -128,10 +148,28 @@ pass() { printf 'PASS: %s\n' "$1" | tee -a "$output/checks.txt"; }
 check_invalid() {
     local label=$1 content=$2
     write_settings "$label" "$content"
+    check_invalid_path "$label"
+}
+check_invalid_path() {
+    local label=$1
     reload_config "$label"
+    wait_lua 'type(require("cosmic").status().config_file_error)=="string"'
     eval_lua "local c=require('cosmic'); local s=c.status(); assert(s.config_file==$expected_path and not s.config_file_loaded and type(s.config_file_error)=='string' and s.config_file_error:find($expected_path,1,true)); assert(s.error==s.config_file_error and not s.initialized and not s.module_initialized and not s.initialization_pending and not s.active and s.input_watchers==0); local ok,err=c.enable(); assert(ok==nil and err==s.config_file_error); c.status(); c.status(); assert(c.status().config_file_error==s.config_file_error and not c.status().initialized)"
     config_ok
     pass "$label is contained to Cosmic, with error path, zero native watchers and no compositor parsing error"
+}
+archive_settings() {
+    local label=$1
+    if [[ -e "$settings" || -L "$settings" ]]; then mv -- "$settings" "$output/settings-$label.fixture"; fi
+}
+repair_after() {
+    local label=$1
+    archive_settings "$label"
+    write_settings "after-$label" 'return {idle_timeout=73,rendering={stars=29}}'
+    reload_config "after-$label"
+    ready
+    eval_lua 'local s=require("cosmic").status(); assert(s.initialized and s.input_watchers>0 and s.config_file_loaded and s.config_file_error==nil and s.config.idle_timeout==73 and s.config.rendering.stars==29)'
+    pass "$label can be replaced by a regular file and immediately recover"
 }
 
 ctl -j version > "$output/version.json"
@@ -186,6 +224,30 @@ check_invalid return-type 'return 42'
 check_invalid unknown-key 'return {unknown_setting=true}'
 check_invalid runtime-error 'error("fixture-only runtime failure")'
 
+# Special files are real filesystem objects, not mocked io.open failures. Every
+# reload and follow-up IPC is bounded so a legacy FIFO open cannot hang this
+# test or the parent session. Keep all fixtures for post-failure inspection.
+for kind in fifo unix-socket directory dangling-symlink oversized; do
+    archive_settings "before-$kind"
+    case "$kind" in
+        fifo) mkfifo -- "$settings" ;;
+        unix-socket) python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.bind(sys.argv[1]); s.close()' "$settings" ;;
+        directory) mkdir -- "$settings" ;;
+        dangling-symlink) ln -s -- "$output/nonexistent-fixture-target.lua" "$settings" ;;
+        oversized) truncate --size=1048577 -- "$settings" ;;
+    esac
+    check_invalid_path "$kind"
+    repair_after "$kind"
+done
+archive_settings before-regular-symlink
+printf '%s\n' 'return {idle_timeout=44,rendering={stars=97}}' > "$output/regular-target.lua"
+ln -s -- "$output/regular-target.lua" "$settings"
+reload_config regular-symlink
+ready
+eval_lua "local s=require('cosmic').status(); assert(s.config_file==$expected_path and s.config_file_loaded and s.config_file_error==nil and s.initialized and s.config.idle_timeout==44 and s.config.rendering.stars==97)"
+pass 'a symlink to a regular dotfile is allowed while retaining the user-facing lexical path'
+archive_settings regular-symlink
+
 write_settings repaired 'return {idle_timeout=73,rendering={stars=29}}'
 reload_config repaired
 ready
@@ -203,4 +265,4 @@ wait_lua 'hl.plugin.cosmic==nil'
 [[ $(ctl -j plugin list) == '[]' ]] || { printf 'Native plugin remained loaded after removing require.\n' >&2; exit 1; }
 config_ok
 pass 'removing require unloads the native plugin and leaves the compositor responsive'
-printf '%s\n' 'PASS: real bare-require dedicated config loading, single-read semantics, create/edit/reload, defaults and setup priority, disabled state, contained syntax/range/type/runtime errors, recovery, missing defaults and native require-removal. No parent configuration, input or IME was changed.' | tee "$output/result.txt"
+printf '%s\n' 'PASS: real bare-require dedicated config loading, single-read semantics, create/edit/reload, defaults and setup priority, disabled state, contained syntax/range/type/runtime errors, bounded rejection of real FIFO/socket/directory/dangling/oversized files, regular symlink support, recovery, missing defaults and native require-removal. No parent configuration, input or IME was changed.' | tee "$output/result.txt"
