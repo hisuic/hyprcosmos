@@ -283,6 +283,16 @@ void CosmicRenderer::executeDraw(PHLMONITOR monitor, const Universe& universe,
     };
     const double visualScale = alternateRegion ? monitorSize.x / view->width : pixelScale;
 
+    // Put the opaque event horizon behind the falling image. Drawing it last
+    // hides a centered target before its shrinking/twisting can be seen.
+    for (const auto& body : universe.bodies()) {
+        if (body.region != view->id || body.sink_progress <= 0 || body.stored) continue;
+        const auto position = toPixel(body.sink_center, body.region);
+        const double diameter = (110 + 16 * std::sin(seconds * 2)) * visualScale;
+        impl.quad(position, {diameter, diameter}, 2, {0.8F, 0.31F, 1.0F, 0.9F},
+                  seconds * 0.6, 1, 0, 0, false, 0.035F, 1);
+    }
+
     // Low-opacity velocity tails show orbital direction without cloning apps.
     for (const auto& body : universe.bodies()) {
         if (body.stored || body.region != view->id) continue;
@@ -331,8 +341,9 @@ void CosmicRenderer::executeDraw(PHLMONITOR monitor, const Universe& universe,
         if (body.region != view->id || body.sink_progress <= 0 || body.stored) continue;
         const auto position = toPixel(body.sink_center, body.region);
         const double diameter = (110 + 16 * std::sin(seconds * 2)) * visualScale;
-        impl.quad(position, {diameter, diameter}, 2, {0.8F, 0.31F, 1.0F, 0.9F},
-                  seconds * 0.6, 1, 0, 0, false, 0.035F, 1);
+        // The foreground accent is only the luminous rim, never a black disk.
+        impl.quad(position, {diameter, diameter}, 2, {0.8F, 0.31F, 1.0F, 0.7F},
+                  seconds * 0.6, 1, 0, 0, false, 0.035F, 0);
     }
     for (const auto& wave : universe.waves()) {
         if (wave.region != view->id) continue;
