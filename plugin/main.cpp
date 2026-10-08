@@ -181,7 +181,7 @@ Clock::time_point lastInput = Clock::now(), lastTick = lastInput, lastCapture = 
              protectedDesktopNamespace(layer->m_namespace));
     }
     bool desktopInteraction() const {
-        // Do not turn a launcher, authentication prompt, IME grab or modal
+        // Do not turn a launcher, authentication prompt, composition or modal
         // seat grab into invisible input UI. Protocol state is the primary
         // safeguard; names only provide additional conservative exceptions.
         if (g_pSeatManager->m_seatGrab) return true;
@@ -191,7 +191,13 @@ Clock::time_point lastInput = Clock::now(), lastTick = lastInput, lastCapture = 
             if (focus && layer && layer->m_mapped && layer->wlSurface() &&
                 layer->wlSurface()->resource() == focus) return true;
         }
-        if (const auto ime = g_pInputManager->m_relay.m_inputMethod.lock(); ime && ime->hasGrab()) return true;
+        // fcitx5 keeps its keyboard grab even while idle (also in Latin mode).
+        // A grab means routing, not user activity. Only an actual focused
+        // preedit inhibits entry; the core still draws IME UI above our pass,
+        // and keyboard.key emits BEFORE ordinary delivery to an IME grab.
+        if (const auto ime = g_pInputManager->m_relay.m_inputMethod.lock();
+            ime && activeIMEComposition(!!g_pInputManager->m_relay.getFocusedTextInput(),
+                                       !ime->m_current.preeditString.string.empty())) return true;
         return false;
     }
     bool blocked() {
@@ -705,6 +711,8 @@ int status(lua_State* L) {
     // guard when an otherwise idle desktop does not enter Cosmic.
     const auto ime = g_pInputManager->m_relay.m_inputMethod.lock();
     b("ime_keyboard_grab", ime && ime->hasGrab());
+    b("ime_composing", ime && activeIMEComposition(!!g_pInputManager->m_relay.getFocusedTextInput(),
+                                                  !ime->m_current.preeditString.string.empty()));
     b("seat_grab", !!g_pSeatManager->m_seatGrab);
     b("desktop_interaction_blocked", instance->desktopInteraction());
     b("held_input", instance->held());
