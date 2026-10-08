@@ -48,6 +48,16 @@ struct Body {
     Vec2 sink_center;
     double angular_velocity = 0.0;
     double original_scale = 0.42;
+    // Captured cinematic seeds make a centered selection move continuously and
+    // make resumed playback follow exactly the same path after a rewind.
+    Vec2 sink_start_offset;
+    Vec2 sink_entry_axis{1.0, 0.0};
+    double sink_arc = 0.0;
+    double sink_start_angle = 0.0;
+    double sink_turn_sign = 1.0;
+    double sink_duration = 0.0;      // May extend an impossible duration/speed combination.
+    Vec2 sink_camera_center;
+    double sink_camera_zoom = 1.0;
 };
 
 struct Particle {
