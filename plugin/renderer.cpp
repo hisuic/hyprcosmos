@@ -24,6 +24,8 @@ class GLState {
         glGetIntegerv(GL_CURRENT_PROGRAM, &program);
         glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &vao);
         glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &buffer);
+        glGetIntegerv(GL_UNPACK_ALIGNMENT, &unpackAlignment);
+        glGetIntegerv(GL_UNPACK_ROW_LENGTH, &unpackRowLength);
         glGetIntegerv(GL_ACTIVE_TEXTURE, &activeTexture);
         glActiveTexture(GL_TEXTURE0);
         glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
@@ -43,6 +45,8 @@ class GLState {
         glUseProgram(program);
         glBindVertexArray(vao);
         glBindBuffer(GL_ARRAY_BUFFER, buffer);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, unpackAlignment);
+        glPixelStorei(GL_UNPACK_ROW_LENGTH, unpackRowLength);
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, texture);
         glActiveTexture(activeTexture);
@@ -59,6 +63,7 @@ class GLState {
         if (enabled) glEnable(capability); else glDisable(capability);
     }
     GLint program = 0, vao = 0, buffer = 0, activeTexture = GL_TEXTURE0, texture = 0;
+    GLint unpackAlignment = 4, unpackRowLength = 0;
     GLint srcRGB = GL_ONE, dstRGB = GL_ZERO, srcAlpha = GL_ONE, dstAlpha = GL_ZERO;
     GLint equationRGB = GL_FUNC_ADD, equationAlpha = GL_FUNC_ADD;
     std::array<GLint, 4> scissor{};
@@ -118,12 +123,54 @@ class CosmicPass final : public IPassElement {
 
 } // namespace
 
+bool PeerViewLayout::contains(Vec2 point) const {
+    return point.x >= origin.x && point.y >= origin.y &&
+           point.x <= origin.x + size.x && point.y <= origin.y + size.y;
+}
+bool PeerViewLayout::containsContent(Vec2 point) const {
+    return point.x >= contentOrigin.x && point.y >= contentOrigin.y &&
+           point.x <= contentOrigin.x + contentSize.x && point.y <= contentOrigin.y + contentSize.y;
+}
+Vec2 PeerViewLayout::toRegionScreen(Vec2 point) const {
+    return {region.x + (point.x - contentOrigin.x) / scale,
+            region.y + (point.y - contentOrigin.y) / scale};
+}
+Vec2 PeerViewLayout::fromRegionScreen(Vec2 point) const {
+    return contentOrigin + (point - Vec2{region.x, region.y}) * scale;
+}
+std::optional<PeerViewLayout> peerViewLayout(const Universe& universe, int mainRegion) {
+    if (!universe.config().wormholes) return std::nullopt;
+    const int peerId = mainRegion >= 1000000 ? mainRegion - 1000000 : mainRegion + 1000000;
+    const auto main = std::ranges::find_if(universe.regions(), [=](const Region& r) { return r.id == mainRegion; });
+    const auto peer = std::ranges::find_if(universe.regions(), [=](const Region& r) { return r.id == peerId; });
+    if (main == universe.regions().end() || peer == universe.regions().end()) return std::nullopt;
+    const bool occupied = std::ranges::any_of(universe.bodies(), [=](const Body& b) {
+        return !b.stored && (b.region == peerId ||
+            (b.portal_progress > 0.0 && b.portal_destination_region == peerId));
+    });
+    if (!occupied) return std::nullopt;
+    const double width = std::min(680.0, main->width * 0.36);
+    const double insetScale = std::min((width - 16.0) / peer->width,
+                                      (main->height * 0.45 - 42.0) / peer->height);
+    if (insetScale <= 0.0) return std::nullopt;
+    PeerViewLayout layout;
+    layout.region = *peer;
+    layout.scale = insetScale;
+    layout.contentSize = {peer->width * insetScale, peer->height * insetScale};
+    layout.size = layout.contentSize + Vec2{16.0, 42.0};
+    layout.origin = {main->x + main->width - layout.size.x - 12.0, main->y + 12.0};
+    layout.contentOrigin = layout.origin + Vec2{8.0, 34.0};
+    return layout;
+}
+
 struct CosmicRenderer::Impl {
     GLuint program = 0, vao = 0, buffer = 0;
     GLint projection = -1, resolution = -1, center = -1, size = -1;
     GLint angle = -1, stretch = -1, twist = -1, bend = -1, crop = -1;
     GLint mode = -1, color = -1, time = -1, radius = -1, phase = -1;
     GLint stars = -1, background = -1;
+    GLint clip = -1;
+    SP<Render::ITexture> peerLabel;
     std::size_t starCount = 180;
     float backgroundAlpha = 0.96F;
     GLsizei gridVertices = 0;
@@ -187,6 +234,7 @@ bool CosmicRenderer::initialize() {
         impl.color = uniform("uColor"); impl.time = uniform("uTime");
         impl.radius = uniform("uRadius"); impl.phase = uniform("uPhase");
         impl.stars = uniform("uStars"); impl.background = uniform("uBackground");
+        impl.clip = uniform("uClip");
 
         std::vector<float> vertices;
         const auto cell = [&](float left, float top, float right, float bottom) {
@@ -210,6 +258,8 @@ bool CosmicRenderer::initialize() {
         glUseProgram(impl.program);
         glUniform1i(uniform("uTexture"), 0);
         if (!impl.vao || !impl.buffer) throw std::runtime_error("Could not allocate Cosmic vertex mesh");
+        impl.peerLabel = g_pHyprRenderer->renderText("OTHER UNIVERSE  /  F10", CHyprColor{0.68, 0.84, 1.0, 1.0},
+                                                   24, false, "sans-serif", 600, 600);
         return true;
     } catch (const std::exception& exception) {
         if (vertex) glDeleteShader(vertex);
@@ -260,6 +310,7 @@ void CosmicRenderer::executeDraw(PHLMONITOR monitor, const Universe& universe,
     glUniform1f(impl.time, std::fmod(seconds, 10000.0));
     glUniform1f(impl.stars, impl.starCount);
     glUniform1f(impl.background, impl.backgroundAlpha);
+    glUniform4f(impl.clip, -1, -1, monitorSize.x + 1, monitorSize.y + 1);
     glUniform4f(impl.crop, 0, 0, 1, 1);
     impl.quad(monitorSize * 0.5, monitorSize, 0, {1, 1, 1, 1});
 
@@ -282,6 +333,45 @@ void CosmicRenderer::executeDraw(PHLMONITOR monitor, const Universe& universe,
         return 1.0;
     };
     const double visualScale = alternateRegion ? monitorSize.x / view->width : pixelScale;
+    const auto drawBody = [&](const Body& body, Vec2 position, double presentationScale) {
+        if (body.stored || body.scale < 0.0001) return;
+        const auto snapshot = std::ranges::find_if(snapshots, [&](const Snapshot& item) { return item.id == body.id; });
+        if (snapshot == snapshots.end() || !snapshot->framebuffer || !snapshot->window) return;
+        const auto texture = snapshot->framebuffer->getTexture();
+        if (!texture || !texture->ok()) return;
+        glBindTexture(GL_TEXTURE_2D, texture->m_texID);
+        const auto& capture = *snapshot;
+        glUniform4f(impl.crop,
+            (capture.logicalBox.x - capture.monitorPosition.x) * capture.monitorScale / texture->m_size.x,
+            (capture.logicalBox.y - capture.monitorPosition.y) * capture.monitorScale / texture->m_size.y,
+            capture.logicalBox.w * capture.monitorScale / texture->m_size.x,
+            capture.logicalBox.h * capture.monitorScale / texture->m_size.y);
+        double deformation = body.sink_progress * 0.24;
+        if (body.portal_progress > 0.0) {
+            const double fraction = body.portal_entry_duration / (body.portal_entry_duration + body.portal_exit_duration);
+            const double phase = body.portal_emerging
+                ? 1.0 - (body.portal_progress - fraction) / (1.0 - fraction)
+                : body.portal_progress / fraction;
+            deformation = std::max(deformation, std::clamp(phase, 0.0, 1.0) * 0.16);
+        }
+        const double scale = presentationScale * body.scale;
+        impl.quad(position, {body.width * scale, body.height * scale}, 1, {1, 1, 1, 1}, body.angle,
+                  body.stretch, body.twist, universe.config().spaghetti ? deformation : 0.0, true);
+    };
+
+    // Natural mouths obey the same layering as a manually triggered hole:
+    // only a luminous rim is allowed in front of intermediate imagery.
+    if (universe.config().wormholes) {
+        for (std::size_t i = 0; i < universe.wormholes().size(); ++i) {
+            const auto& hole = universe.wormholes()[i];
+            if (hole.region != view->id) continue;
+            const auto palette = i % 2 ? std::array<float, 3>{1.0F, 0.47F, 0.25F}
+                                       : std::array<float, 3>{0.35F, 0.68F, 1.0F};
+            const double diameter = hole.radius * 2.7 * visualScale * zoom(hole.region);
+            impl.quad(toPixel(hole.position, hole.region), {diameter, diameter}, 2,
+                      {palette[0], palette[1], palette[2], 0.95F}, hole.angle, 1, 0, 0, false, 0.04F, 1);
+        }
+    }
 
     // Put the opaque event horizon behind the falling image. Drawing it last
     // hides a centered target before its shrinking/twisting can be seen.
@@ -306,23 +396,8 @@ void CosmicRenderer::executeDraw(PHLMONITOR monitor, const Universe& universe,
         }
     }
     for (const auto& body : universe.bodies()) {
-        if (body.stored || body.region != view->id || body.scale < 0.0001) continue;
-        const auto snapshot = std::ranges::find_if(snapshots, [&](const Snapshot& item) { return item.id == body.id; });
-        if (snapshot == snapshots.end() || !snapshot->framebuffer || !snapshot->window) continue;
-        const auto texture = snapshot->framebuffer->getTexture();
-        if (!texture || !texture->ok()) continue;
-        const auto position = toPixel(body.position, body.region);
-        const double scale = visualScale * zoom(body.region) * body.scale;
-        const Vec2 dimensions{body.width * scale, body.height * scale};
-        glBindTexture(GL_TEXTURE_2D, texture->m_texID);
-        const auto& capture = *snapshot;
-        glUniform4f(impl.crop,
-            (capture.logicalBox.x - capture.monitorPosition.x) * capture.monitorScale / texture->m_size.x,
-            (capture.logicalBox.y - capture.monitorPosition.y) * capture.monitorScale / texture->m_size.y,
-            capture.logicalBox.w * capture.monitorScale / texture->m_size.x,
-            capture.logicalBox.h * capture.monitorScale / texture->m_size.y);
-        impl.quad(position, dimensions, 1, {1, 1, 1, 1}, body.angle, body.stretch,
-                  body.twist, universe.config().spaghetti ? body.sink_progress * 0.24 : 0.0, true);
+        if (body.region != view->id) continue;
+        drawBody(body, toPixel(body.position, body.region), visualScale * zoom(body.region));
     }
     glUniform4f(impl.crop, 0, 0, 1, 1);
     if (universe.config().wormholes) {
@@ -334,7 +409,7 @@ void CosmicRenderer::executeDraw(PHLMONITOR monitor, const Universe& universe,
             const auto palette = i % 2 ? std::array<float, 3>{1.0F, 0.47F, 0.25F}
                                        : std::array<float, 3>{0.35F, 0.68F, 1.0F};
             impl.quad(position, {diameter, diameter}, 2,
-                      {palette[0], palette[1], palette[2], 0.95F}, hole.angle, 1, 0, 0, false, 0.04F, 1.0F);
+                      {palette[0], palette[1], palette[2], 0.65F}, hole.angle, 1, 0, 0, false, 0.04F, 0);
         }
     }
     for (const auto& body : universe.bodies()) {
@@ -370,6 +445,51 @@ void CosmicRenderer::executeDraw(PHLMONITOR monitor, const Universe& universe,
                                        : std::array<float, 4>{0.36F, 0.78F, 1.0F, 0.36F},
                   0, 1, 0, 0, false, 0.013F, 0);
     }
+
+    // Keep the hidden counterpart visible for as long as it contains a living
+    // body, not just during transfer/cooldown. F10 can promote it to the main view.
+    if (const auto inset = peerViewLayout(universe, view->id)) {
+        const auto panelPixel = [&](Vec2 point) { return (point - Vec2{monitor->m_position.x, monitor->m_position.y}) * pixelScale; };
+        const auto origin = panelPixel(inset->origin);
+        const auto size = inset->size * pixelScale;
+        glUniform4f(impl.crop, 0, 0, 1, 1);
+        impl.quad(origin + size * 0.5, size, 4, {0.19F, 0.34F, 0.53F, 0.96F});
+        impl.quad(origin + size * 0.5, size - Vec2{2 * pixelScale, 2 * pixelScale}, 4,
+                  {0.016F, 0.021F, 0.050F, 0.97F});
+        if (impl.peerLabel && impl.peerLabel->ok()) {
+            glBindTexture(GL_TEXTURE_2D, impl.peerLabel->m_texID);
+            const double labelScale = std::min(0.5 * pixelScale, (size.x - 20 * pixelScale) / impl.peerLabel->m_size.x);
+            const Vec2 labelSize{impl.peerLabel->m_size.x * labelScale, impl.peerLabel->m_size.y * labelScale};
+            impl.quad(origin + Vec2{10 * pixelScale, 17 * pixelScale} + Vec2{labelSize.x * 0.5, 0}, labelSize,
+                      1, {1, 1, 1, 1});
+        }
+        const auto content = panelPixel(inset->contentOrigin);
+        const auto contentSize = inset->contentSize * pixelScale;
+        glUniform4f(impl.clip, content.x, content.y, content.x + contentSize.x, content.y + contentSize.y);
+        impl.quad(content + contentSize * 0.5, contentSize, 4, {0.008F, 0.010F, 0.026F, 1.0F});
+        const auto peerPixel = [&](Vec2 world) {
+            return panelPixel(inset->fromRegionScreen(universe.worldToScreen(world, inset->region.id)));
+        };
+        const double peerScale = inset->scale * pixelScale * zoom(inset->region.id);
+        for (int foreground = 0; foreground < 2; ++foreground) {
+            if (foreground) {
+                for (const auto& body : universe.bodies())
+                    if (body.region == inset->region.id) drawBody(body, peerPixel(body.position), peerScale);
+                glUniform4f(impl.crop, 0, 0, 1, 1);
+            }
+            for (std::size_t i = 0; i < universe.wormholes().size(); ++i) {
+                const auto& hole = universe.wormholes()[i];
+                if (hole.region != inset->region.id) continue;
+                const auto palette = i % 2 ? std::array<float, 3>{1.0F, 0.47F, 0.25F}
+                                           : std::array<float, 3>{0.35F, 0.68F, 1.0F};
+                const double diameter = hole.radius * 2.7 * peerScale;
+                impl.quad(peerPixel(hole.position), {diameter, diameter}, 2,
+                          {palette[0], palette[1], palette[2], foreground ? 0.65F : 0.95F},
+                          hole.angle, 1, 0, 0, false, 0.04F, foreground ? 0 : 1);
+            }
+        }
+        glUniform4f(impl.clip, -1, -1, monitorSize.x + 1, monitorSize.y + 1);
+    }
 }
 
 UP<IPassElement> CosmicRenderer::pass(PHLMONITOR monitor, const Universe& universe,
@@ -379,6 +499,7 @@ UP<IPassElement> CosmicRenderer::pass(PHLMONITOR monitor, const Universe& univer
 
 void CosmicRenderer::release() {
     auto& impl = *m_impl;
+    impl.peerLabel.reset();
     if (impl.buffer) glDeleteBuffers(1, &impl.buffer);
     if (impl.vao) glDeleteVertexArrays(1, &impl.vao);
     if (impl.program) glDeleteProgram(impl.program);
