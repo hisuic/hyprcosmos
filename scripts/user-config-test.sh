@@ -82,6 +82,11 @@ write_config() {
     case "$mode" in
         bare) printf '%s\n' 'require("cosmic")' >> "$output/config/hyprland.lua" ;;
         inline) printf '%s\n' 'require("cosmic").setup({idle_timeout=19,rendering={stars=31}})' >> "$output/config/hyprland.lua" ;;
+        startup-inline)
+            printf '%s\n' 'assert(hl.plugin.cosmic==nil,"startup fixture must precede native API publication")' \
+                'assert(require("cosmic").setup({idle_timeout=23,controls={preview="F6"}}))' \
+                >> "$output/config/hyprland.lua"
+            ;;
         removed) ;;
         *) printf 'Unknown fixture config mode: %s\n' "$mode" >&2; exit 1 ;;
     esac
@@ -91,7 +96,8 @@ write_settings() {
     printf '%s\n' "$content" > "$settings"
     cp -- "$settings" "$output/settings-$label.lua"
 }
-write_config bare
+write_settings startup 'return {idle_timeout=91,rendering={stars=127},controls={gravity=false}}'
+write_config startup-inline
 
 # No probes or input injection are needed. The only compositor selected for
 # reloads is the new child PID's exact instance. A private headless output makes
@@ -175,6 +181,14 @@ repair_after() {
 ctl -j version > "$output/version.json"
 wait_lua 'hl.plugin.cosmic~=nil and require("cosmic").status().module_initialized'
 config_ok
+eval_lua "local s=require('cosmic').status(); assert(s.config_file==$expected_path and s.config_file_loaded and s.config_file_error==nil and s.config.idle_timeout==23 and s.config.rendering.stars==127 and s.config.controls.gravity==false and s.config.controls.preview=='F6' and s.initialized and s.input_watchers>0)"
+ctl -j binds > "$output/startup.binds.json"
+python3 -c 'import json,sys; b=json.load(open(sys.argv[1])); p=[v for v in b if v.get("description")=="Cosmic: preview"]; assert len(p)==1 and p[0].get("key")=="F6",p; assert not any(v.get("description")=="Cosmic: gravity" for v in b)' "$output/startup.binds.json"
+pass 'real deferred startup reads an existing file before replaying inline setup, including reuse of a default chord disabled by the file'
+mv -- "$settings" "$output/settings-startup-removed.lua"
+write_config bare
+reload_config startup-to-missing
+ready
 eval_lua "local s=require('cosmic').status(); assert(s.config_file==$expected_path and not s.config_file_loaded and s.config_file_error==nil and s.config.idle_timeout==60 and s.config.rendering.stars==240 and s.initialized and s.input_watchers>0)"
 pass 'missing dedicated file uses the 60 s defaults and lexical module-sibling path'
 
@@ -265,4 +279,4 @@ wait_lua 'hl.plugin.cosmic==nil'
 [[ $(ctl -j plugin list) == '[]' ]] || { printf 'Native plugin remained loaded after removing require.\n' >&2; exit 1; }
 config_ok
 pass 'removing require unloads the native plugin and leaves the compositor responsive'
-printf '%s\n' 'PASS: real bare-require dedicated config loading, single-read semantics, create/edit/reload, defaults and setup priority, disabled state, contained syntax/range/type/runtime errors, bounded rejection of real FIFO/socket/directory/dangling/oversized files, regular symlink support, recovery, missing defaults and native require-removal. No parent configuration, input or IME was changed.' | tee "$output/result.txt"
+printf '%s\n' 'PASS: real deferred startup with file-dependent inline controls, bare-require dedicated config loading, single-read semantics, create/edit/reload, defaults and setup priority, disabled state, contained syntax/range/type/runtime errors, bounded rejection of real FIFO/socket/directory/dangling/oversized files, regular symlink support, recovery, missing defaults and native require-removal. No parent configuration, input or IME was changed.' | tee "$output/result.txt"
