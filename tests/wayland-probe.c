@@ -14,6 +14,7 @@
 #include "xdg-shell-client-protocol.h"
 #include "virtual-keyboard-client-protocol.h"
 #include "virtual-pointer-client-protocol.h"
+#include "idle-inhibit-client-protocol.h"
 
 // A real Wayland surface and seat receiver; the second mode injects events only
 // into an explicitly selected hyprcosmos-test socket. No compositor internals.
@@ -24,6 +25,8 @@ static struct wl_seat* seat;
 static struct xdg_wm_base* shell;
 static struct zwp_virtual_keyboard_manager_v1* keyboard_manager;
 static struct zwlr_virtual_pointer_manager_v1* pointer_manager;
+static struct zwp_idle_inhibit_manager_v1* idle_manager;
+static struct zwp_idle_inhibitor_v1* idle_inhibitor;
 static struct wl_surface* surface;
 static struct wl_keyboard* receiving_keyboard;
 static struct wl_pointer* receiving_pointer;
@@ -144,6 +147,8 @@ static void registry(void* d, struct wl_registry* r, uint32_t id, const char* na
         keyboard_manager = wl_registry_bind(r, id, &zwp_virtual_keyboard_manager_v1_interface, 1);
     if (!strcmp(name, "zwlr_virtual_pointer_manager_v1"))
         pointer_manager = wl_registry_bind(r, id, &zwlr_virtual_pointer_manager_v1_interface, version < 2 ? version : 2);
+    if (!strcmp(name, "zwp_idle_inhibit_manager_v1"))
+        idle_manager = wl_registry_bind(r, id, &zwp_idle_inhibit_manager_v1_interface, 1);
 }
 static void global_remove(void* d, struct wl_registry* r, uint32_t id) {}
 static const struct wl_registry_listener registry_listener = {registry, global_remove};
@@ -233,6 +238,12 @@ int main(int argc, char** argv) {
     }
     if (!compositor || !shm || !shell) fail("Required surface protocols unavailable");
     if (argc >= 3) variant = atoi(argv[2]);
+    int inhibit_requested = 0;
+    for (int argument = 3; argument < argc; ++argument) {
+        if (!strcmp(argv[argument], "--idle-inhibit")) inhibit_requested = 1;
+        else fail("Unknown window option; expected --window VARIANT [--idle-inhibit]");
+    }
+    if (inhibit_requested && !idle_manager) fail("Idle-inhibit protocol unavailable");
     surface = wl_compositor_create_surface(compositor);
     struct xdg_surface* xdg = xdg_wm_base_get_xdg_surface(shell, surface);
     xdg_surface_add_listener(xdg, &surface_listener, NULL);
@@ -241,6 +252,18 @@ int main(int argc, char** argv) {
     xdg_toplevel_set_app_id(top, "cosmic-probe");
     xdg_toplevel_set_title(top, variant % 2 ? "Cosmic probe B" : "Cosmic probe A");
     wl_surface_commit(surface);
+    if (inhibit_requested) {
+        // Create only after the first committed pixels have mapped the window.
+        // Hyprland permanently marks an inhibitor on a not-yet-attached
+        // surface as non-desktop, which does not exercise a browser inhibitor.
+        while (!configured && running) {
+            if (wl_display_dispatch(display) < 0) fail("Window configure failed before idle inhibition");
+        }
+        if (!running || wl_display_roundtrip(display) < 0) fail("Window mapping failed before idle inhibition");
+        idle_inhibitor = zwp_idle_inhibit_manager_v1_create_inhibitor(idle_manager, surface);
+        if (wl_display_roundtrip(display) < 0) fail("Idle inhibitor creation failed");
+        puts("{\"event\":\"idle_inhibitor_ready\"}");
+    }
     unsigned last_paint = millis();
     while (running) {
         wl_display_dispatch_pending(display);
@@ -251,6 +274,7 @@ int main(int argc, char** argv) {
         if (ready < 0 && errno != EINTR) break;
         if (millis() - last_paint >= 250) { paint(); last_paint = millis(); }
     }
+    if (idle_inhibitor) zwp_idle_inhibitor_v1_destroy(idle_inhibitor);
     wl_display_disconnect(display);
     return 0;
 }
