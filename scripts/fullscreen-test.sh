@@ -22,7 +22,7 @@ while (($#)); do
 done
 if "$unload_only" && "$stellar_only"; then printf 'Choose either unload-only or stellar-only.\n' >&2; exit 2; fi
 [[ "$unload_rounds" =~ ^[0-9]+$ && "$unload_rounds" -ge 1 && "$unload_rounds" -le 100 ]] || { printf 'Unload rounds must be 1..100.\n' >&2; exit 2; }
-for command in Hyprland hyprctl gcc wayland-scanner pkg-config python3 rg grim timeout; do
+for command in Hyprland hyprctl gcc wayland-scanner pkg-config python3 rg grim timeout getconf; do
     command -v "$command" >/dev/null || { printf 'Missing dependency: %s\n' "$command" >&2; exit 1; }
 done
 pkg-config --exists gtk-layer-shell-0 gtk+-3.0 libpng wayland-client xkbcommon || { printf 'Install GTK 3, gtk-layer-shell, libpng, Wayland and xkbcommon development files.\n' >&2; exit 1; }
@@ -41,12 +41,13 @@ inhibitor_pid=""
 top_pid=""
 overlay_pid=""
 extra_pid=""
+stellar_pids=()
 ime_pid=""
 capture_pid=""
 disabled_outputs=()
 cleanup() {
     local pid
-    for pid in "$capture_pid" "$ime_pid" "$extra_pid" "$top_pid" "$overlay_pid" "$inhibitor_pid" "$client_pid" "$compositor_pid"; do
+    for pid in "$capture_pid" "$ime_pid" "${stellar_pids[@]}" "$extra_pid" "$top_pid" "$overlay_pid" "$inhibitor_pid" "$client_pid" "$compositor_pid"; do
         if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then kill -TERM "$pid" 2>/dev/null || true; fi
     done
     if [[ -n "$native_socket" && -L "$XDG_RUNTIME_DIR/$socket" && $(readlink -- "$XDG_RUNTIME_DIR/$socket") == "$native_socket" ]]; then
@@ -186,6 +187,37 @@ preview() {
     eval_lua 'require("cosmic").action("preview"); assert(require("cosmic").status().active)'
     sleep .2
 }
+select_actor() {
+    # Debris draws above ordinary windows, so probe multiple interior points
+    # and confirm the native hit test instead of exploding an occluded target.
+    local candidate_x candidate_y candidate_id selection_attempt
+    local kind=${1:-window} key=${2:-63} predicate
+    case "$kind" in
+        window) predicate='not o.fragment' ;;
+        fragment) predicate='o.fragment' ;;
+        *) printf 'Unknown actor kind: %s\n' "$kind" >&2; exit 1 ;;
+    esac
+    for ((selection_attempt=0; selection_attempt<8; ++selection_attempt)); do
+        while read -r candidate_x candidate_y candidate_id; do
+            probe move "$candidate_x" "$candidate_y" 1280 720
+            if [[ $(ctl repl "print(require(\"cosmic\").status().hovered_id==$candidate_id)") == true ]]; then
+                eval_lua "_selected_actor_id=$candidate_id"
+                probe key "$key"
+                return
+            fi
+        done < <(ctl repl "local s=require(\"cosmic\").status(); for _,o in ipairs(s.objects) do if $predicate and not o.stored and o.nova_age<0 and o.portal_progress<=0 and o.sink_progress<=0 then local z=1; for _,p in ipairs({{0,0},{-.3,0},{.3,0},{0,-.3},{0,.3}}) do local x=p[1]*o.width*o.scale*z; local y=p[2]*o.height*o.scale*z; print(math.floor(o.x+x*math.cos(o.angle)-y*math.sin(o.angle)),math.floor(o.y+x*math.sin(o.angle)+y*math.cos(o.angle)),o.id) end end end")
+        sleep .1
+    done
+    printf 'No uncovered eligible %s was selectable.\n' "$kind" >&2
+    exit 1
+}
+measure_scene() {
+    local label=$1 start_metrics end_metrics
+    start_metrics="$(ctl repl 'local s=require("cosmic").status(); print(s.render_frames,s.physics_steps)') $(awk '{print $1}' /proc/uptime) $(awk '{print $14+$15}' "/proc/$compositor_pid/stat")"
+    sleep 2
+    end_metrics="$(ctl repl 'local s=require("cosmic").status(); print(s.render_frames,s.physics_steps)') $(awk '{print $1}' /proc/uptime) $(awk '{print $14+$15}' "/proc/$compositor_pid/stat")"
+    python3 -c 'import json,sys; a=list(map(float,sys.argv[2].split())); b=list(map(float,sys.argv[3].split())); t=b[2]-a[2]; print(json.dumps({"scene":sys.argv[1],"seconds":round(t,3),"rendered_fps":round((b[0]-a[0])/t,2),"physics_ticks_hz":round((b[1]-a[1])/t,2),"compositor_cpu_one_core_percent":round(100*(b[3]-a[3])/float(sys.argv[4])/t,2)}))' "$label" "$start_metrics" "$end_metrics" "$(getconf CLK_TCK)" | tee -a "$output/scene-performance.jsonl"
+}
 check_alive() {
     kill -0 "$compositor_pid" || { printf 'Child compositor crashed during lifecycle regression.\n' >&2; exit 1; }
     eval_lua 'assert(hl.plugin.cosmic==nil)'
@@ -290,8 +322,9 @@ wait_lua 'require("cosmic").status().objects[1].nova_age<2 and not require("cosm
 capture stellar-reversed hidden
 probe key 66
 wait_lua 'require("cosmic").status().objects[1].nova_fragment_count==16'
-wait_lua 'require("cosmic").status().objects[1].nova_fragment_count==0 and require("cosmic").status().objects[1].nova_remnant'
-capture stellar-remnant hidden
+wait_lua 'require("cosmic").status().objects[1].nova_age>=5'
+eval_lua 'local s=require("cosmic").status(); assert(s.fragments==16 and s.object_count==16 and s.objects[1].nova_remnant); local live=0; for _,o in ipairs(s.objects) do if o.fragment and not o.stored then live=live+1 end end; assert(live>0,"persistent fragments vanished after initial blast")'
+capture stellar-remnant-and-debris hidden
 before_restore_press=$(event_count '"event":"key","key":30,"state":1' "$output/window.jsonl")
 before_restore_release=$(event_count '"event":"key","key":30,"state":0' "$output/window.jsonl")
 probe key 30
@@ -311,6 +344,16 @@ probe move "$nova_x" "$nova_y" 1280 720
 probe key 63
 wait_lua 'require("cosmic").status().objects[1].nova_fragment_count==4'
 capture stellar-four-fragments hidden
+sleep 1.2
+eval_lua 'local s=require("cosmic").status(); assert(s.fragments==4 and s.object_count==4)'
+select_actor fragment
+eval_lua 'local s=require("cosmic").status(); assert(s.active and s.fragments==4); for _,o in ipairs(s.objects) do if o.fragment then assert(o.nova_age<0,"a fragment started another nova") end end'
+select_actor fragment 65
+wait_lua '(function() for _,o in ipairs(require("cosmic").status().objects) do if o.id==_selected_actor_id then return o.fragment and o.stored end end return false end)()'
+eval_lua 'local s=require("cosmic").status(); assert(s.fragments==4 and s.object_count==4,"stored pieces must retain their rewind slot")'
+probe key 66
+wait_lua '(function() for _,o in ipairs(require("cosmic").status().objects) do if o.id==_selected_actor_id then return o.fragment and not o.stored and o.sink_progress<=0 end end return false end)()'
+probe key 66
 eval_lua 'require("cosmic").action("emergency")'
 
 # A genuine second window makes spontaneous selection eligible; no synthetic
@@ -324,9 +367,51 @@ preview
 sleep 4
 eval_lua 'local s=require("cosmic").status(); assert(s.active and #s.objects==2); for _,o in ipairs(s.objects) do assert(o.nova_age<0) end'
 wait_lua '(function() local n=0; for _,o in ipairs(require("cosmic").status().objects) do if o.nova_age>=0 then n=n+1 end end return n==1 end)()'
-eval_lua 'require("cosmic").action("emergency"); require("cosmic").setup(_cosmic_stellar_options); _cosmic_stellar_options=nil'
+eval_lua 'require("cosmic").action("emergency"); require("cosmic").setup({max_objects=16,stellar={fragments=16}})'
+preview
+select_actor
+eval_lua 'local s=require("cosmic").status(); assert(s.active and s.object_count==2 and s.reserved_object_count==2 and s.fragments==0); for _,o in ipairs(s.objects) do assert(o.nova_age<0) end'
+sleep 5.3
+eval_lua 'local s=require("cosmic").status(); assert(s.active and s.fragments==0 and s.object_count==2,"automatic explosion bypassed the capacity guard"); require("cosmic").action("emergency")'
 stop_extra
-printf '%s\n' 'stellar: F5 pass-through/consumption, growth, 16/4 fragments, rewind, fixed GPU allocation, remnant, restoration and automatic selection passed' | tee -a "$output/stellar-checks.txt"
+
+# Exercise the full default budget with four real source images, then measure
+# actual rendering rather than confusing simulation ticks with video frames.
+for variant in 1 2 3; do
+    env -u HYPRLAND_INSTANCE_SIGNATURE WAYLAND_DISPLAY="$socket" "$output/wayland-probe" --window "$variant" > "$output/stellar-stress-$variant.jsonl" 2>&1 &
+    stellar_pids+=("$!")
+done
+sleep .35
+eval_lua 'require("cosmic").setup({max_objects=64,fps=60,stellar={automatic=false,charge_seconds=.5,fragment_seconds=1,fragments=16},effects={cursor_gravity=true,binary=true,collisions=true,expansion=false,black_hole=false,wormholes=false}})'
+preview
+eval_lua 'assert(require("cosmic").status().object_count==4)'
+measure_scene four-source-windows
+for expected_fragments in 16 32 48 64; do
+    select_actor
+    wait_lua "require(\"cosmic\").status().fragments==$expected_fragments"
+    sleep 1.05
+done
+eval_lua 'local s=require("cosmic").status(); assert(s.active and s.object_count==64 and s.reserved_object_count==64 and s.snapshots==4); for _,o in ipairs(s.objects) do if o.fragment then assert(not o.stored and o.nova_age<0) end end; _stress_snapshot_bytes=s.snapshot_bytes'
+capture stellar-sixty-four hidden
+sleep 4
+eval_lua 'local s=require("cosmic").status(); assert(s.fragments==64 and s.object_count==64 and s.snapshot_bytes==_stress_snapshot_bytes); for _,o in ipairs(s.objects) do if o.fragment then assert(not o.stored) end end'
+measure_scene sixty-four-persistent-fragments
+# Closing one actual source releases exactly its sixteen tiles and one shared
+# framebuffer. Rewinding cannot resurrect that application or its fragments.
+kill -TERM "${stellar_pids[0]}"
+wait "${stellar_pids[0]}" 2>/dev/null || true
+stellar_pids[0]=''
+wait_lua 'require("cosmic").status().fragments==48 and require("cosmic").status().snapshots==3'
+eval_lua 'local s=require("cosmic").status(); assert(s.active and s.object_count==48 and s.snapshot_bytes<_stress_snapshot_bytes)'
+probe key 66
+sleep .6
+eval_lua 'local s=require("cosmic").status(); assert(s.active and s.fragments==48 and s.object_count==48 and s.snapshots==3)'
+probe key 66
+eval_lua 'require("cosmic").action("emergency")'
+for pid in "${stellar_pids[@]}"; do if [[ -n "$pid" ]]; then kill -TERM "$pid"; wait "$pid" 2>/dev/null || true; fi; done
+stellar_pids=()
+eval_lua 'require("cosmic").setup(_cosmic_stellar_options); _cosmic_stellar_options=nil'
+printf '%s\n' 'stellar: real F5 pass-through, persistent 16/4/64 fragments, no re-explosion, F7 absorption, manual/automatic capacity guard, rewind, shared GPU allocation, source closure, remnant, restoration and measured rendering passed' | tee -a "$output/stellar-checks.txt"
 if "$stellar_only"; then
     eval_lua 'assert(not require("cosmic").status().active)'
     printf '%s\n' 'PASS: isolated stellar supernova regressions; parent session was never changed.'
