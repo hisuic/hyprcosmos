@@ -21,6 +21,29 @@ local idle_calm = assert(Config.normalize({ preset = "calm" }, idle_demo))
 check(idle_demo.idle_timeout == 5 and idle_calm.idle_timeout == 5,
     "switching presets preserves the explicitly configured idle delay")
 
+check(default_idle.max_windows == 24 and default_idle.max_objects == 64 and
+    Config.defaults.max_objects == 64,
+    "real window captures and persistent celestial objects have separate default limits")
+for _, count in ipairs({16, 64, 128}) do
+    local objects = assert(Config.normalize({ max_objects = count }))
+    check(objects.max_objects == count and objects.max_windows == 24,
+        "the total object limit accepts and preserves supported integer boundaries")
+end
+for _, invalid in ipairs({15, 129, 64.5, 0 / 0, math.huge, -math.huge, "64", false, {}}) do
+    local objects, message = Config.normalize({ max_objects = invalid })
+    check(objects == nil and type(message) == "string" and message:find("max_objects", 1, true),
+        "invalid total object limits are rejected with the exact configuration path")
+end
+local object_limits = assert(Config.normalize({ max_objects = 96, max_windows = 48 }))
+local partial_limits = assert(Config.normalize({ stellar = { fragments = 4 } }, object_limits))
+local preset_limits = assert(Config.normalize({ preset = "demo" }, partial_limits))
+check(partial_limits.max_objects == 96 and partial_limits.max_windows == 48 and
+    preset_limits.max_objects == 96 and preset_limits.max_windows == 48 and
+    object_limits.stellar.fragments == 16,
+    "partial settings and preset switches preserve object budgets without mutating prior options")
+check(Config.normalize({ max_objects = 16, max_windows = 48 }).max_windows == 48,
+    "the total object budget does not silently rewrite the independent capture limit")
+
 local previous = Config.normalize({ idle_timeout = 8, effects = { orbit = false } })
 check(previous.idle_timeout == 8 and previous.effects.binary and not previous.effects.orbit, "nested partial setup preserves defaults")
 for _, invalid in ipairs({ false, "invalid", { idle_timeout = 0 }, { max_windows = 49 },
@@ -67,7 +90,7 @@ check(default_stellar.stellar.automatic and default_stellar.stellar.interval_min
     default_stellar.stellar.interval_max == 130 and default_stellar.stellar.charge_seconds == 3.5 and
     default_stellar.stellar.fragment_seconds == 3 and default_stellar.stellar.fragments == 16 and
     default_stellar.stellar.growth == 1.7,
-    "cinematic explosions default to rare automatic events, a visible charge and sixteen shared-image fragments")
+    "cinematic explosions default to rare automatic events, a visible charge and sixteen persistent shared-image fragments")
 for _, boundary in ipairs({
     { "interval_min", 5, 1800 }, { "interval_max", 5, 1800 },
     { "charge_seconds", 0.5, 15 }, { "fragment_seconds", 1, 8 }, { "growth", 1.05, 2.5 },
