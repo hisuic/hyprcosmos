@@ -53,11 +53,13 @@ trap 'exit 130' INT TERM
 # matching input protocols. The plugin build requires no downloaded source.
 mkdir -p "$output/protocols" "$output/config"
 xdg_xml="$(pkg-config --variable=pkgdatadir wayland-protocols)/stable/xdg-shell/xdg-shell.xml"
-for protocol in xdg-shell virtual-keyboard virtual-pointer; do
+idle_xml="$(pkg-config --variable=pkgdatadir wayland-protocols)/unstable/idle-inhibit/idle-inhibit-unstable-v1.xml"
+for protocol in xdg-shell virtual-keyboard virtual-pointer idle-inhibit; do
     case "$protocol" in
         xdg-shell) xml="$xdg_xml" ;;
         virtual-keyboard) xml="$repository/tests/protocols/virtual-keyboard-unstable-v1.xml" ;;
         virtual-pointer) xml="$repository/tests/protocols/wlr-virtual-pointer-unstable-v1.xml" ;;
+        idle-inhibit) xml="$idle_xml" ;;
     esac
     wayland-scanner client-header "$xml" "$output/protocols/$protocol-client-protocol.h"
     wayland-scanner private-code "$xml" "$output/protocols/$protocol-protocol.c"
@@ -75,6 +77,7 @@ read -r -a libs <<< "$(pkg-config --libs wayland-client xkbcommon)"
 gcc -std=c11 -O2 -Wall -Wextra -Wno-unused-parameter -I"$output/protocols" "${cflags[@]}" \
     "$repository/tests/wayland-probe.c" "$output/protocols/xdg-shell-protocol.c" \
     "$output/protocols/virtual-keyboard-protocol.c" "$output/protocols/virtual-pointer-protocol.c" \
+    "$output/protocols/idle-inhibit-protocol.c" \
     "${libs[@]}" -o "$output/wayland-probe"
 gcc -std=c11 -O2 -Wall -Wextra -Wno-unused-parameter -I"$output/protocols" "${cflags[@]}" \
     "$repository/tests/share-probe.c" "$output/protocols/toplevel-export-protocol.c" \
