@@ -34,6 +34,7 @@ native_socket=""
 instance=""
 compositor_pid=""
 client_pid=""
+inhibitor_pid=""
 top_pid=""
 overlay_pid=""
 extra_pid=""
@@ -42,7 +43,7 @@ capture_pid=""
 disabled_outputs=()
 cleanup() {
     local pid
-    for pid in "$capture_pid" "$ime_pid" "$extra_pid" "$top_pid" "$overlay_pid" "$client_pid" "$compositor_pid"; do
+    for pid in "$capture_pid" "$ime_pid" "$extra_pid" "$top_pid" "$overlay_pid" "$inhibitor_pid" "$client_pid" "$compositor_pid"; do
         if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then kill -TERM "$pid" 2>/dev/null || true; fi
     done
     if [[ -n "$native_socket" && -L "$XDG_RUNTIME_DIR/$socket" && $(readlink -- "$XDG_RUNTIME_DIR/$socket") == "$native_socket" ]]; then
@@ -60,12 +61,14 @@ trap 'exit 130' INT TERM
 
 mkdir -p -- "$output/protocols" "$output/config"
 xdg_xml="$(pkg-config --variable=pkgdatadir wayland-protocols)/stable/xdg-shell/xdg-shell.xml"
-for protocol in xdg-shell virtual-keyboard virtual-pointer input-method; do
+idle_xml="$(pkg-config --variable=pkgdatadir wayland-protocols)/unstable/idle-inhibit/idle-inhibit-unstable-v1.xml"
+for protocol in xdg-shell virtual-keyboard virtual-pointer input-method idle-inhibit; do
     case "$protocol" in
         xdg-shell) xml="$xdg_xml" ;;
         virtual-keyboard) xml="$repository/tests/protocols/virtual-keyboard-unstable-v1.xml" ;;
         virtual-pointer) xml="$repository/tests/protocols/wlr-virtual-pointer-unstable-v1.xml" ;;
         input-method) xml="$repository/tests/protocols/input-method-unstable-v2.xml" ;;
+        idle-inhibit) xml="$idle_xml" ;;
     esac
     wayland-scanner client-header "$xml" "$output/protocols/$protocol-client-protocol.h"
     wayland-scanner private-code "$xml" "$output/protocols/$protocol-protocol.c"
@@ -75,6 +78,7 @@ read -r -a libs <<< "$(pkg-config --libs wayland-client xkbcommon)"
 gcc -std=c11 -O2 -Wall -Wextra -Wno-unused-parameter -I"$output/protocols" "${cflags[@]}" \
     "$repository/tests/wayland-probe.c" "$output/protocols/xdg-shell-protocol.c" \
     "$output/protocols/virtual-keyboard-protocol.c" "$output/protocols/virtual-pointer-protocol.c" \
+    "$output/protocols/idle-inhibit-protocol.c" \
     "${libs[@]}" -o "$output/wayland-probe"
 gcc -std=c11 -O2 -Wall -Wextra -Wno-unused-parameter -I"$output/protocols" "${cflags[@]}" \
     "$repository/tests/ime-probe.c" "$output/protocols/input-method-protocol.c" "${libs[@]}" -o "$output/ime-probe"
@@ -122,8 +126,11 @@ printf 'child_pid=%s\nchild_instance=%s\nchild_socket=%s\nplugin=%s\n' "$composi
 ctl() { hyprctl -i "$instance" "$@"; }
 eval_lua() {
     local result
-    result=$(ctl eval "$1" 2>&1) || { printf 'Lua request failed: %s\n%s\n' "$1" "$result" >&2; exit 1; }
-    [[ "$result" == ok ]] || { printf 'Lua assertion failed: %s\n%s\n' "$1" "$result" >&2; exit 1; }
+    if ! result=$(ctl eval "$1" 2>&1) || [[ "$result" != ok ]]; then
+        printf 'Lua assertion failed at script line %s: %s\n%s\n' "${BASH_LINENO[0]}" "$1" "$result" >&2
+        ctl repl 'local m=package.loaded["cosmic"]; if m then local s=m.status(); for _,k in ipairs({"active","manual_preview","entry_blocked","manual_entry_blocked","held_input","desktop_interaction_blocked","last_reason"}) do print(k.."="..tostring(s[k])) end end' >&2 || true
+        exit 1
+    fi
 }
 wait_lua() {
     local predicate=$1
@@ -282,6 +289,118 @@ for spec in 'exclusive cosmic-test-launcher' 'on-demand cosmic-test-on-demand' '
     stop_extra
     eval_lua 'require("cosmic").setup({idle_timeout=require("cosmic.config").defaults.idle_timeout})'
 done
+
+# A real surface-scoped inhibitor matches the browser's YouTube behavior.
+# Automatic entry must remain inhibited, including when inhibition begins
+# after idle entry, but an actual F11 is an intentional manual exception.
+eval_lua '_cosmic_idle_regression_options=require("cosmic").status().config; require("cosmic").setup({idle_timeout=.5,exclusions={idle_inhibit=true,fullscreen=true,screenshare=false}})'
+wait_lua 'require("cosmic").status().active'
+eval_lua 'local s=require("cosmic").status(); assert(s.last_reason=="idle" and not s.manual_preview)'
+env -u HYPRLAND_INSTANCE_SIGNATURE WAYLAND_DISPLAY="$socket" "$output/wayland-probe" --window 1 --idle-inhibit > "$output/idle-inhibitor.jsonl" 2>&1 &
+inhibitor_pid=$!
+for ((attempt=0; attempt<80; ++attempt)); do
+    kill -0 "$inhibitor_pid" 2>/dev/null || { sed -n '1,20p' "$output/idle-inhibitor.jsonl" >&2; exit 1; }
+    if [[ $(event_count '"event":"idle_inhibitor_ready"' "$output/idle-inhibitor.jsonl") -ge 1 ]]; then break; fi
+    sleep .05
+done
+[[ $(event_count '"event":"idle_inhibitor_ready"' "$output/idle-inhibitor.jsonl") -eq 1 ]] || { printf 'Surface idle inhibitor was not created.\n' >&2; exit 1; }
+ctl -j clients > "$output/idle-inhibitor-clients.json"
+python3 -c 'import json,sys; c=next(c for c in json.load(sys.stdin) if c.get("title")=="Cosmic probe B"); assert c.get("inhibitingIdle") is True,c' < "$output/idle-inhibitor-clients.json"
+wait_lua 'not require("cosmic").status().active and require("cosmic").status().entry_blocked'
+sleep 1.1
+eval_lua 'local s=require("cosmic").status(); assert(not s.active and not s.manual_preview and s.entry_blocked and not s.manual_entry_blocked)'
+probe key 87
+eval_lua 'local s=require("cosmic").status(); assert(s.active and s.manual_preview and s.last_reason=="manual preview" and s.entry_blocked and not s.manual_entry_blocked); _cosmic_manual_physics_before=s.physics_steps'
+sleep 1.1
+eval_lua 'local s=require("cosmic").status(); assert(s.active and s.manual_preview and s.physics_steps>_cosmic_manual_physics_before+10)'
+capture idle-inhibited-manual hidden
+eval_lua 'assert(require("cosmic").status().active)'
+probe key 87
+eval_lua 'local s=require("cosmic").status(); assert(not s.active and not s.manual_preview and s.last_reason=="preview ended")'
+sleep 1.1
+eval_lua 'assert(not require("cosmic").status().active)'
+
+# The exception belongs to one active preview, not to a persistent config
+# change. Ordinary input restores immediately and still reaches the client.
+probe key 87
+eval_lua 'assert(require("cosmic").status().active and require("cosmic").status().manual_preview)'
+before_inhibited_key=$(event_count '"event":"key","key":30,"state":1' "$output/idle-inhibitor.jsonl")
+before_inhibited_release=$(event_count '"event":"key","key":30,"state":0' "$output/idle-inhibitor.jsonl")
+probe key 30
+wait_lua 'not require("cosmic").status().active'
+sleep .1
+[[ $(event_count '"event":"key","key":30,"state":1' "$output/idle-inhibitor.jsonl") -eq $((before_inhibited_key+1)) ]] || { printf 'Inhibited manual restoration key press was lost or duplicated.\n' >&2; exit 1; }
+[[ $(event_count '"event":"key","key":30,"state":0' "$output/idle-inhibitor.jsonl") -eq $((before_inhibited_release+1)) ]] || { printf 'Inhibited manual restoration key release was lost or duplicated.\n' >&2; exit 1; }
+eval_lua 'assert(not require("cosmic").status().manual_preview)'
+sleep 1.1
+eval_lua 'assert(not require("cosmic").status().active)'
+probe key 87
+eval_lua 'assert(require("cosmic").status().active)'
+probe key 88
+eval_lua 'local s=require("cosmic").status(); assert(not s.active and not s.manual_preview and s.last_reason=="emergency")'
+sleep 1.1
+eval_lua 'assert(not require("cosmic").status().active)'
+
+# Reconfiguration and disable/re-enable must also discard a manual exception.
+# The same inhibitor remains live: neither lifecycle operation may accidentally
+# turn its next automatic entry into a manual preview.
+probe key 87
+eval_lua 'assert(require("cosmic").status().manual_preview); require("cosmic").setup({idle_timeout=.5}); local s=require("cosmic").status(); assert(not s.active and not s.manual_preview and s.entry_blocked)'
+sleep 1.1
+eval_lua 'assert(not require("cosmic").status().active)'
+probe key 87
+eval_lua 'assert(require("cosmic").status().manual_preview); require("cosmic").disable(); local s=require("cosmic").status(); assert(not s.initialized and not s.active and not s.manual_preview); require("cosmic").enable(); s=require("cosmic").status(); assert(s.initialized and not s.active and not s.manual_preview and s.entry_blocked)'
+sleep 1.1
+eval_lua 'assert(not require("cosmic").status().active)'
+
+# Neither fullscreen nor security/interactive layers are bypassed by F11.
+# Change them while manually active as well as testing rejected new entry.
+probe key 87
+eval_lua 'assert(require("cosmic").status().active)'
+# In Hyprland's Lua mode, legacy `dispatch fullscreen 0` is invalid Lua syntax.
+# Dispatch the real object and target B explicitly rather than relying on focus.
+eval_lua '_cosmic_inhibitor_window=nil; for _,w in ipairs(hl.get_windows()) do if w.title=="Cosmic probe B" then _cosmic_inhibitor_window=w; break end end; assert(_cosmic_inhibitor_window); local r=hl.dispatch(hl.dsp.window.fullscreen({action="set",window=_cosmic_inhibitor_window})); assert(r.ok,r.error)'
+wait_lua 'not require("cosmic").status().active and require("cosmic").status().manual_entry_blocked'
+probe key 87
+eval_lua 'assert(not require("cosmic").status().active)'
+eval_lua 'local r=hl.dispatch(hl.dsp.window.fullscreen({action="unset",window=_cosmic_inhibitor_window})); assert(r.ok,r.error); _cosmic_inhibitor_window=nil'
+wait_lua 'not require("cosmic").status().manual_entry_blocked'
+for spec in 'exclusive cosmic-test-inhibited-launcher' 'none hyprlock'; do
+    read -r keyboard_mode namespace <<< "$spec"
+    probe key 87
+    eval_lua 'assert(require("cosmic").status().active)'
+    start_layer "$output/inhibited-$namespace.jsonl" overlay "$namespace" "$keyboard_mode"
+    wait_lua 'not require("cosmic").status().active and require("cosmic").status().manual_entry_blocked'
+    probe key 87
+    eval_lua 'assert(not require("cosmic").status().active)'
+    stop_extra
+    wait_lua 'not require("cosmic").status().manual_entry_blocked'
+done
+
+# A real screencopy must still terminate a manual preview. Its recent-frame
+# guard also rejects a new F11 instead of letting the exception expose Cosmic.
+eval_lua 'require("cosmic").setup({exclusions={screenshare=true}})'
+# Reinitialization observes preexisting shares for 750 ms even when no share
+# is yet reported. Let that independent safety warm-up finish before pressing
+# F11; a rejected press during warm-up is intentional, not this regression.
+sleep .85
+wait_lua 'not require("cosmic").status().manual_entry_blocked'
+probe key 87
+eval_lua 'assert(require("cosmic").status().active)'
+capture inhibited-share-restored visible
+eval_lua 'local s=require("cosmic").status(); assert(not s.active and not s.manual_preview and s.manual_entry_blocked)'
+probe key 87
+eval_lua 'assert(not require("cosmic").status().active)'
+wait_lua 'not require("cosmic").status().manual_entry_blocked'
+eval_lua 'require("cosmic").setup({exclusions={screenshare=false}})'
+
+kill -TERM "$inhibitor_pid"
+wait "$inhibitor_pid" 2>/dev/null || true
+inhibitor_pid=""
+wait_lua 'not require("cosmic").status().entry_blocked'
+wait_lua 'require("cosmic").status().active'
+eval_lua 'local s=require("cosmic").status(); assert(s.last_reason=="idle" and not s.manual_preview); require("cosmic").setup(_cosmic_idle_regression_options); _cosmic_idle_regression_options=nil; _cosmic_manual_physics_before=nil; assert(require("cosmic").status().config.idle_timeout==60 and not require("cosmic").status().config.exclusions.screenshare)'
+printf '%s\n' 'PASS: real browser-like idle inhibition blocks/stops automatic entry; F11 sustains manual rendering/physics, toggles off and restores input exactly once; setup and disable/re-enable discard the exception; emergency, fullscreen, protected UI and sharing retain their guards; inhibitor removal restores automatic entry.' | tee "$output/manual-idle-inhibit-result.txt"
 fi
 
 # Exercise unload without first shutting Cosmic down. Screenshot delivery proves
@@ -351,4 +470,4 @@ sleep .1
 [[ $(event_count '"event":"key","key":30,"state":1' "$output/ime.jsonl") -eq $((before_ime_key+1)) ]] || { printf 'IME restoration key press was lost or duplicated.\n' >&2; exit 1; }
 [[ $(event_count '"event":"key","key":30,"state":0' "$output/ime.jsonl") -eq $((before_ime_release+1)) ]] || { printf 'IME restoration key release was lost or duplicated.\n' >&2; exit 1; }
 capture idle-restored visible
-printf 'PASS: real TOP/OVERLAY suppression and unmap fadeout, exclusive-zone and geometry preservation, first panel click once, protected/interactive layer safety, optional UI visibility, %s active direct unloads, 3 active require removals, and default 60 s idle activation with a persistent real IME grab and its first key delivered once. Parent session was never changed.\n' "$unload_rounds" | tee "$output/result.txt"
+printf 'PASS: real TOP/OVERLAY suppression and unmap fadeout, exclusive-zone and geometry preservation, first panel click once, protected/interactive layer safety, optional UI visibility, manual-only idle-inhibit exception with genuine client inhibition and retained safety guards, %s active direct unloads, 3 active require removals, and default 60 s idle activation with a persistent real IME grab and its first key delivered once. Parent session was never changed.\n' "$unload_rounds" | tee "$output/result.txt"
