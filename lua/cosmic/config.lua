@@ -7,6 +7,10 @@ M.defaults = {
     preset = "calm",
     seed = 0xC05C1C,
     max_windows = 24,
+    -- Normal windows and persistent stellar fragments share this celestial
+    -- budget. A split replaces one window, so sixteen pieces need fifteen
+    -- additional slots; existing pieces are never evicted for a new explosion.
+    max_objects = 64,
     fps = 60,
     snapshot_hz = 4,
     history_seconds = 12,
@@ -26,6 +30,8 @@ M.defaults = {
     },
     -- Cinematic window explosions are deliberately rare. F5 can select a
     -- drifting window manually even when automatic explosions are disabled.
+    -- fragment_seconds controls the initial blast/settling, not a lifetime;
+    -- fragments then follow the same physics as windows and cannot re-explode.
     stellar = {
         automatic = true, interval_min = 70, interval_max = 130,
         charge_seconds = 3.5, fragment_seconds = 3, fragments = 16, growth = 1.7,
@@ -52,7 +58,8 @@ M.defaults = {
 
 local ranges = {
     idle_timeout = { 0.25, 3600 }, seed = { 0, 0xFFFFFFFF, true },
-    max_windows = { 1, 48, true }, fps = { 10, 120, true },
+    max_windows = { 1, 48, true }, max_objects = { 16, 128, true },
+    fps = { 10, 120, true },
     snapshot_hz = { 0.25, 30 }, history_seconds = { 0.1, 60 },
     history_hz = { 1, 60 }, history_mb = { 1, 64 },
     ["physics.fixed_step"] = { 1 / 240, 1 / 30 },
