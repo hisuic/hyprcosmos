@@ -92,6 +92,7 @@ class Cosmic {
     CFunctionHook* layerHook = nullptr;
     CFunctionHook* fadeoutsHook = nullptr;
     bool initialized = false, active = false, capturing = false, alternateRegion = false;
+    bool manualPreview = false;
     bool previousScanoutBlocked = false;
     bool notified = false;
     std::string reason = "not initialized";
@@ -211,7 +212,7 @@ Clock::time_point lastInput = Clock::now(), lastTick = lastInput, lastCapture = 
         if (imeComposition()) return true;
         return false;
     }
-    bool blocked() {
+    bool blocked(bool preview = false) {
         if (g_pSessionLockManager->isSessionLocked() || g_pInputManager->isConstrained() || g_pInputManager->isLocked()) return true;
         if (desktopInteraction()) return true;
         for (const auto& m : State::monitorState()->monitors()) {
@@ -229,7 +230,9 @@ Clock::time_point lastInput = Clock::now(), lastTick = lastInput, lastCapture = 
                     if (const auto dialog = top->m_dialog.lock(); dialog && dialog->modal) return true;
                 }
             }
-            if (options.excludeInhibit && g_pInputManager->isWindowInhibiting(w, false)) return true;
+            // An explicit preview may ignore a video's idle inhibitor, but
+            // never the independent fullscreen, sharing or security guards.
+            if (options.excludeInhibit && !preview && g_pInputManager->isWindowInhibiting(w, false)) return true;
             if (options.excludeFullscreen && Fullscreen::controller()->isFullscreen(w)) return true;
             for (const auto& pattern : options.excluded) if (std::regex_search(w->m_class, pattern)) return true;
         }
@@ -247,6 +250,7 @@ Clock::time_point lastInput = Clock::now(), lastTick = lastInput, lastCapture = 
     void stop(const std::string& why, bool refreshPointer = false, bool shareKnownActive = false) {
         const bool wasActive = active;
         active = false; // BEFORE any input hit testing or seat delivery.
+        manualPreview = false;
         reason = why;
         lastInput = lastTick = Clock::now();
         if (wasActive) {
@@ -335,7 +339,7 @@ Clock::time_point lastInput = Clock::now(), lastTick = lastInput, lastCapture = 
         return body;
     }
     void start(bool preview) {
-        if (!initialized || !options.enabled || active || blocked()) return;
+        if (!initialized || !options.enabled || active || blocked(preview)) return;
         // Fading layer/popup snapshots have no retained namespace/aboveLock
         // identity. Let them finish in the normal desktop before entering.
         for (const auto& fadeout : Desktop::fadingOutState()->fadeouts()) {
@@ -373,6 +377,7 @@ Clock::time_point lastInput = Clock::now(), lastTick = lastInput, lastCapture = 
         universe.reset(std::move(bodies), std::move(regions), cursor(), focused ? focused->m_stableID : 0);
         renderer.beginScene();
         active = true;
+        manualPreview = preview;
         alternateRegion = false;
         lastTick = lastCapture = Clock::now();
         reason = preview ? "manual preview" : "idle";
@@ -434,7 +439,7 @@ Clock::time_point lastInput = Clock::now(), lastTick = lastInput, lastCapture = 
         // CLOCK_MONOTONIC excludes suspend on Linux. CLOCK_BOOTTIME lets us
         // detect resume without feeding suspend time into the simulation.
         if (elapsed > 1.0 || bootElapsed - elapsed > .5) { stop("resume or long pause"); return; }
-        if (blocked()) { if (active) stop("excluded, locked or display off"); lastInput = now; return; }
+        if (blocked(active && manualPreview)) { if (active) stop("excluded, locked or display off"); lastInput = now; return; }
         if (!active) {
             if (std::chrono::duration<double>(now - lastInput).count() >= options.idleTimeout && !held()) start(false);
         } else {
@@ -518,7 +523,7 @@ Clock::time_point lastInput = Clock::now(), lastTick = lastInput, lastCapture = 
         listeners.push_back(events.render.preChecks.listen([this](PHLMONITOR) {
             // Also inspect current state immediately BEFORE rendering, not
             // just the timer: a new modal/security UI must appear this frame.
-            if (active && blocked()) stop("excluded or protected UI before render");
+            if (active && blocked(manualPreview)) stop("excluded or protected UI before render");
             if (active) g_pHyprRenderer->m_directScanoutBlocked = true;
         }));
         listeners.push_back(events.render.stage.listen([this](eRenderStage stage) {
@@ -735,6 +740,7 @@ int status(lua_State* L) {
     n("particles", instance->universe.particles().size()); n("waves", instance->universe.waves().size());
     n("gravity_mode", static_cast<std::size_t>(instance->universe.gravityMode()));
     b("alternate_region", instance->alternateRegion);
+    b("manual_preview", instance->active && instance->manualPreview);
     b("desktop_ui_hidden", instance->active && instance->options.hideDesktopUI);
     // Read-only diagnostics distinguish real activity from a persistent modal
     // guard when an otherwise idle desktop does not enter Cosmic.
@@ -745,6 +751,7 @@ int status(lua_State* L) {
     b("desktop_interaction_blocked", instance->desktopInteraction());
     b("held_input", instance->held());
     b("entry_blocked", instance->blocked());
+    b("manual_entry_blocked", instance->blocked(true));
     lua_pushnumber(L, std::chrono::duration<double>(Clock::now() - instance->lastInput).count());
     lua_setfield(L, -2, "idle_seconds");
     lua_newtable(L);
