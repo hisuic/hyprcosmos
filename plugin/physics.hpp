@@ -32,6 +32,13 @@ struct Region {
 
 struct Body {
     uint64_t id = 0;
+    // Normal actors use their compositor ID as source_id. Fragments have an
+    // independent simulation ID but continue sampling that same source image.
+    uint64_t source_id = 0;
+    int fragment_grid = 0;          // 0: real window, 2/4: immutable texture tile.
+    int fragment_column = 0;
+    int fragment_row = 0;
+    double fragment_age = 0.0;      // Initial blast settling only; never a lifetime.
     Vec2 position;
     Vec2 velocity;
     double width = 640.0;
@@ -84,7 +91,7 @@ struct Body {
     double portal_source_camera_zoom = 1.0;
     double portal_destination_camera_zoom = 1.0;
     // A stellar event owns only seeds and age, never sixteen copies of a GPU
-    // image. Analytic fragment poses can therefore be rewound within Body.
+    // image. Its child actors share source_id and use the ordinary physics path.
     double nova_age = -1.0;
     double nova_charge_seconds = 3.5;
     double nova_fragment_seconds = 3.0;
@@ -154,6 +161,7 @@ struct Config {
     double fixed_step = 1.0 / 120.0;
     std::size_t max_substeps = 8;
     std::size_t max_bodies = 48;
+    std::size_t max_objects = 64;   // Real actors plus persistent fragment actors.
     std::size_t max_particles = 384;
     double history_seconds = 12.0;
     double history_hz = 30.0;
@@ -213,6 +221,10 @@ class Universe {
     GravityMode gravityMode() const { return m_gravity_mode; }
     std::size_t historyFrames() const { return m_history.size(); }
     std::size_t historyLimit() const { return m_history_limit; }
+    // Stored actors retain their slot, so absorption never silently lets a
+    // subsequent event exceed the cap when that actor is restored by rewind.
+    std::size_t objectCount() const;
+    std::size_t reservedObjectCount() const;
     uint64_t hitTest(Vec2 screen_position) const;
     uint64_t hitTest(Vec2 screen_position, int visible_region) const;
     Vec2 worldToScreen(Vec2 position, int region) const;
@@ -223,6 +235,7 @@ class Universe {
         std::vector<Body> bodies;
         double time = 0.0, next_nova = 0.0;
         uint64_t nova_serial = 0;
+        uint64_t next_fragment_id = UINT64_MAX;
         std::mt19937_64 random;
     };
     Config m_config;
@@ -243,6 +256,7 @@ class Universe {
     double m_time = 0.0;
     double m_next_nova = 0.0;
     uint64_t m_nova_serial = 0;
+    uint64_t m_next_fragment_id = UINT64_MAX;
     bool m_rewinding = false;
     GravityMode m_gravity_mode = GravityMode::Cursor;
 
@@ -265,6 +279,9 @@ class Universe {
     void scheduleNova();
     void advanceNova(Body& body, double dt);
     void cancelNova(Body& body);
+    void createNovaFragments(const Body& parent, std::vector<Body>& fragments);
+    uint64_t allocateFragmentId(uint64_t excluded_id = 0);
+    void relocateFragmentId(uint64_t id);
 };
 
 } // namespace cosmic
