@@ -62,6 +62,7 @@ class CosmicRenderer {
                          const std::vector<Snapshot>& snapshots, bool alternateRegion = false);
     void release();
     const std::string& error() const;
+    uint64_t frameCount() const;
 
   private:
     struct Impl;

@@ -144,9 +144,11 @@ std::optional<PeerViewLayout> peerViewLayout(const Universe& universe, int mainR
     const auto main = std::ranges::find_if(universe.regions(), [=](const Region& r) { return r.id == mainRegion; });
     const auto peer = std::ranges::find_if(universe.regions(), [=](const Region& r) { return r.id == peerId; });
     if (main == universe.regions().end() || peer == universe.regions().end()) return std::nullopt;
-    const bool occupied = std::ranges::any_of(universe.bodies(), [=](const Body& b) {
-        return !b.stored && (b.region == peerId ||
-            (b.portal_progress > 0.0 && b.portal_destination_region == peerId));
+    const bool occupied = std::ranges::any_of(universe.bodies(), [&](const Body& b) {
+        const bool novaVisible = b.nova_age >= 0.0 &&
+            (b.nova_age < b.nova_charge_seconds + b.nova_fragment_seconds || universe.config().black_hole);
+        return ((!b.stored || novaVisible) && b.region == peerId) ||
+               (!b.stored && b.portal_progress > 0.0 && b.portal_destination_region == peerId);
     });
     if (!occupied) return std::nullopt;
     const double width = std::min(680.0, main->width * 0.36);
@@ -164,6 +166,7 @@ std::optional<PeerViewLayout> peerViewLayout(const Universe& universe, int mainR
 }
 
 struct CosmicRenderer::Impl {
+    uint64_t renderFrames = 0;
     GLuint program = 0, vao = 0, buffer = 0;
     GLint projection = -1, resolution = -1, center = -1, size = -1;
     GLint angle = -1, stretch = -1, twist = -1, bend = -1, crop = -1;
@@ -291,6 +294,7 @@ void CosmicRenderer::configure(std::size_t stars, double background) {
 void CosmicRenderer::executeDraw(PHLMONITOR monitor, const Universe& universe,
                                  const std::vector<Snapshot>& snapshots, bool alternateRegion) {
     if (!monitor || !initialize()) return;
+    ++m_impl->renderFrames;
     GLState state;
     auto& impl = *m_impl;
     glDisable(GL_SCISSOR_TEST);
@@ -348,17 +352,26 @@ void CosmicRenderer::executeDraw(PHLMONITOR monitor, const Universe& universe,
     const double visualScale = alternateRegion ? monitorSize.x / view->width : pixelScale;
     const auto drawBody = [&](const Body& body, Vec2 position, double presentationScale) {
         if (body.stored || body.scale < 0.0001) return;
-        const auto snapshot = std::ranges::find_if(snapshots, [&](const Snapshot& item) { return item.id == body.id; });
+        // A persistent piece has its own physics ID, but never its own image.
+        // Even after crossing a portal it samples its original window's crop.
+        const uint64_t source = body.fragment_grid > 0 ? body.source_id : body.id;
+        const auto snapshot = std::ranges::find_if(snapshots, [&](const Snapshot& item) { return item.id == source; });
         if (snapshot == snapshots.end() || !snapshot->framebuffer || !snapshot->window) return;
         const auto texture = snapshot->framebuffer->getTexture();
         if (!texture || !texture->ok()) return;
         glBindTexture(GL_TEXTURE_2D, texture->m_texID);
         const auto& capture = *snapshot;
-        glUniform4f(impl.crop,
-            (capture.logicalBox.x - capture.monitorPosition.x) * capture.monitorScale / texture->m_size.x,
-            (capture.logicalBox.y - capture.monitorPosition.y) * capture.monitorScale / texture->m_size.y,
-            capture.logicalBox.w * capture.monitorScale / texture->m_size.x,
-            capture.logicalBox.h * capture.monitorScale / texture->m_size.y);
+        const std::array<float, 4> imageCrop = {
+            float((capture.logicalBox.x - capture.monitorPosition.x) * capture.monitorScale / texture->m_size.x),
+            float((capture.logicalBox.y - capture.monitorPosition.y) * capture.monitorScale / texture->m_size.y),
+            float(capture.logicalBox.w * capture.monitorScale / texture->m_size.x),
+            float(capture.logicalBox.h * capture.monitorScale / texture->m_size.y)};
+        if (body.fragment_grid > 0) {
+            const double grid = body.fragment_grid;
+            glUniform4f(impl.crop, imageCrop[0] + imageCrop[2] * body.fragment_column / grid,
+                        imageCrop[1] + imageCrop[3] * body.fragment_row / grid,
+                        imageCrop[2] / grid, imageCrop[3] / grid);
+        } else glUniform4fv(impl.crop, 1, imageCrop.data());
         double deformation = body.sink_progress * 0.24;
         if (body.portal_progress > 0.0) {
             const double fraction = body.portal_entry_duration / (body.portal_entry_duration + body.portal_exit_duration);
@@ -368,8 +381,44 @@ void CosmicRenderer::executeDraw(PHLMONITOR monitor, const Universe& universe,
             deformation = std::max(deformation, std::clamp(phase, 0.0, 1.0) * 0.16);
         }
         const double scale = presentationScale * body.scale;
-        impl.quad(position, {body.width * scale, body.height * scale}, 1, {1, 1, 1, 1}, body.angle,
-                  body.stretch, body.twist, universe.config().spaghetti ? deformation : 0.0, true);
+        const double charge = body.nova_age >= 0.0
+            ? std::clamp(body.nova_age / std::max(body.nova_charge_seconds, 0.001), 0.0, 1.0) : 0.0;
+        const float heat = body.fragment_grid > 0
+            ? 0.5 * (1.0 - std::clamp(body.fragment_age / std::max(body.nova_fragment_seconds, 0.001), 0.0, 1.0))
+            : charge * charge;
+        if (charge > 0.0) {
+            const float pulse = 0.85F + 0.15F * std::sin(body.nova_age * (4.0 + charge * 10.0));
+            impl.quad(position, {body.width * scale * 1.25, body.height * scale * 1.25}, 5,
+                      {1.0F, 0.13F, 0.035F, (0.08F + 0.34F * heat) * pulse * float(charge)}, body.angle);
+        }
+        impl.quad(position, {body.width * scale, body.height * scale}, 1,
+                  {1, 1.0F - 0.82F * heat, 1.0F - 0.90F * heat, 1}, body.angle,
+                  body.stretch, body.twist, universe.config().spaghetti ? deformation : 0.0,
+                  body.fragment_grid == 0 || deformation > 0.0 || std::abs(body.twist) > 0.001,
+                  0.03F, heat);
+    };
+    const auto drawNovaHole = [&](const Body& body, Vec2 position, double presentationScale, bool foreground) {
+        if (!universe.config().black_hole || body.nova_age < body.nova_charge_seconds) return;
+        const double age = body.nova_age - body.nova_charge_seconds;
+        const double progress = std::clamp(age / 0.25, 0.0, 1.0);
+        const double growth = progress * progress * (3.0 - 2.0 * progress);
+        if (growth <= 0.0001) return;
+        const double diameter = 48.0 * 2.7 * presentationScale * growth;
+        // Override only this cinematic clock, then restore the ambient clock
+        // for the sky and unrelated effects. The remnant retraces F8 exactly.
+        glUniform1f(impl.time, body.nova_age);
+        impl.quad(position, {diameter, diameter}, 2,
+                  {1.0F, 0.32F, 0.12F, foreground ? 0.85F : 0.98F},
+                  body.nova_age * 0.22, 1, 0, 0, false, 0.045F, foreground ? 0 : 1);
+        glUniform1f(impl.time, std::fmod(seconds, 73728.0));
+    };
+    const auto drawNovaFlash = [&](const Body& body, Vec2 position, double presentationScale) {
+        const double age = body.nova_age - body.nova_charge_seconds;
+        if (age < 0.0 || age >= 0.28) return;
+        const float fade = 1.0 - age / 0.28;
+        const double diameter = std::max(body.width, body.height) * body.nova_initial_scale *
+                                body.nova_growth * presentationScale * (0.8 + age * 2.5);
+        impl.quad(position, {diameter, diameter}, 3, {1.0F, 0.85F, 0.61F, 0.90F * fade * fade});
     };
 
     // Natural mouths obey the same layering as a manually triggered hole:
@@ -395,6 +444,9 @@ void CosmicRenderer::executeDraw(PHLMONITOR monitor, const Universe& universe,
         impl.quad(position, {diameter, diameter}, 2, {0.8F, 0.31F, 1.0F, 0.9F},
                   seconds * 0.6, 1, 0, 0, false, 0.035F, 1);
     }
+    for (const auto& body : universe.bodies())
+        if (body.region == view->id)
+            drawNovaHole(body, toPixel(body.position, body.region), visualScale * zoom(body.region), false);
 
     // Low-opacity velocity tails show orbital direction without cloning apps.
     for (const auto& body : universe.bodies()) {
@@ -432,6 +484,13 @@ void CosmicRenderer::executeDraw(PHLMONITOR monitor, const Universe& universe,
         // The foreground accent is only the luminous rim, never a black disk.
         impl.quad(position, {diameter, diameter}, 2, {0.8F, 0.31F, 1.0F, 0.7F},
                   seconds * 0.6, 1, 0, 0, false, 0.035F, 0);
+    }
+    for (const auto& body : universe.bodies()) {
+        if (body.region != view->id) continue;
+        const auto position = toPixel(body.position, body.region);
+        const double scale = visualScale * zoom(body.region);
+        drawNovaHole(body, position, scale, true);
+        drawNovaFlash(body, position, scale);
     }
     for (const auto& wave : universe.waves()) {
         if (wave.region != view->id) continue;
@@ -507,6 +566,11 @@ void CosmicRenderer::executeDraw(PHLMONITOR monitor, const Universe& universe,
                           {palette[0], palette[1], palette[2], foreground ? 0.65F : 0.95F},
                           hole.angle, 1, 0, 0, false, 0.04F, foreground ? 0 : 1);
             }
+            for (const auto& body : universe.bodies()) {
+                if (body.region != inset->region.id) continue;
+                drawNovaHole(body, peerPixel(body.position), peerScale, foreground);
+                if (foreground) drawNovaFlash(body, peerPixel(body.position), peerScale);
+            }
         }
         for (const auto& wave : universe.waves()) {
             if (wave.region != inset->region.id) continue;
@@ -542,5 +606,6 @@ void CosmicRenderer::release() {
 }
 
 const std::string& CosmicRenderer::error() const { return m_impl->error; }
+uint64_t CosmicRenderer::frameCount() const { return m_impl->renderFrames; }
 
 } // namespace cosmic

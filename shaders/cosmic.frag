@@ -153,8 +153,13 @@ void main() {
     } else if (uMode == 1) {
         if (any(lessThan(vUV, vec2(0.0))) || any(greaterThan(vUV, vec2(1.0)))) discard;
         vec4 texel = texture(uTexture, vUV);
-        // Captured framebuffer pixels already use premultiplied alpha.
-        fragColor = texel * uColor.a;
+        // Captured framebuffer pixels already use premultiplied alpha. The
+        // nova tint must keep transparent texels transparent, including its
+        // faint emissive red component; white/zero phase is an exact identity.
+        vec3 tinted = texel.rgb * uColor.rgb;
+        vec3 emission = vec3(0.16, 0.012, 0.004) * texel.a * clamp(uPhase, 0.0, 1.0);
+        tinted += min(emission, max(vec3(texel.a) - tinted, vec3(0.0)));
+        fragColor = vec4(tinted, texel.a) * uColor.a;
     } else if (uMode == 2) {
         float r = length(vLocal) * 2.0;
         float a = atan(vLocal.y, vLocal.x);
@@ -170,6 +175,13 @@ void main() {
         fragColor = vec4(color, alpha);
     } else if (uMode == 4) {
         fragColor = vec4(uColor.rgb * uColor.a, uColor.a);
+    } else if (uMode == 5) {
+        // A soft rounded-rectangle corona around a charging window. It is a
+        // single quad, not a blur pass or additional captured texture.
+        vec2 p = abs(vLocal) * 2.0;
+        float edge = length(max(p - vec2(0.60), vec2(0.0)));
+        float alpha = exp(-pow((edge - 0.16) / 0.18, 2.0)) * uColor.a;
+        fragColor = vec4(uColor.rgb * alpha, alpha);
     } else {
         float r = length(vLocal) * 2.0;
         float alpha = exp(-r * r * 5.0) * uColor.a;

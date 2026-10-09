@@ -107,6 +107,11 @@ struct Settings {
     std::array<float, 4> sky = {0.0F, 0.0F, 640.0F, 360.0F};
     std::array<float, 4> clip = {0.0F, 0.0F, 640.0F, 360.0F};
     std::array<float, 4> clear = {0.7F, 0.2F, 0.5F, 1.0F};
+    int mode = 0;
+    float phase = 0.0F;
+    std::array<float, 4> color = {1, 1, 1, 1};
+    std::array<float, 4> crop = {0, 0, 1, 1};
+    std::array<Pixel, 16> capture{};
 };
 
 class Renderer {
@@ -137,6 +142,7 @@ class Renderer {
         glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), nullptr);
         glGenFramebuffers(1, &framebuffer);
         glGenTextures(2, textures.data());
+        glGenTextures(1, &captureTexture);
         glUseProgram(program);
         // Projection and quad conventions are the same as the compositor pass.
         constexpr std::array<float, 9> projection = {2, 0, 0, 0, 2, 0, -1, -1, 1};
@@ -147,10 +153,12 @@ class Renderer {
         glUniform1f(uniform("uBend"), 0);
         glUniform4f(uniform("uCrop"), 0, 0, 1, 1);
         glUniform1i(uniform("uMode"), 0);
+        glUniform1i(uniform("uTexture"), 0);
         check(glGetError() == GL_NO_ERROR, "shader and quad initialization has no GL errors");
     }
     ~Renderer() {
         glDeleteTextures(2, textures.data());
+        glDeleteTextures(1, &captureTexture);
         glDeleteFramebuffers(1, &framebuffer);
         glDeleteBuffers(1, &vbo);
         glDeleteVertexArrays(1, &vao);
@@ -195,6 +203,21 @@ class Renderer {
         glUniform1ui(uniform("uSeed"), settings.seed);
         glUniform4fv(uniform("uSkyViewport"), 1, settings.sky.data());
         glUniform4fv(uniform("uClip"), 1, settings.clip.data());
+        glUniform1i(uniform("uMode"), settings.mode);
+        glUniform4fv(uniform("uColor"), 1, settings.color.data());
+        glUniform1f(uniform("uPhase"), settings.phase);
+        glUniform1f(uniform("uRadius"), 0.035F);
+        glUniform4fv(uniform("uCrop"), 1, settings.crop.data());
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, captureTexture);
+        if (settings.mode == 1) {
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 4, 4, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                         settings.capture.data());
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        }
         glDrawArrays(GL_TRIANGLES, 0, 6);
         Frame frame;
         frame.normal = read(GL_COLOR_ATTACHMENT0, settings.width, settings.height);
@@ -217,8 +240,63 @@ class Renderer {
         return result;
     }
     GLuint program = 0, vao = 0, vbo = 0, framebuffer = 0;
+    GLuint captureTexture = 0;
     std::array<GLuint, 2> textures{};
 };
+
+void novaTintAndTileCrop(Renderer& renderer) {
+    Settings settings;
+    settings.width = settings.height = 64;
+    settings.sky = settings.clip = {0, 0, 64, 64};
+    settings.clear = {0, 0, 0, 0};
+    settings.mode = 1;
+    const Pixel original{64, 96, 120, 128};
+    settings.capture.fill(original);
+    const auto untouched = renderer.draw(settings).normal;
+    check(std::ranges::all_of(untouched.pixels, [&](const Pixel& p) { return p == original; }),
+          "white captured-window color and zero nova heat preserve every premultiplied pixel");
+    settings.phase = 1;
+    settings.color = {1, 0.18F, 0.10F, 1};
+    const auto charged = renderer.draw(settings).normal;
+    const auto& red = charged.at(32, 32);
+    check(red[0] > original[0] && red[1] < original[1] / 3 && red[2] < original[2] / 3,
+          "nova charge produces actual red captured-window pixels, not only a surrounding effect");
+    check(red[3] == original[3], "nova tint and emissive red preserve captured alpha");
+    settings.color[3] = 0.5F;
+    const auto faded = renderer.draw(settings).normal;
+    check(faded.at(32, 32)[3] == 64, "fragment fade halves captured alpha");
+    check(std::ranges::all_of(faded.pixels, [](const Pixel& p) {
+        return p[0] <= p[3] && p[1] <= p[3] && p[2] <= p[3];
+    }), "nova tint and fragment fade keep RGB premultiplied by alpha");
+    settings.capture.fill(Pixel{0, 0, 0, 0});
+    const auto transparent = renderer.draw(settings).normal;
+    check(std::ranges::all_of(transparent.pixels, [](const Pixel& p) { return p == Pixel{0, 0, 0, 0}; }),
+          "emissive nova tint cannot make a transparent source texel visible");
+
+    settings.phase = 0;
+    settings.color = {1, 1, 1, 1};
+    for (int row = 0; row < 4; ++row)
+        for (int column = 0; column < 4; ++column)
+            settings.capture[row * 4 + column] = Pixel{
+                std::uint8_t(30 + 50 * column), std::uint8_t(25 + 50 * row),
+                std::uint8_t(20 + 10 * (row * 4 + column)), 255};
+    for (int row = 0; row < 4; ++row)
+        for (int column = 0; column < 4; ++column) {
+            settings.crop = {column * 0.25F, row * 0.25F, 0.25F, 0.25F};
+            const auto tile = renderer.draw(settings).normal;
+            const auto expected = settings.capture[row * 4 + column];
+            check(std::ranges::all_of(tile.pixels, [&](const Pixel& p) { return p == expected; }),
+                  "each of sixteen UV crops displays only its own source tile from one shared image");
+        }
+    settings.mode = 5;
+    settings.color = {1, 0.13F, 0.035F, 0.35F};
+    const auto corona = renderer.draw(settings).normal;
+    check(std::ranges::any_of(corona.pixels, [](const Pixel& p) { return p[0] > 20 && p[3] > 20; }),
+          "charging corona is rendered as visible red pixels");
+    check(std::ranges::all_of(corona.pixels, [](const Pixel& p) {
+        return p[0] <= p[3] && p[1] <= p[3] && p[2] <= p[3];
+    }), "charging corona remains premultiplied for compositor blending");
+}
 
 std::vector<bool> starMask(const Image& stars, const Image& base) {
     check(stars.width == base.width && stars.height == base.height, "star masks compare equal-sized canvases");
@@ -630,6 +708,7 @@ int main() {
         logicalDpiAndInset(renderer);
         meteorLifecycle(renderer);
         meteorVariety(renderer);
+        novaTintAndTileCrop(renderer);
         std::cout << "starfield: " << assertions << " rendered-pixel checks passed\n";
         return EXIT_SUCCESS;
     } catch (const Unavailable& error) {

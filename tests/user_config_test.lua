@@ -56,6 +56,8 @@ local function run()
             "a real configuration accepts an explicit twenty- or sixty-second delay")
         check(options.rendering.hide_desktop_ui and options.effects.orbit,
             "partial user configuration preserves the validated public defaults")
+        check(options.max_windows == 24 and options.max_objects == 64,
+            "existing user configuration inherits the independent persistent-object budget")
     end
     local path = fixture([[assert(_G == _ENV and type(math.sqrt) == "function")
 return { idle_timeout = math.floor(20.9), rendering = { stars = 7, hide_desktop_ui = false },
@@ -66,6 +68,27 @@ return { idle_timeout = math.floor(20.9), rendering = { stars = 7, hide_desktop_
     check(custom.rendering.stars == 7 and not custom.rendering.hide_desktop_ui and
         not custom.effects.orbit and not custom.controls.preview and custom.effects.binary,
         "nested user configuration is fully normalized rather than returned as a raw patch")
+    local stellar, stellar_error, stellar_found = UserConfig.load(fixture([[
+return { max_windows = 32, max_objects = 96,
+         stellar = { automatic = false, interval_min = 150, interval_max = 250,
+                     charge_seconds = 5, fragment_seconds = 6, fragments = 4 },
+         controls = { stellar_nova = "F4" } }
+]]))
+    check(stellar and not stellar_error and stellar_found and not stellar.stellar.automatic and
+        stellar.stellar.interval_min == 150 and stellar.stellar.interval_max == 250 and
+        stellar.stellar.charge_seconds == 5 and stellar.stellar.fragment_seconds == 6 and
+        stellar.stellar.fragments == 4 and stellar.stellar.growth == 1.7 and
+        stellar.controls.stellar_nova == "F4" and stellar.controls.supernova == "F9",
+        "the dedicated configuration file can tune cinematic explosions and its manual control independently")
+    check(stellar.max_windows == 32 and stellar.max_objects == 96,
+        "a real user configuration can independently tune capture and persistent-object limits")
+    for _, count in ipairs({16, 128}) do
+        local limits, limits_error, limits_found = UserConfig.load(fixture(
+            "return { max_objects = " .. count .. " }"))
+        check(limits and limits.max_objects == count and limits.max_windows == 24 and
+            limits_error == nil and limits_found,
+            "the dedicated configuration accepts total object limit boundaries")
+    end
 
     rejected(fixture("return { idle_timeout = "), "syntax error")
     rejected(fixture("error('fixture execution error')"), "execution failed")
@@ -75,8 +98,16 @@ return { idle_timeout = math.floor(20.9), rendering = { stars = 7, hide_desktop_
     for _, source in ipairs({
         "return { unknown = true }", "return { idle_timeout = 0 }",
         "return { idle_timeout = math.huge }", "return { idle_timeout = 0/0 }",
+        "return { max_objects = 15 }", "return { max_objects = 129 }",
+        "return { max_objects = 64.5 }", "return { max_objects = '64' }",
+        "return { max_objects = math.huge }", "return { max_objects = 0/0 }",
         "return { rendering = { hide_desktop_ui = 'true' } }",
         "return { controls = { preview = 'F6' } }",
+        "return { controls = { stellar_nova = 'F9' } }",
+        "return { stellar = { fragments = 8 } }",
+        "return { stellar = { interval_min = 140, interval_max = 130 } }",
+        "return { stellar = { charge_seconds = 0.49 } }",
+        "return { stellar = { automatic = 'false' } }",
         "return { controls = { preview = 'SUPER+ALT+C', emergency = 'ALT+SUPER+C' } }",
         "return { exclusions = { classes = {[2] = 'game'} } }",
     }) do rejected(fixture(source), "invalid configuration") end

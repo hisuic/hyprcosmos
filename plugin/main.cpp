@@ -364,7 +364,7 @@ Clock::time_point lastInput = Clock::now(), lastTick = lastInput, lastCapture = 
         snapshotBytes = 0;
         std::vector<Body> bodies;
         for (const auto& window : Desktop::windowState()->windows()) {
-            if (bodies.size() >= options.physics.max_bodies) break;
+            if (bodies.size() >= std::min(options.physics.max_bodies, options.physics.max_objects)) break;
             if (!window->m_isMapped || window->isHidden() || !g_pHyprRenderer->shouldRenderWindow(window)) continue;
             Snapshot shot;
             if (capture(window, shot)) {
@@ -389,6 +389,10 @@ Clock::time_point lastInput = Clock::now(), lastTick = lastInput, lastCapture = 
         if (snapshots.empty()) return;
         refreshIndex %= snapshots.size();
         auto& old = snapshots[refreshIndex++];
+        const auto body = std::ranges::find_if(universe.bodies(), [&](const Body& item) { return item.id == old.id; });
+        // All fragments share the last pre-burst framebuffer. Keep it alive
+        // for reverse playback without allocating a separate image per tile.
+        if (body != universe.bodies().end() && body->nova_age >= body->nova_charge_seconds) return;
         auto window = old.window.lock();
         if (!window || !window->m_isMapped || window->isHidden()) return;
         auto monitor = window->m_monitor.lock();
@@ -422,7 +426,12 @@ Clock::time_point lastInput = Clock::now(), lastTick = lastInput, lastCapture = 
             if (std::ranges::any_of(snapshots, [&](const auto& shot) { return shot.id == window->m_stableID; })) continue;
             Snapshot shot;
             if (capture(window, shot)) {
-                universe.addBody(bodyFor(shot), true);
+                if (!universe.addBody(bodyFor(shot), true)) {
+                    // A real application must not become a hidden orphan just
+                    // because debris already reserves all virtual slots.
+                    stop("new window exceeds celestial capacity");
+                    return;
+                }
                 snapshots.push_back(std::move(shot));
             }
         }
@@ -559,6 +568,10 @@ Clock::time_point lastInput = Clock::now(), lastTick = lastInput, lastCapture = 
             if (const auto location = actionLocation())
                 universe.supernova(universe.screenToWorld(location->first, location->second), location->second);
         }
+        else if (name == "stellar_nova") {
+            if (const auto location = actionLocation())
+                universe.startStellarNova(location->first, location->second);
+        }
         damage();
     }
 };
@@ -608,11 +621,11 @@ int setup(lua_State* L) {
         next.fps = number(L, 1, "fps", 60, 10, 120);
         next.snapshotHz = number(L, 1, "snapshot_hz", 4, .25, 30);
         next.physics.max_bodies = static_cast<std::size_t>(number(L, 1, "max_windows", 24, 1, 48));
+        next.physics.max_objects = static_cast<std::size_t>(number(L, 1, "max_objects", 64, 16, 128));
         next.physics.seed = static_cast<uint64_t>(number(L, 1, "seed", 12606492, 0, 4294967295.0));
         next.physics.history_seconds = number(L, 1, "history_seconds", 12, .1, 60);
         next.physics.history_hz = number(L, 1, "history_hz", 30, 1, 60);
-        const auto historyBytes = number(L, 1, "history_mb", 16, 1, 64) * 1024 * 1024;
-        next.physics.history_seconds = std::min(next.physics.history_seconds, historyBytes / (sizeof(Body) * next.physics.max_bodies * next.physics.history_hz));
+        next.physics.history_bytes = static_cast<std::size_t>(number(L, 1, "history_mb", 16, 1, 64) * 1024 * 1024);
         lua_getfield(L, 1, "effects");
         if (lua_istable(L, -1)) {
             int t = lua_gettop(L);
@@ -620,6 +633,20 @@ int setup(lua_State* L) {
             EFFECT(cursor_gravity); EFFECT(orbit); EFFECT(binary); EFFECT(collisions); EFFECT(black_hole);
             EFFECT(spaghetti); EFFECT(wormholes); EFFECT(supernova); EFFECT(expansion); EFFECT(rewind);
 #undef EFFECT
+        }
+        lua_pop(L, 1);
+        lua_getfield(L, 1, "stellar");
+        if (lua_istable(L, -1)) {
+            const int t = lua_gettop(L);
+            next.physics.stellar_automatic = boolean(L, t, "automatic", true);
+            next.physics.stellar_interval_min = number(L, t, "interval_min", 70, 5, 1800);
+            next.physics.stellar_interval_max = number(L, t, "interval_max", 130, next.physics.stellar_interval_min, 1800);
+            next.physics.stellar_charge_seconds = number(L, t, "charge_seconds", 3.5, .5, 15);
+            next.physics.stellar_fragment_seconds = number(L, t, "fragment_seconds", 3, 1, 8);
+            next.physics.stellar_growth = number(L, t, "growth", 1.7, 1.05, 2.5);
+            const auto fragments = number(L, t, "fragments", 16, 4, 16);
+            if (fragments != 4 && fragments != 16) throw std::invalid_argument("stellar.fragments must be 4 or 16");
+            next.physics.stellar_fragments = static_cast<std::size_t>(fragments);
         }
         lua_pop(L, 1);
         lua_getfield(L, 1, "physics");
@@ -735,6 +762,14 @@ int status(lua_State* L) {
     auto n = [&](const char* k, std::size_t v) { lua_pushinteger(L, static_cast<lua_Integer>(v)); lua_setfield(L, -2, k); };
     b("enabled", instance->options.enabled); b("initialized", instance->initialized); b("active", instance->active); b("rewinding", instance->universe.rewinding());
     n("bodies", instance->universe.bodies().size()); n("snapshots", instance->snapshots.size()); n("snapshot_bytes", instance->snapshotBytes);
+    n("object_count", instance->universe.objectCount());
+    n("reserved_object_count", instance->universe.reservedObjectCount());
+    n("max_objects", instance->options.physics.max_objects);
+    n("render_frames", instance->renderer.frameCount());
+    n("fragments", std::ranges::count_if(instance->universe.bodies(), [](const Body& body) { return body.fragment_grid > 0; }));
+    const auto location = instance->active ? instance->actionLocation() : std::nullopt;
+    const uint64_t hovered = location ? instance->universe.hitTest(location->first, location->second) : 0;
+    lua_pushinteger(L, static_cast<lua_Integer>(hovered)); lua_setfield(L, -2, "hovered_id");
     n("history_frames", instance->universe.historyFrames()); n("history_limit", instance->universe.historyLimit()); n("input_watchers", instance->listeners.size()); n("physics_steps", instance->physicsSteps);
     n("stored", std::ranges::count_if(instance->universe.bodies(), [](const auto& body) { return body.stored; }));
     n("particles", instance->universe.particles().size()); n("waves", instance->universe.waves().size());
@@ -760,10 +795,28 @@ int status(lua_State* L) {
         lua_newtable(L);
         auto value = [&](const char* key, double number) { lua_pushnumber(L, number); lua_setfield(L, -2, key); };
         const auto display = instance->universe.worldToScreen(body.position, body.region);
-        value("id", body.id); value("x", display.x); value("y", display.y);
+        // Lua integers preserve all identity bits; double diagnostics would
+        // collapse adjacent high-range synthetic fragment IDs into one value.
+        lua_pushinteger(L, static_cast<lua_Integer>(body.id)); lua_setfield(L, -2, "id");
+        value("x", display.x); value("y", display.y);
+        lua_pushinteger(L, static_cast<lua_Integer>(body.source_id)); lua_setfield(L, -2, "source_id");
+        value("width", body.width); value("height", body.height);
+        value("velocity_x", body.velocity.x); value("velocity_y", body.velocity.y);
+        value("fragment_grid", body.fragment_grid);
+        value("fragment_column", body.fragment_column); value("fragment_row", body.fragment_row);
+        value("fragment_age", body.fragment_age);
+        lua_pushboolean(L, body.fragment_grid > 0); lua_setfield(L, -2, "fragment");
         value("angle", body.angle); value("scale", body.scale); value("stretch", body.stretch);
         value("twist", body.twist); value("region", body.region); value("sink_progress", body.sink_progress);
         value("portal_progress", body.portal_progress);
+        value("nova_age", body.nova_age);
+        value("nova_charge_seconds", body.nova_charge_seconds);
+        value("nova_fragment_seconds", body.nova_fragment_seconds);
+        value("nova_growth", body.nova_growth);
+        value("nova_grid", body.nova_grid);
+        value("nova_fragment_count", instance->universe.novaFragments(body).size());
+        lua_pushboolean(L, body.nova_age >= body.nova_charge_seconds && instance->options.physics.black_hole);
+        lua_setfield(L, -2, "nova_remnant");
         value("portal_source_region", body.portal_source_region);
         value("portal_destination_region", body.portal_destination_region);
         value("portal_entry_duration", body.portal_entry_duration);
