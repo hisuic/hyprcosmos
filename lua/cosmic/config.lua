@@ -24,6 +24,12 @@ M.defaults = {
         restitution = 0.68, collision_strength = 0.35, expansion_rate = 0.006,
         sink_duration = 2.8, wormhole_cooldown = 2, explosion_strength = 320,
     },
+    -- Cinematic window explosions are deliberately rare. F5 can select a
+    -- drifting window manually even when automatic explosions are disabled.
+    stellar = {
+        automatic = true, interval_min = 70, interval_max = 130,
+        charge_seconds = 3.5, fragment_seconds = 3, fragments = 16, growth = 1.7,
+    },
     exclusions = {
         fullscreen = true, idle_inhibit = true, screenshare = true,
         classes = { "^steam_app_", "^steam$", "^gamescope$", "^mpv$" },
@@ -39,7 +45,7 @@ M.defaults = {
     -- Dedicated keys avoid modifier preambles: ordinary modifier presses must
     -- restore immediately, including modifiers used by input methods.
     controls = {
-        gravity = "F6", black_hole = "F7", rewind = "F8", supernova = "F9",
+        stellar_nova = "F5", gravity = "F6", black_hole = "F7", rewind = "F8", supernova = "F9",
         region = "F10", preview = "F11", emergency = "F12",
     },
 }
@@ -60,6 +66,9 @@ local ranges = {
     ["physics.expansion_rate"] = { 0, 0.1 }, ["physics.sink_duration"] = { 0.3, 20 },
     ["physics.wormhole_cooldown"] = { 0.2, 10 },
     ["physics.explosion_strength"] = { 0, 3000 },
+    ["stellar.interval_min"] = { 5, 1800 }, ["stellar.interval_max"] = { 5, 1800 },
+    ["stellar.charge_seconds"] = { 0.5, 15 }, ["stellar.fragment_seconds"] = { 1, 8 },
+    ["stellar.growth"] = { 1.05, 2.5 },
     ["rendering.particles"] = { 0, 384, true },
     ["rendering.stars"] = { 0, 1024, true }, ["rendering.background"] = { 0, 1 },
     ["rendering.snapshot_mb"] = { 16, 512 },
@@ -112,6 +121,9 @@ local function validate(value, expected, path)
         return
     end
     if type(value) ~= type(expected) then fail(path, "must be a " .. type(expected)) end
+    if path == "stellar.fragments" and value ~= 4 and value ~= 16 then
+        fail(path, "must be 4 or 16")
+    end
     local range = ranges[path]
     if range and (value ~= value or value == math.huge or value == -math.huge or
         value < range[1] or value > range[2] or (range[3] and value % 1 ~= 0)) then
@@ -157,6 +169,9 @@ function M.normalize(options, previous, defer_inherited_controls)
     end
     local ok, message = pcall(merge, result, patch, M.defaults, "")
     if not ok then return nil, message end
+    if result.stellar.interval_min > result.stellar.interval_max then
+        return nil, "cosmic: stellar.interval_min must not exceed stellar.interval_max"
+    end
     local used = {}
     for action, chord in pairs(result.controls) do
         if chord then
