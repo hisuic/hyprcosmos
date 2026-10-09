@@ -71,8 +71,28 @@ local function bind_controls()
     if not options.enabled then return true end
     for action, chord in pairs(options.controls) do
         if chord then
-            local ok, binding, bind_error = pcall(hl.bind, chord, function() M.action(action) end,
-                { description = "Cosmic: " .. action, submap_universal = true })
+            local bind_options = { description = "Cosmic: " .. action, submap_universal = true }
+            local callback = function() M.action(action) end
+            if action == "stellar_nova" then
+                -- Hyprland efb5099 LuaBindingsRegistration.cpp reads the
+                -- callback's { ok, pass_event }; KeybindManager.cpp consumes an
+                -- auto_consuming bind only on success. No polling timer or
+                -- synthetic key forwarding is needed, and ordinary F5 retains
+                -- both its press and release outside Cosmic.
+                bind_options.auto_consuming = true
+                callback = function()
+                    local status = call("status")
+                    if not initialized or stopped or not options.enabled or
+                        type(status) ~= "table" or status.active ~= true then
+                        return { ok = false, pass_event = true }
+                    end
+                    -- An empty target is still a Cosmic control: never refresh
+                    -- a hidden browser just because no window was selected.
+                    M.action(action)
+                    return { ok = true }
+                end
+            end
+            local ok, binding, bind_error = pcall(hl.bind, chord, callback, bind_options)
             if not ok or binding == nil then
                 remove_bindings()
                 return nil, "could not register control '" .. chord .. "': " .. tostring(bind_error or binding)
