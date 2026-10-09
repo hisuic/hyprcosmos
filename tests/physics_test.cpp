@@ -34,6 +34,7 @@ Config inert() {
     Config config;
     config.cursor_gravity = config.orbit = config.binary = config.collisions = false;
     config.expansion = config.wormholes = false;
+    config.stellar_automatic = false;
     config.damping = 0.0;
     return config;
 }
@@ -51,6 +52,17 @@ void checkFinite(const Universe& universe) {
         check(std::isfinite(current.portal_progress) && current.portal_progress >= 0.0 && current.portal_progress <= 1.0 &&
               std::isfinite(current.portal_arc) && std::isfinite(current.portal_entry_duration) &&
               std::isfinite(current.portal_exit_duration), "automatic portal seeds and phase stay finite and bounded");
+        check(std::isfinite(current.nova_age) && std::isfinite(current.nova_charge_seconds) &&
+              std::isfinite(current.nova_fragment_seconds) && std::isfinite(current.nova_initial_scale) &&
+              std::isfinite(current.nova_growth) && std::isfinite(current.nova_camera_zoom),
+              "stellar nova seeds and phase remain finite");
+        const auto fragments = universe.novaFragments(current);
+        check(fragments.size() <= 16, "one stellar source never generates more than 16 fragments");
+        for (const auto& fragment : fragments)
+            check(std::isfinite(fragment.position.x) && std::isfinite(fragment.position.y) &&
+                  std::isfinite(fragment.angle) && std::isfinite(fragment.scale) && fragment.scale >= 0.0 &&
+                  std::isfinite(fragment.alpha) && fragment.alpha >= 0.0 && fragment.alpha <= 1.0,
+                  "fragment kinematics and opacity stay finite and bounded");
         check(magnitude(current.velocity) <= universe.config().max_speed + 1e-6, "speed cap enforced");
     }
     for (const auto& camera : universe.cameras())
@@ -641,6 +653,436 @@ void supernovaAndCaps() {
     check(universe.historyFrames() == 0, "disabling rewind releases history");
 }
 
+void compareNovaFragments(const Universe& first, const Universe& second, const Body& a, const Body& b) {
+    const auto expected = first.novaFragments(a), actual = second.novaFragments(b);
+    check(expected.size() == actual.size(), "seeded stellar playback preserves fragment count");
+    for (std::size_t index = 0; index < expected.size(); ++index) {
+        const auto& left = expected[index];
+        const auto& right = actual[index];
+        check(left.column == right.column && left.row == right.row && left.grid == right.grid &&
+              magnitude(left.position - right.position) < 1e-7 && close(left.angle, right.angle) &&
+              close(left.scale, right.scale) && close(left.alpha, right.alpha),
+              "rewound fragment geometry, spin and fade replay identically");
+    }
+}
+
+void cinematicStellarNova() {
+    const Vec2 center{960.0, 540.0};
+    for (const std::size_t count : {4U, 16U}) {
+        auto config = inert();
+        config.stellar_fragments = count;
+        config.stellar_charge_seconds = 1.0;
+        config.stellar_fragment_seconds = 1.5;
+        config.stellar_growth = 1.7;
+        Universe universe(config);
+        Body target = body(1, center, {40.0, -20.0});
+        target.width = 800.0;
+        target.height = 400.0;
+        target.angle = 0.4;
+        target.stretch = 1.3;
+        target.twist = 0.2;
+        universe.reset({target, body(2, {1400.0, 700.0})}, {Region{}}, center);
+        const Body initial = universe.bodies()[0];
+        const Vec2 anchor = universe.worldToScreen(initial.position, initial.region);
+        check(!universe.startStellarNova(Vec2{30.0, 30.0}, 0), "F5 on empty sky does not select an unrelated window");
+        check(!universe.startStellarNova(anchor, 42), "F5 cannot select a window in a hidden virtual region");
+        check(universe.startStellarNova(anchor, 0), "F5 selection starts a stellar nova at the displayed window");
+        const Body started = universe.bodies()[0];
+        check(started.nova_age == 0.0 && !started.stored && close(started.scale, initial.scale) &&
+              magnitude(started.position - initial.position) < 1e-7 && close(started.angle, initial.angle),
+              "stellar activation preserves the currently displayed pose without a jump");
+        check(universe.novaFragments(started).empty(), "the charging image is not split before its burst");
+        check(!universe.startStellarNova(uint64_t{2}), "a second source cannot overlap a charging stellar event");
+        check(!universe.startBlackHole(anchor, 0), "F7 cannot interrupt a charging stellar source");
+        double previous_scale = initial.scale;
+        for (int frame = 0; frame < 119; ++frame) {
+            universe.step(1.0 / 120.0, {100.0, 100.0});
+            const Body current = universe.bodies()[0];
+            check(!current.stored && current.scale + 1e-12 >= previous_scale &&
+                  current.scale <= initial.scale * config.stellar_growth + 1e-7,
+                  "charging stellar image grows continuously within its configured size");
+            check(magnitude(current.position - initial.position) < 1e-7 &&
+                  magnitude(universe.worldToScreen(current.position, 0) - anchor) < 1e-7,
+                  "stellar charge remains anchored while the cursor moves");
+            check(universe.novaFragments(current).empty(), "stellar source remains intact throughout charge");
+            previous_scale = current.scale;
+        }
+        check(universe.bodies()[0].scale > initial.scale * 1.6, "late stellar charge visibly approaches its expanded size");
+        for (int frame = 0; frame < 3 && !universe.bodies()[0].stored; ++frame)
+            universe.step(1.0 / 120.0, center);
+        const Body burst = universe.bodies()[0];
+        check(burst.stored && close(burst.scale, 0.0) && burst.nova_age >= burst.nova_charge_seconds,
+              "burst virtually stores the intact image without removing its living app id");
+        check(!universe.particles().empty() && !universe.waves().empty(), "stellar burst emits the existing shockwave and particle effects");
+        check(!universe.startStellarNova(uint64_t{2}), "a second stellar event cannot overlap flying fragments");
+        check(!universe.startStellarNova(uint64_t{1}), "an exploded source cannot explode again");
+        const auto fragments = universe.novaFragments(burst);
+        const std::size_t grid = count == 4 ? 2 : 4;
+        check(fragments.size() == count && burst.nova_grid == grid, "configured 4 or 16 split yields the expected square tile grid");
+        bool seen[4][4]{};
+        Body exact_burst = burst;
+        exact_burst.nova_age = exact_burst.nova_charge_seconds;
+        for (const auto& fragment : universe.novaFragments(exact_burst)) {
+            check(fragment.grid == grid && fragment.column < grid && fragment.row < grid,
+                  "each fragment identifies a bounded crop from the shared source image");
+            check(!seen[fragment.row][fragment.column], "each image crop appears exactly once");
+            seen[fragment.row][fragment.column] = true;
+            const Vec2 offset{
+                (static_cast<double>(fragment.column) + 0.5 - static_cast<double>(grid) * 0.5) *
+                    burst.width * burst.nova_initial_scale * burst.nova_growth / static_cast<double>(grid),
+                (static_cast<double>(fragment.row) + 0.5 - static_cast<double>(grid) * 0.5) *
+                    burst.height * burst.nova_initial_scale * burst.nova_growth / static_cast<double>(grid)};
+            const Vec2 rotated{offset.x * std::cos(burst.angle) - offset.y * std::sin(burst.angle),
+                               offset.x * std::sin(burst.angle) + offset.y * std::cos(burst.angle)};
+            check(magnitude(fragment.position - burst.position - rotated) < 1e-7 && close(fragment.angle, burst.angle) &&
+                  close(fragment.alpha, 1.0), "the first fragment frame exactly reconstructs the expanded unwarped image");
+        }
+        advance(universe, 0.35, {1800.0, 900.0});
+        const auto flying = universe.novaFragments(universe.bodies()[0]);
+        check(flying.size() == count, "fragment tiles remain visible during their configured flight");
+        bool differing_rotation = false, differing_displacement = false;
+        const auto exact = universe.novaFragments(exact_burst);
+        for (std::size_t index = 1; index < flying.size(); ++index) {
+            differing_rotation |= !close(flying[index].angle, flying[0].angle);
+            differing_displacement |= !close(magnitude(flying[index].position - exact[index].position),
+                                              magnitude(flying[0].position - exact[0].position));
+        }
+        check(differing_rotation && differing_displacement, "fragment seeds produce varied spin and radial speeds rather than identical clones");
+        check(magnitude(universe.bodies()[0].position - initial.position) < 1e-7,
+              "the remnant hole stays at the actual explosion location while fragments fly");
+        advance(universe, 5.0);
+        const Body remnant = universe.bodies()[0];
+        check(remnant.stored && universe.novaFragments(remnant).empty() &&
+              close(remnant.nova_age, remnant.nova_charge_seconds + remnant.nova_fragment_seconds),
+              "expired fragments leave a fixed remnant with a bounded age and no retained particle state");
+        check(universe.bodies().size() == 2 && universe.bodies()[0].id == target.id,
+              "exploding the virtual image never removes or recreates the actual application id");
+        check(universe.startStellarNova(uint64_t{2}), "the next living source becomes available after previous fragments expire");
+        checkFinite(universe);
+    }
+
+    auto config = inert();
+    Universe universe(config);
+    Body unavailable = body(4, center);
+    unavailable.stored = true;
+    universe.reset({unavailable}, {Region{}}, center);
+    check(!universe.startStellarNova(uint64_t{4}) && !universe.startStellarNova(uint64_t{999}),
+          "stored and unknown app ids cannot become stellar sources");
+    universe.reset({body(4, center)}, {Region{}}, center);
+    check(universe.startBlackHole(center), "sink exclusion test starts a real cinematic sink");
+    check(!universe.startStellarNova(uint64_t{4}), "a sinking source is excluded from stellar selection");
+    config.wormholes = true;
+    universe.configure(config);
+    universe.reset({}, {Region{}}, center);
+    universe.reset({body(4, universe.wormholes().front().position)}, {Region{}}, center);
+    universe.step(1.0 / 120.0, center);
+    check(universe.bodies()[0].portal_progress > 0.0 && !universe.startStellarNova(uint64_t{4}),
+          "a source entering a natural wormhole cannot be selected for a stellar nova");
+    config = inert();
+    config.supernova = false;
+    universe.configure(config);
+    universe.reset({body(4, center)}, {Region{}}, center);
+    check(!universe.startStellarNova(uint64_t{4}), "disabling supernova effects also disables F5 stellar events");
+    config.supernova = true;
+    universe.configure(config);
+    advance(universe, 0.2);
+    universe.setRewinding(true);
+    check(universe.rewinding() && !universe.startStellarNova(uint64_t{4}), "reverse playback cannot initiate a new stellar event");
+
+    config.stellar_interval_min = std::numeric_limits<double>::quiet_NaN();
+    config.stellar_interval_max = -20.0;
+    config.stellar_charge_seconds = std::numeric_limits<double>::infinity();
+    config.stellar_fragment_seconds = -1.0;
+    config.stellar_growth = std::numeric_limits<double>::quiet_NaN();
+    config.stellar_fragments = 1000000;
+    universe.configure(config);
+    const Config normalized = universe.config();
+    check(std::isfinite(normalized.stellar_interval_min) && normalized.stellar_interval_min >= 5.0 &&
+          std::isfinite(normalized.stellar_interval_max) && normalized.stellar_interval_max >= normalized.stellar_interval_min &&
+          std::isfinite(normalized.stellar_charge_seconds) && normalized.stellar_charge_seconds > 0.0 &&
+          std::isfinite(normalized.stellar_fragment_seconds) && normalized.stellar_fragment_seconds > 0.0 &&
+          std::isfinite(normalized.stellar_growth) && normalized.stellar_growth >= 1.0 &&
+          (normalized.stellar_fragments == 4 || normalized.stellar_fragments == 16),
+          "invalid direct-native stellar configuration is normalized to finite bounded safe values");
+
+    for (const double cancel_time : {0.4, 1.4}) {
+        config = inert();
+        config.stellar_charge_seconds = 1.0;
+        config.stellar_fragment_seconds = 2.0;
+        universe.configure(config);
+        universe.reset({body(4, center)}, {Region{}}, center);
+        const double original_scale = universe.bodies()[0].scale;
+        check(universe.startStellarNova(uint64_t{4}), "stellar cancellation regression starts a selected source");
+        advance(universe, cancel_time);
+        config.supernova = false;
+        universe.configure(config);
+        const Body canceled = universe.bodies()[0];
+        check(canceled.nova_age < 0.0 && !canceled.stored && close(canceled.scale, original_scale) &&
+              universe.novaFragments(canceled).empty(), "disabling stellar effects cancels either charge or flying fragments and restores the living image");
+        universe.setRewinding(true);
+        advance(universe, 0.3);
+        check(universe.bodies()[0].nova_age < 0.0 && !universe.bodies()[0].stored &&
+              universe.novaFragments(universe.bodies()[0]).empty(), "historical stellar states cannot reactivate disabled supernova effects");
+    }
+}
+
+void stellarRemnantPhysics() {
+    const Vec2 center{960.0, 540.0};
+    auto config = inert();
+    config.stellar_charge_seconds = 0.5;
+    Universe universe(config);
+    universe.reset({body(1, center)}, {Region{}}, center);
+    check(universe.startStellarNova(uint64_t{1}), "remnant attraction test starts a stellar burst");
+    advance(universe, 0.6);
+    check(universe.bodies()[0].stored, "remnant physics begins only after the selected image bursts");
+    check(universe.addBody(body(2, center + Vec2{300.0, 0.0}), false), "another living image can approach the persistent remnant");
+    Universe disabled = universe;
+    auto no_hole = config;
+    no_hole.black_hole = false;
+    disabled.configure(no_hole);
+    advance(universe, 0.3);
+    advance(disabled, 0.3);
+    check(universe.bodies()[1].velocity.x < -0.1 && close(disabled.bodies()[1].velocity.x, 0.0),
+          "stellar remnant supplies softened attraction independently of cursor gravity and obeys the black-hole effect switch");
+    check(magnitude(universe.bodies()[0].position - center) < 1e-7 && universe.bodies()[1].sink_progress == 0.0,
+          "distant remnant attraction does not move the hole or instantly hide its neighbors");
+
+    config.fixed_step = 1.0 / 30.0;
+    config.max_speed = 5000.0;
+    config.cursor_strength = 0.0;
+    universe.configure(config);
+    universe.reset({body(1, center)}, {Region{}}, center);
+    check(universe.startStellarNova(uint64_t{1}), "swept remnant absorption regression starts its source");
+    advance(universe, 0.6);
+    check(universe.addBody(body(3, center - Vec2{70.0, 0.0}, {5000.0, 0.0}), false),
+          "a fast neighboring image approaches the remnant without a new-window explosion");
+    universe.step(1.0 / 30.0, center);
+    const Body falling = universe.bodies()[1];
+    check(falling.sink_progress > 0.0 && !falling.stored &&
+          magnitude(falling.sink_center - center) < 1e-7,
+          "swept remnant mouth detection starts a visible F7-style absorption even when both endpoints skip its center");
+    check(close(falling.scale, falling.original_scale), "remnant entry preserves the readable image at activation rather than making it disappear");
+    advance(universe, 8.0);
+    check(universe.bodies()[1].stored && universe.bodies().size() == 2,
+          "remnant absorption ends in virtual storage while preserving both actual living app ids");
+    checkFinite(universe);
+}
+
+void stellarNovaHistoryAndScheduler() {
+    const Vec2 center{960.0, 540.0};
+    auto config = inert();
+    config.stellar_charge_seconds = 1.0;
+    config.stellar_fragment_seconds = 2.0;
+    config.history_seconds = 10.0;
+    Universe universe(config);
+    Body clock_body = body(2, {2400.0, 350.0}, {12.0, 0.0});
+    clock_body.region = 42;
+    universe.reset({body(1, center), clock_body}, {Region{}, Region{42, 1920.0, 0.0, 1920.0, 1080.0}}, center);
+    check(universe.startStellarNova(uint64_t{1}), "stellar rewind test starts a selected living source");
+    advance(universe, 1.4);
+    Universe expected = universe;
+    const double clock = expected.bodies()[1].position.x;
+    check(!expected.novaFragments(expected.bodies()[0]).empty(), "recorded rewind checkpoint contains flying image fragments");
+    advance(universe, 1.0);
+    universe.setRewinding(true);
+    for (int frame = 0; frame < 100 && universe.bodies()[1].position.x > clock + 1e-7; ++frame)
+        universe.step(1.0 / config.history_hz, center);
+    check(close(universe.bodies()[1].position.x, clock) && close(universe.bodies()[0].nova_age, expected.bodies()[0].nova_age),
+          "rewind restores the recorded fragment age and living simulation clock");
+    compareNovaFragments(expected, universe, expected.bodies()[0], universe.bodies()[0]);
+    universe.setRewinding(false);
+    for (int frame = 0; frame < 240; ++frame) {
+        universe.step(1.0 / 120.0, center);
+        expected.step(1.0 / 120.0, center);
+        const Body replayed = universe.bodies()[0], original = expected.bodies()[0];
+        check(replayed.stored == original.stored && close(replayed.nova_age, original.nova_age) &&
+              replayed.nova_seed == original.nova_seed && magnitude(replayed.position - original.position) < 1e-7,
+              "forward stellar playback preserves remnant position, phase and seed after rewind");
+        compareNovaFragments(expected, universe, original, replayed);
+    }
+    universe.setRewinding(true);
+    for (int frame = 0; frame < 150 && universe.bodies()[0].stored; ++frame)
+        universe.step(1.0 / config.history_hz, center);
+    check(!universe.bodies()[0].stored && universe.bodies()[0].nova_age < universe.bodies()[0].nova_charge_seconds &&
+          universe.novaFragments(universe.bodies()[0]).empty(), "rewinding through the burst reassembles the intact charging window and removes its hole");
+    universe.removeBody(1);
+    advance(universe, 10.0);
+    check(universe.bodies().size() == 1 && universe.bodies()[0].id == 2,
+          "closed stellar apps and their fragment or hole state are never resurrected by history");
+
+    universe.configure(config);
+    universe.reset({body(1, center), clock_body, body(3, {1400.0, 540.0})},
+                   {Region{}, Region{42, 1920.0, 0.0, 1920.0, 1080.0}}, center);
+    check(universe.startStellarNova(uint64_t{1}), "pre-burst replay regression starts its selected source");
+    advance(universe, 0.4);
+    expected = universe;
+    const double before_burst_clock = expected.bodies()[1].position.x;
+    advance(universe, 1.1);
+    universe.setRewinding(true);
+    for (int frame = 0; frame < 100 && universe.bodies()[1].position.x > before_burst_clock + 1e-7; ++frame)
+        universe.step(1.0 / config.history_hz, center);
+    universe.setRewinding(false);
+    for (int frame = 0; frame < 160; ++frame) {
+        universe.step(1.0 / 120.0, center);
+        expected.step(1.0 / 120.0, center);
+        for (std::size_t index = 0; index < universe.bodies().size(); ++index)
+            check(magnitude(universe.bodies()[index].position - expected.bodies()[index].position) < 1e-7 &&
+                  magnitude(universe.bodies()[index].velocity - expected.bodies()[index].velocity) < 1e-7,
+                  "rewinding to charge preserves the exact seeded explosion impulse and remnant gravity on neighbors");
+        check(universe.particles().size() == expected.particles().size(), "replayed burst regenerates the same bounded particle count");
+        for (std::size_t index = 0; index < universe.particles().size(); ++index) {
+            const auto& actual_particle = universe.particles()[index];
+            const auto& expected_particle = expected.particles()[index];
+            check(magnitude(actual_particle.position - expected_particle.position) < 1e-7 &&
+                  magnitude(actual_particle.velocity - expected_particle.velocity) < 1e-7 &&
+                  close(actual_particle.life, expected_particle.life) && close(actual_particle.size, expected_particle.size),
+                  "rewind restores the RNG so burst particles replay with identical positions and lifetimes");
+        }
+    }
+
+    config.stellar_automatic = true;
+    config.stellar_interval_min = config.stellar_interval_max = 5.0;
+    Universe first(config), second(config);
+    const std::vector<Body> seeds{body(1, {750.0, 540.0}), body(2, {1100.0, 540.0}), body(3, {400.0, 300.0}, {12.0, 0.0})};
+    first.reset(seeds, {Region{}}, center);
+    second.reset(seeds, {Region{}}, center);
+    advance(first, 4.0);
+    advance(second, 4.0);
+    check(std::all_of(first.bodies().begin(), first.bodies().end(), [](const Body& current) { return current.nova_age < 0.0; }),
+          "automatic stellar explosions never begin before their minimum interval");
+    Universe automatic_checkpoint = first;
+    advance(first, 1.4);
+    advance(second, 1.4);
+    std::size_t charging = 0;
+    for (std::size_t index = 0; index < first.bodies().size(); ++index) {
+        const Body a = first.bodies()[index], b = second.bodies()[index];
+        charging += a.nova_age >= 0.0;
+        check(close(a.nova_age, b.nova_age) && a.nova_seed == b.nova_seed,
+              "identically seeded automatic schedules pick the same source and cinematic seed");
+    }
+    check(charging == 1, "automatic scheduler picks exactly one eligible source per event");
+    // The reset frame plus exact 30 Hz sampling makes the checkpoint's history
+    // size a clock unaffected by whichever moving source the scheduler chose.
+    first.setRewinding(true);
+    for (int frame = 0; frame < 100 && first.historyFrames() > automatic_checkpoint.historyFrames(); ++frame)
+        first.step(1.0 / config.history_hz, center);
+    first.setRewinding(false);
+    for (int frame = 0; frame < 180; ++frame) {
+        first.step(1.0 / 120.0, center);
+        automatic_checkpoint.step(1.0 / 120.0, center);
+        for (std::size_t index = 0; index < first.bodies().size(); ++index) {
+            const Body a = first.bodies()[index], b = automatic_checkpoint.bodies()[index];
+            check(close(a.nova_age, b.nova_age) && a.nova_seed == b.nova_seed && a.stored == b.stored,
+                  "rewind restores the automatic scheduler so future selection and timing replay identically");
+        }
+    }
+    Universe lonely(config);
+    lonely.reset({body(1, center)}, {Region{}}, center);
+    advance(lonely, 12.0);
+    check(lonely.bodies()[0].nova_age < 0.0 && !lonely.bodies()[0].stored,
+          "automatic stellar events preserve the last intact window instead of emptying the whole scene");
+    checkFinite(first);
+    checkFinite(lonely);
+}
+
+void stellarHistoryBudgetAndNewLivingIds() {
+    constexpr std::size_t mib = 1024U * 1024U;
+    auto config = inert();
+    config.max_bodies = 1;
+    config.history_seconds = 60.0;
+    config.history_hz = 60.0;
+    config.history_bytes = mib;
+    Universe budget(config);
+    budget.reset({body(1, {960.0, 540.0})}, {Region{}}, {});
+    // Each frame owns a body vector, scheduler fields and a complete RNG state;
+    // even this minimum excludes padding and therefore gives a safe upper
+    // bound, independent of private Frame layout changes.
+    const std::size_t minimum_frame_bytes = sizeof(Body) + sizeof(std::vector<Body>) +
+        2U * sizeof(double) + sizeof(uint64_t) + sizeof(std::mt19937_64);
+    const auto small_limit = budget.historyLimit();
+    check(small_limit >= 2 && small_limit <= mib / minimum_frame_bytes,
+          "a 1 MiB history budget accounts for per-frame RNG state and scheduler overhead, not only body storage");
+    check(small_limit < 350, "small histories cannot allocate all 3601 requested frames after stellar RNG snapshots grow");
+    advance(budget, 60.0);
+    check(budget.historyFrames() == small_limit, "a long-running 1 MiB history stops at its true memory-derived frame cap");
+    config.history_bytes = 2U * mib;
+    budget.configure(config);
+    check(budget.historyLimit() > small_limit && budget.historyLimit() <= 2U * mib / minimum_frame_bytes,
+          "raising the history budget permits more frames while preserving full snapshot memory accounting");
+    config.history_bytes = 0;
+    budget.configure(config);
+    check(budget.config().history_bytes == mib && budget.historyFrames() <= budget.historyLimit(),
+          "an invalid zero-byte history budget is safely clamped and immediately trims existing frames");
+    config.history_bytes = std::numeric_limits<std::size_t>::max();
+    budget.configure(config);
+    check(budget.config().history_bytes == 64U * mib, "native history memory is capped at 64 MiB even for extreme inputs");
+
+    config = inert();
+    config.black_hole = false;
+    config.stellar_charge_seconds = 1.0;
+    config.stellar_fragment_seconds = 1.0;
+    config.history_seconds = 8.0;
+    Universe universe(config);
+    universe.reset({body(1, {960.0, 540.0})}, {Region{}}, {});
+    check(universe.startStellarNova(uint64_t{1}), "new-id rewind regression starts the original stellar source");
+    advance(universe, 2.5);
+    check(universe.bodies()[0].stored && universe.novaFragments(universe.bodies()[0]).empty(),
+          "the original stellar event fully completes before another real app arrives");
+    check(universe.addBody(body(2, {1400.0, 700.0}), false) && universe.startStellarNova(uint64_t{2}),
+          "a later actual app may begin its own stellar event after the original fragments expire");
+    advance(universe, 0.2);
+    universe.setRewinding(true);
+    bool restored_original_charge = false;
+    for (int frame = 0; frame < 150 && universe.rewinding(); ++frame) {
+        universe.step(1.0 / config.history_hz, {});
+        std::size_t busy = 0;
+        for (const auto& current : universe.bodies())
+            busy += current.nova_age >= 0.0 && current.nova_age < current.nova_charge_seconds + current.nova_fragment_seconds;
+        check(busy <= 1, "rewinding before a later app's creation never overlays its future stellar charge on the historical one");
+        check(universe.bodies().size() == 2 && universe.bodies()[1].id == 2,
+              "rewind cancellation preserves the newer actual app id rather than deleting its living window");
+        if (universe.bodies()[0].nova_age >= 0.0 && universe.bodies()[0].nova_age < universe.bodies()[0].nova_charge_seconds) {
+            restored_original_charge = true;
+            check(universe.bodies()[1].nova_age < 0.0 && !universe.bodies()[1].stored,
+                  "a living app absent from the old snapshot resumes as an intact nonstellar image");
+            break;
+        }
+    }
+    check(restored_original_charge, "new-id regression really rewinds across creation into the earlier source's charge");
+    checkFinite(universe);
+}
+
+void stellarSchedulerAfterLongUptime() {
+    auto config = inert();
+    config.fixed_step = 1.0 / 30.0;
+    config.max_substeps = 1;
+    config.history_seconds = 0.0;
+    config.rewind = false;
+    config.max_particles = 0;
+    config.black_hole = false;
+    config.stellar_automatic = true;
+    config.stellar_interval_min = config.stellar_interval_max = 5.0;
+    Universe universe(config);
+    universe.reset({body(1, {750.0, 540.0})}, {Region{}}, {});
+    // Exercise actual integration beyond the presentation clock's ten-hour
+    // cap: passing one huge elapsed delta would intentionally discard the
+    // interval and would not test the scheduler's long-uptime behavior.
+    constexpr int frames = (36000 + 10) * 30;
+    for (int frame = 0; frame < frames; ++frame)
+        universe.step(config.fixed_step, {});
+    check(universe.bodies()[0].nova_age < 0.0 && universe.historyFrames() == 0,
+          "ten hours of lone-window uptime do not fabricate explosions or retained history");
+    check(universe.addBody(body(2, {1200.0, 540.0}), false), "another real image can arrive after ten hours of Cosmic uptime");
+    bool event_started = false;
+    for (int frame = 0; frame < 180 && !event_started; ++frame) {
+        universe.step(config.fixed_step, {});
+        event_started = std::any_of(universe.bodies().begin(), universe.bodies().end(),
+                                   [](const Body& current) { return current.nova_age >= 0.0; });
+    }
+    check(event_started, "automatic stellar countdown still fires after the capped ten-hour presentation clock stops advancing");
+    checkFinite(universe);
+}
+
 void expansionAndStress() {
     auto config = inert();
     config.expansion = true;
@@ -724,6 +1166,11 @@ int main() {
     blackHoleAndLivingHistory();
     cinematicBlackHole();
     supernovaAndCaps();
+    cinematicStellarNova();
+    stellarRemnantPhysics();
+    stellarNovaHistoryAndScheduler();
+    stellarHistoryBudgetAndNewLivingIds();
+    stellarSchedulerAfterLongUptime();
     expansionAndStress();
     std::cout << "Cosmic physics: " << assertions << " checks passed\n";
 }
