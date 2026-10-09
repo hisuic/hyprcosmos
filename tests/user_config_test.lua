@@ -66,6 +66,16 @@ return { idle_timeout = math.floor(20.9), rendering = { stars = 7, hide_desktop_
     check(custom.rendering.stars == 7 and not custom.rendering.hide_desktop_ui and
         not custom.effects.orbit and not custom.controls.preview and custom.effects.binary,
         "nested user configuration is fully normalized rather than returned as a raw patch")
+    local stellar, stellar_error, stellar_found = UserConfig.load(fixture([[
+return { stellar = { automatic = false, interval_min = 150, interval_max = 250,
+                     charge_seconds = 5, fragments = 4 }, controls = { stellar_nova = "F4" } }
+]]))
+    check(stellar and not stellar_error and stellar_found and not stellar.stellar.automatic and
+        stellar.stellar.interval_min == 150 and stellar.stellar.interval_max == 250 and
+        stellar.stellar.charge_seconds == 5 and stellar.stellar.fragment_seconds == 3 and
+        stellar.stellar.fragments == 4 and stellar.stellar.growth == 1.7 and
+        stellar.controls.stellar_nova == "F4" and stellar.controls.supernova == "F9",
+        "the dedicated configuration file can tune cinematic explosions and its manual control independently")
 
     rejected(fixture("return { idle_timeout = "), "syntax error")
     rejected(fixture("error('fixture execution error')"), "execution failed")
@@ -77,6 +87,11 @@ return { idle_timeout = math.floor(20.9), rendering = { stars = 7, hide_desktop_
         "return { idle_timeout = math.huge }", "return { idle_timeout = 0/0 }",
         "return { rendering = { hide_desktop_ui = 'true' } }",
         "return { controls = { preview = 'F6' } }",
+        "return { controls = { stellar_nova = 'F9' } }",
+        "return { stellar = { fragments = 8 } }",
+        "return { stellar = { interval_min = 140, interval_max = 130 } }",
+        "return { stellar = { charge_seconds = 0.49 } }",
+        "return { stellar = { automatic = 'false' } }",
         "return { controls = { preview = 'SUPER+ALT+C', emergency = 'ALT+SUPER+C' } }",
         "return { exclusions = { classes = {[2] = 'game'} } }",
     }) do rejected(fixture(source), "invalid configuration") end
