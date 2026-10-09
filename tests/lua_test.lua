@@ -60,6 +60,69 @@ end
 check(Config.normalize({ history_hz = 60 }).history_hz == 60 and
     not Config.normalize({ history_hz = 60.01 }), "history frequency matches the simulation's sixty Hz cap")
 
+local default_stellar = assert(Config.normalize())
+check(default_stellar.controls.stellar_nova == "F5" and default_stellar.controls.supernova == "F9",
+    "targeted cinematic explosions use F5 without changing F9's immediate shockwave")
+check(default_stellar.stellar.automatic and default_stellar.stellar.interval_min == 70 and
+    default_stellar.stellar.interval_max == 130 and default_stellar.stellar.charge_seconds == 3.5 and
+    default_stellar.stellar.fragment_seconds == 3 and default_stellar.stellar.fragments == 16 and
+    default_stellar.stellar.growth == 1.7,
+    "cinematic explosions default to rare automatic events, a visible charge and sixteen shared-image fragments")
+for _, boundary in ipairs({
+    { "interval_min", 5, 1800 }, { "interval_max", 5, 1800 },
+    { "charge_seconds", 0.5, 15 }, { "fragment_seconds", 1, 8 }, { "growth", 1.05, 2.5 },
+}) do
+    local name, low, high = boundary[1], boundary[2], boundary[3]
+    for _, value in ipairs({low, high}) do
+        local patch = { [name] = value }
+        if name == "interval_min" then patch.interval_max = 1800 end
+        if name == "interval_max" then patch.interval_min = 5 end
+        local stellar = assert(Config.normalize({ stellar = patch }))
+        check(stellar.stellar[name] == value, "stellar." .. name .. " retains its effective boundary")
+    end
+    for _, invalid in ipairs({low - 0.00001, high + 0.00001, 0 / 0, math.huge, -math.huge, "3"}) do
+        local stellar, message = Config.normalize({ stellar = { [name] = invalid } }, default_stellar)
+        check(stellar == nil and type(message) == "string" and message:find("stellar." .. name, 1, true),
+            "stellar." .. name .. " rejects invalid values with a precise path")
+    end
+end
+for _, count in ipairs({4, 16}) do
+    check(Config.normalize({ stellar = { fragments = count } }).stellar.fragments == count,
+        "four and sixteen fragment grids are supported without clamping")
+end
+for _, invalid in ipairs({0, 1, 8, 15, 17, 4.5, 0 / 0, math.huge, "16", false, {}}) do
+    local stellar, message = Config.normalize({ stellar = { fragments = invalid } })
+    check(not stellar and message:find("stellar.fragments", 1, true),
+        "only four or sixteen fragments are accepted")
+end
+for _, invalid in ipairs({0, 1, "false", {}}) do
+    local stellar, message = Config.normalize({ stellar = { automatic = invalid } })
+    check(not stellar and message:find("stellar.automatic", 1, true),
+        "automatic explosions require a boolean")
+end
+check(not Config.normalize({ stellar = { interval_min = 131 } }) and
+    not Config.normalize({ stellar = { interval_max = 69 } }),
+    "an inverted explosion interval is rejected after applying partial updates")
+local custom_stellar = assert(Config.normalize({ stellar = {
+    automatic = false, interval_min = 200, interval_max = 300, fragments = 4,
+} }))
+local partial_stellar = assert(Config.normalize({ stellar = { charge_seconds = 5 }, idle_timeout = 91 }, custom_stellar))
+check(not partial_stellar.stellar.automatic and partial_stellar.stellar.fragments == 4 and
+    partial_stellar.stellar.interval_min == 200 and partial_stellar.stellar.interval_max == 300 and
+    partial_stellar.stellar.charge_seconds == 5 and custom_stellar.stellar.charge_seconds == 3.5 and
+    partial_stellar.controls.stellar_nova == "F5",
+    "partial cinematic configuration preserves custom values, manual controls and prior immutable options")
+check(not Config.normalize({ stellar = { interval_min = 301 } }, custom_stellar) and
+    custom_stellar.stellar.interval_min == 200,
+    "invalid interval updates do not mutate the previously accepted settings")
+local demo_stellar = assert(Config.normalize({ preset = "demo" }, partial_stellar))
+check(not demo_stellar.stellar.automatic and demo_stellar.stellar.charge_seconds == 5 and
+    demo_stellar.stellar.fragments == 4,
+    "preset changes preserve deliberately configured cinematic timing and fragment count")
+check(not Config.normalize({ controls = { preview = "F5" } }) and
+    Config.normalize({ controls = { stellar_nova = false, preview = "F5" } }).controls.preview == "F5",
+    "the cinematic control participates in duplicate detection and can be explicitly disabled")
+
 local default_sky = assert(Config.normalize())
 check(default_sky.rendering.background == 1 and default_sky.rendering.stars == 240,
     "default cosmic sky fully covers the wallpaper with 240 ASCII stars")
@@ -137,7 +200,7 @@ check(explicit_demo_sky.rendering.background == 0.25 and explicit_demo_sky.rende
 local original_open = io.open
 local function mock(mode, user_config_source)
     local state = { events = {}, bindings = {}, timers = {}, setups = 0, notifications = 0, loads = {},
-        enable = 0, disable = 0, shutdown = 0, actions = {}, initialized = false, enabled = false,
+        enable = 0, disable = 0, shutdown = 0, actions = {}, initialized = false, enabled = false, active = false,
         config_opens = 0, user_config_source = user_config_source }
     io.open = function(path)
         if path:match("/hyprcosmos%.lua$") then
@@ -155,6 +218,7 @@ local function mock(mode, user_config_source)
         end,
         setup = function(options)
             state.setups = state.setups + 1
+            state.active = false
             if state.fail_setup then state.initialized = false; state.enabled = false; return nil, "runtime setup failure" end
             if mode == "nil-error" then return nil, "test initialization failure" end
             if mode == "throw" then error("test exception") end
@@ -164,10 +228,20 @@ local function mock(mode, user_config_source)
             return true
         end,
         enable = function() state.enable = state.enable + 1; state.enabled = true; state.initialized = true; return true end,
-        disable = function() state.disable = state.disable + 1; state.enabled = false; state.initialized = false; return true end,
-        shutdown = function() state.shutdown = state.shutdown + 1; state.enabled = false; state.initialized = false; return true end,
-        action = function(action) state.actions[#state.actions + 1] = action; return true end,
-        status = function() return { enabled = state.enabled, initialized = state.initialized, active = false, input_watchers = state.initialized and 1 or 0 } end,
+        disable = function() state.disable = state.disable + 1; state.enabled = false; state.initialized = false; state.active = false; return true end,
+        shutdown = function() state.shutdown = state.shutdown + 1; state.enabled = false; state.initialized = false; state.active = false; return true end,
+        action = function(action)
+            state.actions[#state.actions + 1] = action
+            if state.fail_action then return nil, "fixture action failure" end
+            return true
+        end,
+        status = function()
+            if state.fail_status then return nil, "fixture status failure" end
+            if state.throw_status then error("fixture status exception") end
+            if state.invalid_status then return state.invalid_status end
+            return { enabled = state.enabled, initialized = state.initialized, active = state.active,
+                input_watchers = state.initialized and 1 or 0 }
+        end,
     }
     if mode == "old-api" then api.read_user_config = nil end
     _G.hl = {
@@ -184,8 +258,8 @@ local function mock(mode, user_config_source)
             table.insert(state.events[event], subscription)
             return subscription
         end,
-        bind = function(chord, callback)
-            local binding = { chord = chord, callback = callback, active = true }
+        bind = function(chord, callback, bind_options)
+            local binding = { chord = chord, callback = callback, active = true, options = bind_options }
             function binding:remove() self.active = false end
             state.bindings[#state.bindings + 1] = binding
             return binding
@@ -207,6 +281,11 @@ local function mock(mode, user_config_source)
         local count = 0
         for _, binding in ipairs(state.bindings) do if binding.active then count = count + 1 end end
         return count
+    end
+    function state.binding(chord)
+        for _, binding in ipairs(state.bindings) do
+            if binding.active and binding.chord == chord then return binding end
+        end
     end
     function state.live_events()
         local count = 0
@@ -233,9 +312,9 @@ check(cosmic.setup({ idle_timeout = 6 }) == cosmic, "setup before plugin load re
 state.fire("config.reloaded")
 state.fire("config.reloaded")
 check(state.setups == 1 and state.options.idle_timeout == 6, "recursive plugin reload emits initialize only once")
-check(state.live_bindings() == 7 and state.live_events() == 2, "one set of controls and event ownership")
+check(state.live_bindings() == 8 and state.live_events() == 2, "one set of controls and event ownership")
 check(cosmic.setup({ effects = { wormholes = false }, controls = { supernova = false } }) == cosmic, "setup updates native options")
-check(state.live_bindings() == 6 and state.setups == 2, "setup replaces bindings without duplication")
+check(state.live_bindings() == 7 and state.setups == 2, "setup replaces bindings without duplication")
 check(state.options.rendering.hide_desktop_ui == true,
     "native setup receives the default desktop UI suppression option")
 check(cosmic.setup({ rendering = { hide_desktop_ui = false } }) == cosmic and
@@ -248,7 +327,7 @@ local status = cosmic.status()
 status.config.effects.orbit = false
 check(cosmic.status().config.effects.orbit, "status returns independent configuration data")
 check(cosmic.disable() and not cosmic.status().initialized and cosmic.status().module_initialized and state.live_bindings() == 0, "disable releases native watchers and consuming controls")
-check(cosmic.enable() and cosmic.status().initialized and state.live_bindings() == 6, "enable restores one set of watchers and controls")
+check(cosmic.enable() and cosmic.status().initialized and state.live_bindings() == 7, "enable restores one set of watchers and controls")
 check(cosmic.action("black_hole") and state.actions[1] == "black_hole", "dedicated actions reach native API")
 check(not cosmic.action("invalid"), "unknown actions are rejected")
 check(cosmic.shutdown() and cosmic.shutdown(), "shutdown is repeatable")
@@ -258,13 +337,87 @@ check(cosmic.setup({ enabled = false }) == cosmic and state.setups == 4 and stat
 state.fire("hyprland.shutdown")
 check(state.live_bindings() == 0 and state.live_events() == 0 and cosmic.status().input_watchers == 0, "compositor shutdown cleans module ownership and exposes native counters")
 
+local stellar_module, stellar_state = mock("success")
+stellar_state.fire("config.reloaded")
+local stellar_binding = assert(stellar_state.binding("F5"))
+check(stellar_binding.options.auto_consuming and not stellar_binding.options.non_consuming and
+    stellar_binding.options.submap_universal and stellar_state.live_bindings() == 8,
+    "F5 uses Hyprland's native conditional-consumption option without adding a lifecycle poll")
+local passed = stellar_binding.callback()
+check(passed.ok == false and passed.pass_event == true and #stellar_state.actions == 0 and
+    #stellar_state.timers == 0,
+    "ordinary F5 passes to applications and never invokes a Cosmic action or polling timer")
+stellar_state.active = true
+local consumed = stellar_binding.callback()
+check(consumed.ok == true and not consumed.pass_event and #stellar_state.actions == 1 and
+    stellar_state.actions[1] == "stellar_nova",
+    "F5 selects the cinematic action and consumes the key only while Cosmic is active")
+stellar_state.fail_action = true
+consumed = stellar_binding.callback()
+check(consumed.ok == true and not consumed.pass_event,
+    "an unavailable cinematic target never leaks F5 into the hidden application")
+stellar_state.fail_action = false
+local action_count = #stellar_state.actions
+for _, failure in ipairs({"fail_status", "throw_status", "invalid_status"}) do
+    stellar_state[failure] = true
+    local guarded = stellar_binding.callback()
+    check(guarded.ok == false and guarded.pass_event == true and #stellar_state.actions == action_count,
+        "missing or invalid native active status safely passes F5 instead of globally consuming it")
+    stellar_state[failure] = nil
+end
+local stellar_api, stellar_status = hl.plugin.cosmic, hl.plugin.cosmic.status
+hl.plugin.cosmic.status = nil
+passed = stellar_binding.callback()
+check(not passed.ok and passed.pass_event and #stellar_state.actions == action_count,
+    "an incompatible native status API cannot consume ordinary F5")
+hl.plugin.cosmic.status = stellar_status
+hl.plugin.cosmic = nil
+passed = stellar_binding.callback()
+check(not passed.ok and passed.pass_event and #stellar_state.actions == action_count,
+    "a missing native plugin cannot consume F5 through a retained callback")
+hl.plugin.cosmic = stellar_api
+check(stellar_module.setup({ stellar = { automatic = false, fragments = 4 },
+    controls = { stellar_nova = "F4" } }) == stellar_module and not stellar_binding.active and
+    not stellar_state.binding("F5") and stellar_state.binding("F4").options.auto_consuming,
+    "reassigning the cinematic control replaces the old F5 binding without changing conditional semantics")
+check(not stellar_state.options.stellar.automatic and stellar_state.options.stellar.fragments == 4 and
+    stellar_state.options.stellar.charge_seconds == 3.5,
+    "validated cinematic settings reach native setup with defaults preserved")
+passed = stellar_state.binding("F4").callback()
+check(not passed.ok and passed.pass_event,
+    "a reassigned cinematic key also passes outside Cosmic after setup resets its active phase")
+stellar_state.active = true
+consumed = stellar_state.binding("F4").callback()
+check(consumed.ok and not consumed.pass_event and stellar_state.actions[#stellar_state.actions] == "stellar_nova",
+    "disabling automatic explosions leaves manual targeted explosions available")
+check(stellar_module.setup({ controls = { stellar_nova = false } }) == stellar_module and
+    stellar_state.live_bindings() == 7 and not stellar_state.binding("F4") and stellar_state.binding("F9"),
+    "disabling the cinematic control releases its binding while retaining the independent F9 shockwave")
+check(stellar_module.setup({ controls = { stellar_nova = "F5" } }) == stellar_module,
+    "the cinematic binding can be restored after being disabled")
+local restored_stellar_binding = assert(stellar_state.binding("F5"))
+check(stellar_module.disable() and not restored_stellar_binding.active and stellar_state.live_bindings() == 0,
+    "module disable removes the conditional cinematic binding along with all ordinary controls")
+passed = restored_stellar_binding.callback()
+check(not passed.ok and passed.pass_event,
+    "a stale conditional callback after disable cannot consume F5")
+check(stellar_module.enable() and stellar_state.binding("F5").options.auto_consuming and
+    stellar_state.live_bindings() == 8,
+    "enable restores exactly one conditional cinematic binding")
+restored_stellar_binding = assert(stellar_state.binding("F5"))
+check(stellar_module.shutdown() and not restored_stellar_binding.active and stellar_state.live_bindings() == 0,
+    "shutdown releases cinematic key ownership completely")
+passed = restored_stellar_binding.callback()
+check(not passed.ok and passed.pass_event,
+    "a stale conditional callback after shutdown cannot consume F5")
+
 local recovering, recovery = mock("success")
 recovery.fire("config.reloaded")
 recovery.fail_setup = true
 check(not recovering.setup({ idle_timeout = 11 }) and recovery.live_bindings() == 0 and
     recovering.status().config.idle_timeout == Config.defaults.idle_timeout, "native reconfiguration failure releases old consuming controls and keeps accepted options")
 recovery.fail_setup = false
-check(recovering.setup({ idle_timeout = 7 }) == recovering and recovery.live_bindings() == 7 and
+check(recovering.setup({ idle_timeout = 7 }) == recovering and recovery.live_bindings() == 8 and
     recovering.status().initialized, "valid setup recovers after a native failure without a reload")
 recovering.shutdown()
 
@@ -275,7 +428,7 @@ check(not reenabling.setup({ idle_timeout = 11 }), "native reconfiguration failu
 check(not reenabling.enable() and reenable.setups == 3 and reenable.live_bindings() == 0 and
     not reenabling.status().initialized, "enable reports a continuing native initialization failure")
 reenable.fail_setup = false
-check(reenabling.enable() and reenable.setups == 4 and reenable.live_bindings() == 7 and
+check(reenabling.enable() and reenable.setups == 4 and reenable.live_bindings() == 8 and
     reenabling.status().initialized and reenable.options.idle_timeout == Config.defaults.idle_timeout,
     "enable reinitializes accepted configuration after native failure")
 reenabling.shutdown()
