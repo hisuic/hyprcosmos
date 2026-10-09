@@ -35,6 +35,14 @@ Vec2 limited(Vec2 value, double maximum) {
 double radius(const Body& body) {
     return std::max(8.0, std::hypot(body.width, body.height) * body.scale * 0.30);
 }
+Vec2 renderedHalfExtent(const Body& body) {
+    const double winding = std::min(PI * 0.25, std::abs(body.twist));
+    const double extent = std::cos(winding) + std::sin(winding);
+    const double local_x = body.width * body.scale * body.stretch * extent * 0.5;
+    const double local_y = body.height * body.scale / body.stretch * extent * 0.5;
+    const double cosine = std::abs(std::cos(body.angle)), sine = std::abs(std::sin(body.angle));
+    return {local_x * cosine + local_y * sine, local_x * sine + local_y * cosine};
+}
 Vec2 softenedGravity(Vec2 distance, double strength, double softening) {
     const double squared = lengthSquared(distance) + softening * softening;
     return distance * (strength / (squared * std::sqrt(squared)));
@@ -48,8 +56,12 @@ uint64_t novaHash(uint64_t value) {
 double novaRandom(uint64_t value) {
     return static_cast<double>(novaHash(value) >> 11) / 9007199254740992.0;
 }
-bool novaEligible(const Body& body) {
+bool actorEligible(const Body& body) {
     return !body.stored && body.sink_progress <= 0.0 && body.portal_progress <= 0.0 && body.nova_age < 0.0;
+}
+bool novaEligible(const Body& body) { return body.fragment_grid == 0 && actorEligible(body); }
+bool novaRemnant(const Body& body) {
+    return body.fragment_grid == 0 && body.nova_age >= body.nova_charge_seconds;
 }
 double segmentPortalEntry(Vec2 start, Vec2 end, Vec2 center, double portal_radius) {
     const Vec2 offset = start - center, travel = end - start;
@@ -87,6 +99,7 @@ void Universe::configure(Config config) {
     config.fixed_step = finiteClamp(config.fixed_step, 1.0 / 240.0, 1.0 / 30.0, 1.0 / 120.0);
     config.max_substeps = std::clamp<std::size_t>(config.max_substeps, 1, 32);
     config.max_bodies = std::clamp<std::size_t>(config.max_bodies, 1, 128);
+    config.max_objects = std::clamp<std::size_t>(config.max_objects, 16, 128);
     config.max_particles = std::min<std::size_t>(config.max_particles, 2048);
     config.history_seconds = finiteClamp(config.history_seconds, 0.0, 60.0, 12.0);
     config.history_hz = finiteClamp(config.history_hz, 1.0, 60.0, 30.0);
@@ -114,13 +127,22 @@ void Universe::configure(Config config) {
     m_config = config;
     if (seed_changed)
         m_random.seed(m_config.seed);
-    if (m_bodies.size() > config.max_bodies)
-        m_bodies.resize(config.max_bodies);
+    // max_bodies concerns captured apps, not their child actors. Never resize
+    // the mixed actor vector: doing so would discard arbitrary persistent tiles.
+    std::vector<uint64_t> excess_sources;
+    std::size_t real_count = 0;
+    for (const auto& body : m_bodies)
+        if (body.fragment_grid == 0 && ++real_count > config.max_bodies)
+            excess_sources.push_back(body.id);
+    for (const auto id : excess_sources) removeBody(id);
     if (m_particles.size() > config.max_particles)
         m_particles.resize(config.max_particles);
     if (!config.supernova) {
         m_particles.clear();
         m_waves.clear();
+        std::erase_if(m_bodies, [](const Body& body) { return body.fragment_grid != 0; });
+        for (auto& frame : m_history)
+            std::erase_if(frame.bodies, [](const Body& body) { return body.fragment_grid != 0; });
         for (auto& body : m_bodies) if (body.nova_age >= 0.0) cancelNova(body);
     }
     if (!config.wormholes) {
@@ -145,6 +167,7 @@ void Universe::reset(std::vector<Body> bodies, std::vector<Region> regions, Vec2
     m_wormholes.clear();
     m_random.seed(m_config.seed);
     m_nova_serial = 0;
+    m_next_fragment_id = UINT64_MAX;
     m_cursor = safeVector(cursor);
     m_focused_id = focused_id;
     m_accumulator = m_history_accumulator = m_rewind_accumulator = m_time = 0.0;
@@ -242,9 +265,21 @@ void Universe::normalizeBody(Body& body, bool initialize_velocity) {
 }
 
 bool Universe::addBody(Body body, bool explode) {
-    if (body.id == 0 || m_bodies.size() >= m_config.max_bodies ||
-        std::any_of(m_bodies.begin(), m_bodies.end(), [&](const Body& current) { return current.id == body.id; }))
+    const auto real_count = std::count_if(m_bodies.begin(), m_bodies.end(), [](const Body& current) {
+        return current.fragment_grid == 0;
+    });
+    if (body.id == 0 || static_cast<std::size_t>(real_count) >= m_config.max_bodies ||
+        reservedObjectCount() >= m_config.max_objects ||
+        std::any_of(m_bodies.begin(), m_bodies.end(), [&](const Body& current) {
+            return current.id == body.id && current.fragment_grid == 0;
+        }))
         return false;
+    // IDs supplied by the compositor are opaque: a later real window may use
+    // an ID previously allocated to a fragment, even at UINT64_MAX.
+    relocateFragmentId(body.id);
+    body.source_id = body.id;
+    body.fragment_grid = body.fragment_column = body.fragment_row = 0;
+    body.fragment_age = 0.0;
     normalizeBody(body, true);
     m_bodies.push_back(body);
     if (explode)
@@ -253,12 +288,56 @@ bool Universe::addBody(Body body, bool explode) {
 }
 
 void Universe::removeBody(uint64_t id) {
-    std::erase_if(m_bodies, [&](const Body& body) { return body.id == id; });
+    std::erase_if(m_bodies, [&](const Body& body) { return body.id == id || body.source_id == id; });
     // Removing IDs from all frames also releases their history memory promptly.
     for (auto& frame : m_history)
-        std::erase_if(frame.bodies, [&](const Body& body) { return body.id == id; });
+        std::erase_if(frame.bodies, [&](const Body& body) { return body.id == id || body.source_id == id; });
     if (m_focused_id == id)
         m_focused_id = 0;
+}
+
+std::size_t Universe::objectCount() const {
+    return static_cast<std::size_t>(std::count_if(m_bodies.begin(), m_bodies.end(), [](const Body& body) {
+        return !novaRemnant(body);
+    }));
+}
+
+std::size_t Universe::reservedObjectCount() const {
+    std::size_t count = objectCount();
+    for (const auto& body : m_bodies)
+        if (body.fragment_grid == 0 && body.nova_age >= 0.0 && body.nova_age < body.nova_charge_seconds)
+            count += static_cast<std::size_t>(body.nova_grid * body.nova_grid - 1);
+    return count;
+}
+
+uint64_t Universe::allocateFragmentId(uint64_t excluded_id) {
+    for (;;) {
+        const uint64_t candidate = m_next_fragment_id--;
+        if (candidate == 0 || candidate == excluded_id) continue;
+        const auto contains = [&](const auto& bodies) {
+            return std::any_of(bodies.begin(), bodies.end(), [&](const Body& body) { return body.id == candidate; });
+        };
+        if (contains(m_bodies)) continue;
+        if (std::any_of(m_history.begin(), m_history.end(), [&](const Frame& frame) { return contains(frame.bodies); })) continue;
+        return candidate;
+    }
+}
+
+void Universe::relocateFragmentId(uint64_t id) {
+    const auto contains = [&](const auto& bodies) {
+        return std::any_of(bodies.begin(), bodies.end(), [&](const Body& body) {
+            return body.fragment_grid != 0 && body.id == id;
+        });
+    };
+    if (!contains(m_bodies) && !std::any_of(m_history.begin(), m_history.end(), [&](const Frame& frame) {
+        return contains(frame.bodies);
+    })) return;
+    const uint64_t replacement = allocateFragmentId(id);
+    const auto relocate = [&](auto& bodies) {
+        for (auto& body : bodies) if (body.fragment_grid != 0 && body.id == id) body.id = replacement;
+    };
+    relocate(m_bodies);
+    for (auto& frame : m_history) relocate(frame.bodies);
 }
 
 const Region& Universe::regionFor(int id) const {
@@ -328,7 +407,7 @@ bool Universe::startBlackHoleById(Vec2 screen_cursor, uint64_t id) {
     const auto found = std::find_if(m_bodies.begin(), m_bodies.end(), [&](const Body& body) { return body.id == id; });
     if (found == m_bodies.end())
         return false;
-    if (!novaEligible(*found)) return false;
+    if (!actorEligible(*found)) return false;
     found->sink_progress = std::numeric_limits<double>::epsilon();
     // This center is captured once: later mouse motion does not drag the hole.
     found->sink_center = screenToWorld(screen_cursor, found->region);
@@ -387,6 +466,9 @@ bool Universe::startStellarNova(uint64_t id) {
     if (!m_config.supernova || m_rewinding || novaBusy()) return false;
     const auto selected = std::find_if(m_bodies.begin(), m_bodies.end(), [&](const Body& body) { return body.id == id; });
     if (selected == m_bodies.end() || !novaEligible(*selected)) return false;
+    // Reserve the entire eventual split at activation. New windows and later
+    // events cannot steal these slots during the visible charging interval.
+    if (reservedObjectCount() + m_config.stellar_fragments - 1 > m_config.max_objects) return false;
     auto& body = *selected;
     body.nova_age = 0.0;
     body.nova_charge_seconds = m_config.stellar_charge_seconds;
@@ -438,28 +520,49 @@ void Universe::cancelNova(Body& body) {
 
 std::vector<NovaFragment> Universe::novaFragments(const Body& body) const {
     std::vector<NovaFragment> result;
-    if (!m_config.supernova || body.nova_age < body.nova_charge_seconds ||
-        body.nova_age >= body.nova_charge_seconds + body.nova_fragment_seconds) return result;
-    const double age = body.nova_age - body.nova_charge_seconds;
-    const int grid = body.nova_grid == 2 ? 2 : 4;
-    const double burst_scale = body.nova_initial_scale * body.nova_growth;
-    const double travel = (1.0 - std::exp(-0.32 * age)) / 0.32;
-    const double fade = 1.0 - smoothProgress(age / body.nova_fragment_seconds, 0.60);
-    result.reserve(grid * grid);
+    if (!m_config.supernova || body.fragment_grid != 0 || !novaRemnant(body)) return result;
+    result.reserve(static_cast<std::size_t>(body.nova_grid * body.nova_grid));
+    for (const auto& child : m_bodies) {
+        if (child.fragment_grid == 0 || child.source_id != body.id || child.stored || child.scale < 0.0001) continue;
+        result.push_back({child.position, child.angle, child.scale, 1.0,
+                          child.fragment_column, child.fragment_row, child.fragment_grid});
+    }
+    return result;
+}
+
+void Universe::createNovaFragments(const Body& parent, std::vector<Body>& fragments) {
+    const int grid = parent.nova_grid == 2 ? 2 : 4;
+    const double burst_scale = parent.nova_initial_scale * parent.nova_growth;
     for (int row = 0; row < grid; ++row) for (int column = 0; column < grid; ++column) {
-        const uint64_t key = body.nova_seed ^ novaHash(static_cast<uint64_t>(row * grid + column));
-        const Vec2 local{(static_cast<double>(column) + 0.5 - grid * 0.5) * body.width * burst_scale / grid,
-                         (static_cast<double>(row) + 0.5 - grid * 0.5) * body.height * burst_scale / grid};
-        const Vec2 offset = rotate(local, body.angle);
+        const uint64_t key = parent.nova_seed ^ novaHash(static_cast<uint64_t>(row * grid + column));
+        const Vec2 local{(static_cast<double>(column) + 0.5 - grid * 0.5) * parent.width * burst_scale / grid,
+                         (static_cast<double>(row) + 0.5 - grid * 0.5) * parent.height * burst_scale / grid};
+        const Vec2 offset = rotate(local, parent.angle);
         const double direction = std::atan2(offset.y, offset.x) + (novaRandom(key) - 0.5) * 0.45;
         const double speed = std::min(m_config.max_speed, 150.0 + novaRandom(key + 1) * 290.0);
         const double spin = (novaRandom(key + 2) - 0.5) * 5.5;
-        result.push_back({body.position + offset + rotate({speed * travel, 0.0}, direction),
-                          body.angle + spin * age,
-                          burst_scale * (1.0 - 0.28 * smoothProgress(age / body.nova_fragment_seconds, 0.0)),
-                          fade, column, row, grid});
+        Body child;
+        child.id = allocateFragmentId();
+        child.source_id = parent.id;
+        child.fragment_grid = grid;
+        child.fragment_column = column;
+        child.fragment_row = row;
+        child.position = parent.position + offset;
+        child.velocity = rotate({speed, 0.0}, direction);
+        child.width = parent.width / grid;
+        child.height = parent.height / grid;
+        child.mass = std::max(0.001, parent.mass / static_cast<double>(grid * grid));
+        child.angle = parent.angle;
+        child.angular_velocity = spin;
+        child.scale = burst_scale;
+        child.original_scale = parent.nova_initial_scale;
+        child.region = parent.region;
+        child.nova_initial_scale = parent.nova_initial_scale;
+        child.nova_growth = parent.nova_growth;
+        child.nova_fragment_seconds = parent.nova_fragment_seconds;
+        child.cooldown = parent.nova_fragment_seconds + m_config.wormhole_cooldown;
+        fragments.push_back(child);
     }
-    return result;
 }
 
 void Universe::supernova(Vec2 position, int region) {
@@ -679,13 +782,28 @@ void Universe::integrate(double dt) {
             // Manual selection deliberately still allows that final star.
             if (eligible.size() >= 2) {
                 const auto index = static_cast<std::size_t>(novaHash(m_config.seed ^ m_nova_serial) % eligible.size());
-                startStellarNova(eligible[index]);
+                if (!startStellarNova(eligible[index])) {
+                    // A full scene is expected; retry at the normal rare event
+                    // interval instead of checking an unfulfillable split 120Hz.
+                    ++m_nova_serial;
+                    scheduleNova();
+                }
             } else {
                 ++m_nova_serial;
                 scheduleNova();
             }
         }
     }
+    // Spawn before any indexed acceleration arrays or actor references exist.
+    // Child bodies subsequently follow exactly the ordinary integration path.
+    std::vector<Body> fragments;
+    for (auto& body : m_bodies) {
+        if (body.nova_age < 0.0) continue;
+        const bool charging = body.nova_age < body.nova_charge_seconds;
+        advanceNova(body, dt);
+        if (charging && novaRemnant(body)) createNovaFragments(body, fragments);
+    }
+    m_bodies.insert(m_bodies.end(), fragments.begin(), fragments.end());
     std::vector<Vec2> acceleration(m_bodies.size());
     // A completed transit still keeps its promised exit velocity for this step.
     std::vector<bool> portal_updated(m_bodies.size(), false);
@@ -716,7 +834,8 @@ void Universe::integrate(double dt) {
                 const auto& b = m_bodies[second];
                 if (b.stored || b.sink_progress > 0.0 || b.portal_progress > 0.0 || b.nova_age >= 0.0 || a.region != b.region)
                     continue;
-                const bool focused_pair = m_gravity_mode == GravityMode::Focused && (a.id == m_focused_id || b.id == m_focused_id);
+                const bool focused_pair = m_gravity_mode == GravityMode::Focused &&
+                                          (a.source_id == m_focused_id || b.source_id == m_focused_id);
                 const double strength = m_config.mutual_strength * (focused_pair ? 8.0 : 1.0);
                 const Vec2 force = softenedGravity(b.position - a.position, strength, m_config.softening);
                 acceleration[first] += force * b.mass;
@@ -728,9 +847,13 @@ void Universe::integrate(double dt) {
     for (std::size_t index = 0; index < m_bodies.size(); ++index) {
         auto& body = m_bodies[index];
         body.cooldown = std::max(0.0, body.cooldown - dt);
-        if (body.nova_age >= 0.0) {
-            advanceNova(body, dt);
-            continue;
+        if (body.nova_age >= 0.0) continue;
+        if (body.fragment_grid != 0) {
+            body.fragment_age = std::min(body.nova_fragment_seconds, body.fragment_age + dt);
+            if (!body.stored && body.sink_progress <= 0.0 && body.portal_progress <= 0.0) {
+                const double ease = smoothProgress(body.fragment_age / body.nova_fragment_seconds, 0.0);
+                body.scale = body.nova_initial_scale * (1.0 + (body.nova_growth - 1.0) * (1.0 - ease));
+            }
         }
         if (body.stored)
             continue;
@@ -793,7 +916,7 @@ void Universe::integrate(double dt) {
             body.position += (body.position - regionFor(body.region).center()) * (m_config.expansion_rate * dt);
         body.angle = std::remainder(body.angle + body.angular_velocity * dt, TAU);
         body.angular_velocity *= std::exp(-0.008 * dt);
-        if (m_config.black_hole) {
+        if (m_config.black_hole && body.cooldown <= 0.0) {
             for (const auto& remnant : m_bodies) {
                 if (remnant.id == body.id || remnant.region != body.region ||
                     remnant.nova_age < remnant.nova_charge_seconds) continue;
@@ -854,8 +977,11 @@ void Universe::integrate(double dt) {
             continue;
         const auto& region = regionFor(body.region);
         const double expansion = m_config.expansion ? std::min(5.0, 1.0 + m_time * m_config.expansion_rate * 0.5) : 1.0;
-        const double half_x = std::max(16.0, region.width * 0.5 * expansion - radius(body));
-        const double half_y = std::max(16.0, region.height * 0.5 * expansion - radius(body));
+        // Wall contacts cover the visible, rotated texture rectangle, including
+        // its shader deformation, for both whole windows and small tile actors.
+        const Vec2 bound = renderedHalfExtent(body);
+        const double half_x = std::max(16.0, region.width * 0.5 * expansion - bound.x);
+        const double half_y = std::max(16.0, region.height * 0.5 * expansion - bound.y);
         Vec2 offset = body.position - region.center();
         if (m_config.collisions) {
             if (std::abs(offset.x) > half_x) {
@@ -930,11 +1056,11 @@ void Universe::updateCameras(double dt) {
         for (const auto& body : m_bodies) {
             if (body.region != camera.region || (body.stored && body.nova_age < 0.0))
                 continue;
-            const double padding = body.stored ? 90.0 : radius(body) * std::max(1.0, body.stretch) + 40.0;
-            minimum_x = std::min(minimum_x, body.position.x - padding);
-            maximum_x = std::max(maximum_x, body.position.x + padding);
-            minimum_y = std::min(minimum_y, body.position.y - padding);
-            maximum_y = std::max(maximum_y, body.position.y + padding);
+            const Vec2 extent = body.stored ? Vec2{90.0, 90.0} : renderedHalfExtent(body) + Vec2{40.0, 40.0};
+            minimum_x = std::min(minimum_x, body.position.x - extent.x);
+            maximum_x = std::max(maximum_x, body.position.x + extent.x);
+            minimum_y = std::min(minimum_y, body.position.y - extent.y);
+            maximum_y = std::max(maximum_y, body.position.y + extent.y);
         }
         const Vec2 center{(minimum_x + maximum_x) * 0.5, (minimum_y + maximum_y) * 0.5};
         const double target_zoom = std::clamp(std::min(region.width / (maximum_x - minimum_x),
@@ -950,7 +1076,9 @@ void Universe::resizeHistory() {
     const std::size_t requested = static_cast<std::size_t>(std::ceil(m_config.history_seconds * m_config.history_hz)) + 1;
     // Existing snapshots may have been recorded before a runtime body-limit
     // reduction. Account for their allocation too, not just the new cap.
-    std::size_t largest_frame = std::max(m_config.max_bodies, m_bodies.size());
+    // Exploded source bodies remain as image/remnant owners, but do not use
+    // object slots. Include that real-window ghost overhead in every estimate.
+    std::size_t largest_frame = std::max(m_config.max_objects + m_config.max_bodies, m_bodies.size());
     for (const auto& frame : m_history)
         largest_frame = std::max(largest_frame, frame.bodies.capacity());
     const std::size_t frame_bytes = sizeof(Frame) + sizeof(Body) * largest_frame;
@@ -967,14 +1095,19 @@ void Universe::recordFrame() {
         return;
     if (m_history.size() >= m_history_limit)
         m_history.pop_front();
-    m_history.push_back({m_bodies, m_time, m_next_nova, m_nova_serial, m_random});
+    m_history.push_back({m_bodies, m_time, m_next_nova, m_nova_serial, m_next_fragment_id, m_random});
 }
 
 void Universe::restoreFrame(const Frame& frame) {
-    // Never replace the living-ID set with the historical one. New windows can
-    // remain, while closed windows can never be resurrected by rewind.
-    for (auto& body : m_bodies) {
-        const auto previous = std::find_if(frame.bodies.begin(), frame.bodies.end(), [&](const Body& old) { return old.id == body.id; });
+    // Only real-window IDs define liveness. Fragments are timeline-owned actors:
+    // discard future ones, restore old ones only while their source app lives.
+    std::vector<Body> restored;
+    restored.reserve(m_config.max_objects + m_config.max_bodies);
+    for (auto body : m_bodies) {
+        if (body.fragment_grid != 0) continue;
+        const auto previous = std::find_if(frame.bodies.begin(), frame.bodies.end(), [&](const Body& old) {
+            return old.fragment_grid == 0 && old.id == body.id;
+        });
         if (previous != frame.bodies.end())
             body = *previous;
         else if (body.nova_age >= 0.0)
@@ -985,10 +1118,38 @@ void Universe::restoreFrame(const Frame& frame) {
             cancelPortal(body);
         if (!m_config.supernova && body.nova_age >= 0.0)
             cancelNova(body);
+        restored.push_back(body);
     }
+    if (m_config.supernova) {
+        for (auto body : frame.bodies) {
+            if (body.fragment_grid == 0) continue;
+            const bool living_source = std::any_of(restored.begin(), restored.end(), [&](const Body& current) {
+                return current.fragment_grid == 0 && current.id == body.source_id && novaRemnant(current);
+            });
+            if (!living_source) continue;
+            if (!m_config.wormholes && body.portal_progress > 0.0) cancelPortal(body);
+            restored.push_back(body);
+        }
+    }
+    std::size_t reserved = 0;
+    for (const auto& body : restored) {
+        if (novaRemnant(body)) continue;
+        ++reserved;
+        if (body.fragment_grid == 0 && body.nova_age >= 0.0)
+            reserved += static_cast<std::size_t>(body.nova_grid * body.nova_grid - 1);
+    }
+    // A runtime reduction can make earlier scenes larger than the new budget.
+    // Keep existing actors intact and stop at that boundary; never discard
+    // tiles or resurrect a closed app merely to make a history frame fit.
+    if (reserved > m_config.max_objects) {
+        m_rewinding = false;
+        return;
+    }
+    m_bodies = std::move(restored);
     m_time = frame.time;
     m_next_nova = frame.next_nova;
     m_nova_serial = frame.nova_serial;
+    m_next_fragment_id = frame.next_fragment_id;
     m_random = frame.random;
     updateCameras(0.0);
 }
@@ -1015,7 +1176,7 @@ void Universe::step(double elapsed, Vec2 screen_cursor) {
     if (m_rewinding) {
         m_rewind_accumulator += elapsed;
         const double interval = 1.0 / m_config.history_hz;
-        while (m_rewind_accumulator + 1e-12 >= interval && m_history.size() > 1) {
+        while (m_rewinding && m_rewind_accumulator + 1e-12 >= interval && m_history.size() > 1) {
             m_rewind_accumulator -= interval;
             m_history.pop_back();
             restoreFrame(m_history.back());
