@@ -6,6 +6,7 @@ plugin="$repository/build/cosmic.so"
 output=""
 nested_window=false
 unload_only=false
+stellar_only=false
 unload_rounds=12
 while (($#)); do
     case "$1" in
@@ -13,11 +14,13 @@ while (($#)); do
         --output) output=${2:?}; shift 2 ;;
         --nested-window) nested_window=true; shift ;;
         --unload-only) unload_only=true; shift ;;
+        --stellar-only) stellar_only=true; shift ;;
         --unload-rounds) unload_rounds=${2:?}; shift 2 ;;
-        -h|--help) printf '%s\n' 'Usage: scripts/fullscreen-test.sh [--plugin FILE] [--output DIR] [--nested-window] [--unload-rounds N] [--unload-only]'; exit 0 ;;
+        -h|--help) printf '%s\n' 'Usage: scripts/fullscreen-test.sh [--plugin FILE] [--output DIR] [--nested-window] [--unload-rounds N] [--unload-only | --stellar-only]'; exit 0 ;;
         *) printf 'Unknown argument: %s\n' "$1" >&2; exit 2 ;;
     esac
 done
+if "$unload_only" && "$stellar_only"; then printf 'Choose either unload-only or stellar-only.\n' >&2; exit 2; fi
 [[ "$unload_rounds" =~ ^[0-9]+$ && "$unload_rounds" -ge 1 && "$unload_rounds" -le 100 ]] || { printf 'Unload rounds must be 1..100.\n' >&2; exit 2; }
 for command in Hyprland hyprctl gcc wayland-scanner pkg-config python3 rg grim timeout; do
     command -v "$command" >/dev/null || { printf 'Missing dependency: %s\n' "$command" >&2; exit 1; }
@@ -251,6 +254,84 @@ geometry > "$output/geometry-restored.json"
 reserved > "$output/reserved-restored.json"
 cmp -- "$output/geometry-before.json" "$output/geometry-restored.json"
 cmp -- "$output/reserved-before.json" "$output/reserved-restored.json"
+
+# F5 is a conditional control, not a global replacement for browser refresh.
+# Exercise actual seat delivery, not just the Lua callback's return value.
+probe move 550 360 1280 720
+before_f5_press=$(event_count '"event":"key","key":63,"state":1' "$output/window.jsonl")
+before_f5_release=$(event_count '"event":"key","key":63,"state":0' "$output/window.jsonl")
+probe key 63
+sleep .1
+[[ $(event_count '"event":"key","key":63,"state":1' "$output/window.jsonl") -eq $((before_f5_press+1)) ]] || { printf 'Normal F5 press was consumed or duplicated.\n' >&2; exit 1; }
+[[ $(event_count '"event":"key","key":63,"state":0' "$output/window.jsonl") -eq $((before_f5_release+1)) ]] || { printf 'Normal F5 release was consumed or duplicated.\n' >&2; exit 1; }
+eval_lua '_cosmic_stellar_options=require("cosmic").status().config; require("cosmic").setup({stellar={automatic=false,charge_seconds=2,fragment_seconds=3,fragments=16},effects={cursor_gravity=false,binary=false,collisions=false,wormholes=false,expansion=false}})'
+preview
+read -r nova_x nova_y <<< "$(ctl repl 'local o=require("cosmic").status().objects[1]; print(math.floor(o.x),math.floor(o.y))')"
+probe move "$nova_x" "$nova_y" 1280 720
+before_f5_press=$(event_count '"event":"key","key":63,"state":1' "$output/window.jsonl")
+before_f5_release=$(event_count '"event":"key","key":63,"state":0' "$output/window.jsonl")
+probe key 63
+eval_lua 'local s=require("cosmic").status(); local o=s.objects[1]; assert(s.active and o.nova_age>=0 and o.nova_age<2 and not o.stored); _nova_initial_scale=o.scale; _nova_snapshot_bytes=s.snapshot_bytes'
+sleep .6
+eval_lua 'local s=require("cosmic").status(); assert(s.active and s.objects[1].scale>_nova_initial_scale)'
+capture stellar-charge hidden
+wait_lua 'require("cosmic").status().objects[1].nova_age>=1.5'
+capture stellar-hot-charge hidden
+wait_lua 'require("cosmic").status().objects[1].nova_fragment_count==16'
+eval_lua 'local s=require("cosmic").status(); local o=s.objects[1]; assert(o.stored and o.nova_remnant and s.snapshot_bytes==_nova_snapshot_bytes)'
+capture stellar-fragments hidden
+[[ $(event_count '"event":"key","key":63,"state":1' "$output/window.jsonl") -eq "$before_f5_press" ]] || { printf 'Cosmic F5 reached the hidden app.\n' >&2; exit 1; }
+[[ $(event_count '"event":"key","key":63,"state":0' "$output/window.jsonl") -eq "$before_f5_release" ]] || { printf 'Cosmic F5 release reached the hidden app.\n' >&2; exit 1; }
+geometry > "$output/geometry-stellar.json"
+cmp -- "$output/geometry-before.json" "$output/geometry-stellar.json"
+probe key 66
+eval_lua 'assert(require("cosmic").status().rewinding)'
+wait_lua 'require("cosmic").status().objects[1].nova_age<2 and not require("cosmic").status().objects[1].stored'
+capture stellar-reversed hidden
+probe key 66
+wait_lua 'require("cosmic").status().objects[1].nova_fragment_count==16'
+wait_lua 'require("cosmic").status().objects[1].nova_fragment_count==0 and require("cosmic").status().objects[1].nova_remnant'
+capture stellar-remnant hidden
+before_restore_press=$(event_count '"event":"key","key":30,"state":1' "$output/window.jsonl")
+before_restore_release=$(event_count '"event":"key","key":30,"state":0' "$output/window.jsonl")
+probe key 30
+wait_lua 'not require("cosmic").status().active'
+sleep .1
+[[ $(event_count '"event":"key","key":30,"state":1' "$output/window.jsonl") -eq $((before_restore_press+1)) ]] || { printf 'Stellar restoration key was lost or duplicated.\n' >&2; exit 1; }
+[[ $(event_count '"event":"key","key":30,"state":0' "$output/window.jsonl") -eq $((before_restore_release+1)) ]] || { printf 'Stellar restoration release was lost or duplicated.\n' >&2; exit 1; }
+capture stellar-restored visible
+geometry > "$output/geometry-stellar-restored.json"
+cmp -- "$output/geometry-before.json" "$output/geometry-stellar-restored.json"
+
+# The low-cost 2x2 mode uses the very same snapshot/selection lifecycle.
+eval_lua 'require("cosmic").setup({stellar={charge_seconds=.5,fragment_seconds=1,fragments=4}})'
+preview
+read -r nova_x nova_y <<< "$(ctl repl 'local o=require("cosmic").status().objects[1]; print(math.floor(o.x),math.floor(o.y))')"
+probe move "$nova_x" "$nova_y" 1280 720
+probe key 63
+wait_lua 'require("cosmic").status().objects[1].nova_fragment_count==4'
+capture stellar-four-fragments hidden
+eval_lua 'require("cosmic").action("emergency")'
+
+# A genuine second window makes spontaneous selection eligible; no synthetic
+# applications are launched by Cosmic itself. Timings are accelerated only in
+# this child compositor and restored before all existing safety regressions.
+env -u HYPRLAND_INSTANCE_SIGNATURE WAYLAND_DISPLAY="$socket" "$output/wayland-probe" --window 1 > "$output/stellar-second.jsonl" 2>&1 &
+extra_pid=$!
+sleep .3
+eval_lua 'require("cosmic").setup({stellar={automatic=true,interval_min=5,interval_max=5,charge_seconds=.5,fragment_seconds=1},effects={black_hole=false}})'
+preview
+sleep 4
+eval_lua 'local s=require("cosmic").status(); assert(s.active and #s.objects==2); for _,o in ipairs(s.objects) do assert(o.nova_age<0) end'
+wait_lua '(function() local n=0; for _,o in ipairs(require("cosmic").status().objects) do if o.nova_age>=0 then n=n+1 end end return n==1 end)()'
+eval_lua 'require("cosmic").action("emergency"); require("cosmic").setup(_cosmic_stellar_options); _cosmic_stellar_options=nil'
+stop_extra
+printf '%s\n' 'stellar: F5 pass-through/consumption, growth, 16/4 fragments, rewind, fixed GPU allocation, remnant, restoration and automatic selection passed' | tee -a "$output/stellar-checks.txt"
+if "$stellar_only"; then
+    eval_lua 'assert(not require("cosmic").status().active)'
+    printf '%s\n' 'PASS: isolated stellar supernova regressions; parent session was never changed.'
+    exit 0
+fi
 
 eval_lua 'require("cosmic").setup({rendering={hide_desktop_ui=false}})'
 preview
