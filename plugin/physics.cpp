@@ -8,7 +8,6 @@ namespace cosmic {
 namespace {
 constexpr double PI = 3.14159265358979323846;
 constexpr double TAU = 2.0 * PI;
-constexpr std::size_t HISTORY_BYTES = 16U * 1024U * 1024U;
 
 double finiteClamp(double value, double low, double high, double fallback) {
     return std::isfinite(value) ? std::clamp(value, low, high) : fallback;
@@ -39,6 +38,18 @@ double radius(const Body& body) {
 Vec2 softenedGravity(Vec2 distance, double strength, double softening) {
     const double squared = lengthSquared(distance) + softening * softening;
     return distance * (strength / (squared * std::sqrt(squared)));
+}
+uint64_t novaHash(uint64_t value) {
+    value += 0x9e3779b97f4a7c15ULL;
+    value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
+    return value ^ (value >> 31);
+}
+double novaRandom(uint64_t value) {
+    return static_cast<double>(novaHash(value) >> 11) / 9007199254740992.0;
+}
+bool novaEligible(const Body& body) {
+    return !body.stored && body.sink_progress <= 0.0 && body.portal_progress <= 0.0 && body.nova_age < 0.0;
 }
 double segmentPortalEntry(Vec2 start, Vec2 end, Vec2 center, double portal_radius) {
     const Vec2 offset = start - center, travel = end - start;
@@ -79,6 +90,7 @@ void Universe::configure(Config config) {
     config.max_particles = std::min<std::size_t>(config.max_particles, 2048);
     config.history_seconds = finiteClamp(config.history_seconds, 0.0, 60.0, 12.0);
     config.history_hz = finiteClamp(config.history_hz, 1.0, 60.0, 30.0);
+    config.history_bytes = std::clamp<std::size_t>(config.history_bytes, 1024U * 1024U, 64U * 1024U * 1024U);
     config.cursor_strength = finiteClamp(config.cursor_strength, 0.0, 20000000.0, 1400000.0);
     config.mutual_strength = finiteClamp(config.mutual_strength, 0.0, 2000000.0, 14000.0);
     config.softening = finiteClamp(config.softening, 10.0, 2000.0, 100.0);
@@ -91,6 +103,13 @@ void Universe::configure(Config config) {
     config.sink_duration = finiteClamp(config.sink_duration, 0.3, 20.0, 2.8);
     config.wormhole_cooldown = finiteClamp(config.wormhole_cooldown, 0.2, 20.0, 2.0);
     config.explosion_strength = finiteClamp(config.explosion_strength, 0.0, 3000.0, 320.0);
+    config.stellar_interval_min = finiteClamp(config.stellar_interval_min, 5.0, 1800.0, 70.0);
+    config.stellar_interval_max = finiteClamp(config.stellar_interval_max, config.stellar_interval_min, 1800.0,
+                                             std::max(config.stellar_interval_min, 130.0));
+    config.stellar_charge_seconds = finiteClamp(config.stellar_charge_seconds, 0.5, 15.0, 3.5);
+    config.stellar_fragment_seconds = finiteClamp(config.stellar_fragment_seconds, 1.0, 8.0, 3.0);
+    config.stellar_growth = finiteClamp(config.stellar_growth, 1.05, 2.5, 1.7);
+    config.stellar_fragments = config.stellar_fragments == 4 ? 4 : 16;
     const bool seed_changed = config.seed != m_config.seed;
     m_config = config;
     if (seed_changed)
@@ -102,6 +121,7 @@ void Universe::configure(Config config) {
     if (!config.supernova) {
         m_particles.clear();
         m_waves.clear();
+        for (auto& body : m_bodies) if (body.nova_age >= 0.0) cancelNova(body);
     }
     if (!config.wormholes) {
         for (auto& body : m_bodies) if (body.portal_progress > 0.0) cancelPortal(body);
@@ -124,9 +144,11 @@ void Universe::reset(std::vector<Body> bodies, std::vector<Region> regions, Vec2
     m_history.clear();
     m_wormholes.clear();
     m_random.seed(m_config.seed);
+    m_nova_serial = 0;
     m_cursor = safeVector(cursor);
     m_focused_id = focused_id;
     m_accumulator = m_history_accumulator = m_rewind_accumulator = m_time = 0.0;
+    scheduleNova();
     m_rewinding = false;
     m_gravity_mode = GravityMode::Cursor;
     for (auto region : regions) {
@@ -165,6 +187,7 @@ void Universe::normalizeBody(Body& body, bool initialize_velocity) {
     body.scale = finiteClamp(body.scale, 0.01, 0.42, std::min(0.42, 450.0 / std::max(body.width, body.height)));
     body.scale = std::min(body.scale, 450.0 / std::max(body.width, body.height));
     body.original_scale = body.scale;
+    body.nova_age = -1.0;
     body.stretch = finiteClamp(body.stretch, 1.0, 12.0, 1.0);
     body.twist = finiteClamp(body.twist, -8.0, 8.0, 0.0);
     body.angle = std::isfinite(body.angle) ? std::remainder(body.angle, TAU) : 0.0;
@@ -273,7 +296,7 @@ uint64_t Universe::hitTestInRegion(Vec2 screen_position, const int* visible_regi
         const Body& body = *iterator;
         if (visible_region && body.region != *visible_region)
             continue;
-        if (body.stored || body.sink_progress > 0.0 || body.portal_progress > 0.0 || body.scale < 0.001)
+        if (body.stored || body.sink_progress > 0.0 || body.portal_progress > 0.0 || body.nova_age >= 0.0 || body.scale < 0.001)
             continue;
         const auto& region = regionFor(body.region);
         if (screen_position.x < region.x || screen_position.x > region.x + region.width ||
@@ -305,6 +328,7 @@ bool Universe::startBlackHoleById(Vec2 screen_cursor, uint64_t id) {
     const auto found = std::find_if(m_bodies.begin(), m_bodies.end(), [&](const Body& body) { return body.id == id; });
     if (found == m_bodies.end())
         return false;
+    if (!novaEligible(*found)) return false;
     found->sink_progress = std::numeric_limits<double>::epsilon();
     // This center is captured once: later mouse motion does not drag the hole.
     found->sink_center = screenToWorld(screen_cursor, found->region);
@@ -341,12 +365,109 @@ double Universe::randomUnit() {
     return std::generate_canonical<double, 53>(m_random);
 }
 
+bool Universe::novaBusy() const {
+    return std::any_of(m_bodies.begin(), m_bodies.end(), [](const Body& body) {
+        return body.nova_age >= 0.0 && body.nova_age < body.nova_charge_seconds + body.nova_fragment_seconds;
+    });
+}
+
+void Universe::scheduleNova() {
+    const double jitter = novaRandom(m_config.seed ^ novaHash(m_nova_serial));
+    // A remaining duration, not an absolute deadline: the bounded expansion
+    // clock may reach its ten-hour ceiling without stopping future events.
+    m_next_nova = m_config.stellar_interval_min +
+                  (m_config.stellar_interval_max - m_config.stellar_interval_min) * jitter;
+}
+
+bool Universe::startStellarNova(Vec2 screen_cursor, int visible_region) {
+    return startStellarNova(hitTest(screen_cursor, visible_region));
+}
+
+bool Universe::startStellarNova(uint64_t id) {
+    if (!m_config.supernova || m_rewinding || novaBusy()) return false;
+    const auto selected = std::find_if(m_bodies.begin(), m_bodies.end(), [&](const Body& body) { return body.id == id; });
+    if (selected == m_bodies.end() || !novaEligible(*selected)) return false;
+    auto& body = *selected;
+    body.nova_age = 0.0;
+    body.nova_charge_seconds = m_config.stellar_charge_seconds;
+    body.nova_fragment_seconds = m_config.stellar_fragment_seconds;
+    body.nova_initial_scale = body.scale;
+    body.nova_growth = m_config.stellar_growth;
+    body.nova_start_stretch = body.stretch;
+    body.nova_start_twist = body.twist;
+    body.nova_grid = m_config.stellar_fragments == 4 ? 2 : 4;
+    body.nova_seed = novaHash(m_config.seed ^ body.id ^ novaHash(++m_nova_serial));
+    const Camera* camera = cameraFor(body.region);
+    body.nova_camera_center = camera ? camera->center : regionFor(body.region).center();
+    body.nova_camera_zoom = camera ? camera->zoom : 1.0;
+    // Keep the selected star in place so its warning and eventual remnant
+    // clearly belong together. Only the presentation stops, never the app.
+    body.velocity = {};
+    scheduleNova();
+    return true;
+}
+
+void Universe::advanceNova(Body& body, double dt) {
+    const double old_age = body.nova_age;
+    body.nova_age = std::min(body.nova_charge_seconds + body.nova_fragment_seconds, old_age + dt);
+    if (body.nova_age < body.nova_charge_seconds - 1e-12) {
+        const double progress = body.nova_age / body.nova_charge_seconds;
+        const double ease = smoothProgress(progress, 0.0);
+        body.scale = body.nova_initial_scale * (1.0 + (body.nova_growth - 1.0) * ease);
+        body.stretch = 1.0 + (body.nova_start_stretch - 1.0) * (1.0 - ease);
+        body.twist = body.nova_start_twist * (1.0 - ease);
+        body.angle = std::remainder(body.angle + body.angular_velocity * dt * (1.0 - ease), TAU);
+    } else if (old_age < body.nova_charge_seconds) {
+        body.nova_age = std::max(body.nova_age, body.nova_charge_seconds);
+        body.stored = true;
+        body.scale = 0.0;
+        body.stretch = 1.0;
+        body.twist = 0.0;
+        body.velocity = {};
+        supernova(body.position, body.region);
+    }
+}
+
+void Universe::cancelNova(Body& body) {
+    body.stored = false;
+    body.scale = body.nova_initial_scale;
+    body.stretch = body.nova_start_stretch;
+    body.twist = body.nova_start_twist;
+    body.nova_age = -1.0;
+}
+
+std::vector<NovaFragment> Universe::novaFragments(const Body& body) const {
+    std::vector<NovaFragment> result;
+    if (!m_config.supernova || body.nova_age < body.nova_charge_seconds ||
+        body.nova_age >= body.nova_charge_seconds + body.nova_fragment_seconds) return result;
+    const double age = body.nova_age - body.nova_charge_seconds;
+    const int grid = body.nova_grid == 2 ? 2 : 4;
+    const double burst_scale = body.nova_initial_scale * body.nova_growth;
+    const double travel = (1.0 - std::exp(-0.32 * age)) / 0.32;
+    const double fade = 1.0 - smoothProgress(age / body.nova_fragment_seconds, 0.60);
+    result.reserve(grid * grid);
+    for (int row = 0; row < grid; ++row) for (int column = 0; column < grid; ++column) {
+        const uint64_t key = body.nova_seed ^ novaHash(static_cast<uint64_t>(row * grid + column));
+        const Vec2 local{(static_cast<double>(column) + 0.5 - grid * 0.5) * body.width * burst_scale / grid,
+                         (static_cast<double>(row) + 0.5 - grid * 0.5) * body.height * burst_scale / grid};
+        const Vec2 offset = rotate(local, body.angle);
+        const double direction = std::atan2(offset.y, offset.x) + (novaRandom(key) - 0.5) * 0.45;
+        const double speed = std::min(m_config.max_speed, 150.0 + novaRandom(key + 1) * 290.0);
+        const double spin = (novaRandom(key + 2) - 0.5) * 5.5;
+        result.push_back({body.position + offset + rotate({speed * travel, 0.0}, direction),
+                          body.angle + spin * age,
+                          burst_scale * (1.0 - 0.28 * smoothProgress(age / body.nova_fragment_seconds, 0.0)),
+                          fade, column, row, grid});
+    }
+    return result;
+}
+
 void Universe::supernova(Vec2 position, int region) {
     if (!m_config.supernova || m_rewinding)
         return;
     position = safeVector(position, regionFor(region).center());
     for (auto& body : m_bodies) {
-        if (body.stored || body.region != region || body.sink_progress > 0.0 || body.portal_progress > 0.0)
+        if (body.stored || body.region != region || body.sink_progress > 0.0 || body.portal_progress > 0.0 || body.nova_age >= 0.0)
             continue;
         Vec2 displacement = body.position - position;
         const double distance = length(displacement);
@@ -523,7 +644,7 @@ void Universe::setBinaryPreset() {
     Body* first = nullptr;
     Body* second = nullptr;
     for (auto& body : m_bodies) {
-        if (body.stored || body.sink_progress > 0.0 || body.portal_progress > 0.0)
+        if (body.stored || body.sink_progress > 0.0 || body.portal_progress > 0.0 || body.nova_age >= 0.0)
             continue;
         if (!first)
             first = &body;
@@ -549,27 +670,51 @@ void Universe::setBinaryPreset() {
 }
 
 void Universe::integrate(double dt) {
+    m_next_nova = std::max(0.0, m_next_nova - dt);
+    if (m_config.supernova && m_config.stellar_automatic && m_next_nova <= 1e-12) {
+        if (!novaBusy()) {
+            std::vector<uint64_t> eligible;
+            for (const auto& body : m_bodies) if (novaEligible(body)) eligible.push_back(body.id);
+            // Do not automatically destroy the only remaining floating image.
+            // Manual selection deliberately still allows that final star.
+            if (eligible.size() >= 2) {
+                const auto index = static_cast<std::size_t>(novaHash(m_config.seed ^ m_nova_serial) % eligible.size());
+                startStellarNova(eligible[index]);
+            } else {
+                ++m_nova_serial;
+                scheduleNova();
+            }
+        }
+    }
     std::vector<Vec2> acceleration(m_bodies.size());
     // A completed transit still keeps its promised exit velocity for this step.
     std::vector<bool> portal_updated(m_bodies.size(), false);
     for (std::size_t index = 0; index < m_bodies.size(); ++index) {
         const auto& body = m_bodies[index];
-        if (body.stored || body.sink_progress > 0.0 || body.portal_progress > 0.0)
+        if (body.stored || body.sink_progress > 0.0 || body.portal_progress > 0.0 || body.nova_age >= 0.0)
             continue;
         if (m_config.cursor_gravity && m_gravity_mode == GravityMode::Cursor)
             acceleration[index] += softenedGravity(screenToWorld(m_cursor, body.region) - body.position,
                                                    m_config.cursor_strength, m_config.softening);
         if (m_config.expansion)
             acceleration[index] += (body.position - regionFor(body.region).center()) * (m_config.expansion_rate * 0.14);
+        if (m_config.black_hole) {
+            for (const auto& remnant : m_bodies) {
+                if (remnant.id == body.id || remnant.region != body.region ||
+                    remnant.nova_age < remnant.nova_charge_seconds) continue;
+                acceleration[index] += softenedGravity(remnant.position - body.position,
+                                                       m_config.cursor_strength * 0.6, m_config.softening);
+            }
+        }
     }
     if (m_config.binary) {
         for (std::size_t first = 0; first < m_bodies.size(); ++first) {
             const auto& a = m_bodies[first];
-            if (a.stored || a.sink_progress > 0.0 || a.portal_progress > 0.0)
+            if (a.stored || a.sink_progress > 0.0 || a.portal_progress > 0.0 || a.nova_age >= 0.0)
                 continue;
             for (std::size_t second = first + 1; second < m_bodies.size(); ++second) {
                 const auto& b = m_bodies[second];
-                if (b.stored || b.sink_progress > 0.0 || b.portal_progress > 0.0 || a.region != b.region)
+                if (b.stored || b.sink_progress > 0.0 || b.portal_progress > 0.0 || b.nova_age >= 0.0 || a.region != b.region)
                     continue;
                 const bool focused_pair = m_gravity_mode == GravityMode::Focused && (a.id == m_focused_id || b.id == m_focused_id);
                 const double strength = m_config.mutual_strength * (focused_pair ? 8.0 : 1.0);
@@ -583,6 +728,10 @@ void Universe::integrate(double dt) {
     for (std::size_t index = 0; index < m_bodies.size(); ++index) {
         auto& body = m_bodies[index];
         body.cooldown = std::max(0.0, body.cooldown - dt);
+        if (body.nova_age >= 0.0) {
+            advanceNova(body, dt);
+            continue;
+        }
         if (body.stored)
             continue;
         if (body.portal_progress > 0.0) {
@@ -644,6 +793,17 @@ void Universe::integrate(double dt) {
             body.position += (body.position - regionFor(body.region).center()) * (m_config.expansion_rate * dt);
         body.angle = std::remainder(body.angle + body.angular_velocity * dt, TAU);
         body.angular_velocity *= std::exp(-0.008 * dt);
+        if (m_config.black_hole) {
+            for (const auto& remnant : m_bodies) {
+                if (remnant.id == body.id || remnant.region != body.region ||
+                    remnant.nova_age < remnant.nova_charge_seconds) continue;
+                if (std::isfinite(segmentPortalEntry(previous_position, body.position, remnant.position, 22.0))) {
+                    startBlackHoleById(worldToScreen(remnant.position, remnant.region), body.id);
+                    break;
+                }
+            }
+            if (body.sink_progress > 0.0) continue;
+        }
         if (m_config.wormholes && body.cooldown <= 0.0) {
             const Wormhole* selected = nullptr;
             double nearest = std::numeric_limits<double>::infinity();
@@ -662,11 +822,11 @@ void Universe::integrate(double dt) {
     if (m_config.collisions && m_config.collision_strength > 0.0) {
         for (std::size_t first = 0; first < m_bodies.size(); ++first) {
             auto& a = m_bodies[first];
-            if (a.stored || a.sink_progress > 0.0 || a.portal_progress > 0.0 || portal_updated[first])
+            if (a.stored || a.sink_progress > 0.0 || a.portal_progress > 0.0 || a.nova_age >= 0.0 || portal_updated[first])
                 continue;
             for (std::size_t second = first + 1; second < m_bodies.size(); ++second) {
                 auto& b = m_bodies[second];
-                if (b.stored || b.sink_progress > 0.0 || b.portal_progress > 0.0 || portal_updated[second] || a.region != b.region)
+                if (b.stored || b.sink_progress > 0.0 || b.portal_progress > 0.0 || b.nova_age >= 0.0 || portal_updated[second] || a.region != b.region)
                     continue;
                 const Vec2 offset = b.position - a.position;
                 const double distance = length(offset), contact = radius(a) + radius(b);
@@ -690,7 +850,7 @@ void Universe::integrate(double dt) {
     }
     for (std::size_t index = 0; index < m_bodies.size(); ++index) {
         auto& body = m_bodies[index];
-        if (body.stored || body.sink_progress > 0.0 || body.portal_progress > 0.0 || portal_updated[index])
+        if (body.stored || body.sink_progress > 0.0 || body.portal_progress > 0.0 || body.nova_age >= 0.0 || portal_updated[index])
             continue;
         const auto& region = regionFor(body.region);
         const double expansion = m_config.expansion ? std::min(5.0, 1.0 + m_time * m_config.expansion_rate * 0.5) : 1.0;
@@ -737,6 +897,15 @@ void Universe::integrate(double dt) {
 void Universe::updateCameras(double dt) {
     for (auto& camera : m_cameras) {
         const auto& region = regionFor(camera.region);
+        const auto nova = std::find_if(m_bodies.begin(), m_bodies.end(), [&](const Body& body) {
+            return body.region == camera.region && body.nova_age >= 0.0 &&
+                   body.nova_age < body.nova_charge_seconds + body.nova_fragment_seconds;
+        });
+        if (nova != m_bodies.end()) {
+            camera.center = nova->nova_camera_center;
+            camera.zoom = nova->nova_camera_zoom;
+            continue;
+        }
         const auto sinking = std::find_if(m_bodies.begin(), m_bodies.end(), [&](const Body& body) {
             return body.region == camera.region && body.sink_progress > 0.0 && !body.stored;
         });
@@ -759,9 +928,9 @@ void Universe::updateCameras(double dt) {
         double minimum_x = region.x, maximum_x = region.x + region.width;
         double minimum_y = region.y, maximum_y = region.y + region.height;
         for (const auto& body : m_bodies) {
-            if (body.region != camera.region || body.stored)
+            if (body.region != camera.region || (body.stored && body.nova_age < 0.0))
                 continue;
-            const double padding = radius(body) * std::max(1.0, body.stretch) + 40.0;
+            const double padding = body.stored ? 90.0 : radius(body) * std::max(1.0, body.stretch) + 40.0;
             minimum_x = std::min(minimum_x, body.position.x - padding);
             maximum_x = std::max(maximum_x, body.position.x + padding);
             minimum_y = std::min(minimum_y, body.position.y - padding);
@@ -786,7 +955,7 @@ void Universe::resizeHistory() {
         largest_frame = std::max(largest_frame, frame.bodies.capacity());
     const std::size_t frame_bytes = sizeof(Frame) + sizeof(Body) * largest_frame;
     m_history_limit = m_config.rewind && m_config.history_seconds > 0.0
-                          ? std::clamp<std::size_t>(requested, 2, std::max<std::size_t>(2, HISTORY_BYTES / frame_bytes)) : 0;
+                          ? std::clamp<std::size_t>(requested, 2, std::max<std::size_t>(2, m_config.history_bytes / frame_bytes)) : 0;
     while (m_history.size() > m_history_limit)
         m_history.pop_front();
     if (m_history_limit == 0)
@@ -798,7 +967,7 @@ void Universe::recordFrame() {
         return;
     if (m_history.size() >= m_history_limit)
         m_history.pop_front();
-    m_history.push_back({m_bodies, m_time});
+    m_history.push_back({m_bodies, m_time, m_next_nova, m_nova_serial, m_random});
 }
 
 void Universe::restoreFrame(const Frame& frame) {
@@ -808,10 +977,19 @@ void Universe::restoreFrame(const Frame& frame) {
         const auto previous = std::find_if(frame.bodies.begin(), frame.bodies.end(), [&](const Body& old) { return old.id == body.id; });
         if (previous != frame.bodies.end())
             body = *previous;
+        else if (body.nova_age >= 0.0)
+            // Its app still exists, but its later stellar event must not
+            // overlap the historical event being restored on another body.
+            cancelNova(body);
         if (!m_config.wormholes && body.portal_progress > 0.0)
             cancelPortal(body);
+        if (!m_config.supernova && body.nova_age >= 0.0)
+            cancelNova(body);
     }
     m_time = frame.time;
+    m_next_nova = frame.next_nova;
+    m_nova_serial = frame.nova_serial;
+    m_random = frame.random;
     updateCameras(0.0);
 }
 
