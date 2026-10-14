@@ -3,6 +3,7 @@
 -- startup config.reloaded may precede construction of the plugin manager.
 local Config = require("cosmic.config")
 local UserConfig = require("cosmic.user_config")
+local Observation = require("cosmic.observation")
 local M = {}
 local options = Config.copy(Config.defaults)
 local initialized, stopped, warned, configuration_ready = false, false, false, false
@@ -160,7 +161,7 @@ local function initialize()
     local ok, message = load_config_file()
     if not ok then warn(message); return nil, message end
     cancel_initialization()
-    ok, message = call("setup", Config.copy(options))
+    ok, message = call("setup", Config.copy(options), options.observation.formatter or Observation.format)
     if not ok then warn(message); return nil, message end
     ok, message = bind_controls()
     if not ok then call("shutdown"); warn(message); return nil, message end
@@ -223,7 +224,7 @@ function M.setup(update)
     config_file_error = nil
     if initialized then
         local ok
-        ok, message = call("setup", Config.copy(validated))
+        ok, message = call("setup", Config.copy(validated), validated.observation.formatter or Observation.format)
         if not ok then
             remove_bindings()
             initialized = false
@@ -260,7 +261,7 @@ function M.enable()
     options.enabled = true
     if not config_read then pending_updates[#pending_updates + 1] = { enabled = true } end
     if initialized then
-        local ok, message = call("enable")
+        local ok, message = call("enable", options.observation.formatter or Observation.format)
         if not ok then warn(message); return nil, message end
         return bind_controls()
     end
