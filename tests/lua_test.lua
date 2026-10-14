@@ -3,6 +3,7 @@
 local root = arg[1] or "."
 package.path = root .. "/lua/?.lua;" .. root .. "/lua/?/init.lua;" .. package.path
 local Config = require("cosmic.config")
+local Observation = require("cosmic.observation")
 local checks = 0
 local function check(condition, message)
     checks = checks + 1
@@ -10,6 +11,92 @@ local function check(condition, message)
 end
 
 local default_idle = assert(Config.normalize())
+check(default_idle.observation.enabled and default_idle.observation.delay == 0.35 and
+    default_idle.observation.distance == 24 and default_idle.observation.formatter == false,
+    "passive observation defaults to a short dwell, twenty-four-pixel proximity and the bundled formatter")
+local formatter = function(context) return { "CUSTOM: " .. context.kind } end
+local custom_observation = assert(Config.normalize({ observation = {
+    enabled = false, delay = 1.2, distance = 0, formatter = formatter,
+} }))
+local partial_observation = assert(Config.normalize({ observation = { distance = 96 } }, custom_observation))
+local preset_observation = assert(Config.normalize({ preset = "demo" }, partial_observation))
+check(not partial_observation.observation.enabled and partial_observation.observation.delay == 1.2 and
+    partial_observation.observation.distance == 96 and partial_observation.observation.formatter == formatter and
+    custom_observation.observation.distance == 0 and preset_observation.observation.formatter == formatter,
+    "partial configuration, copies and preset changes preserve custom observation callbacks without mutation")
+check(Config.copy(custom_observation).observation.formatter == formatter and
+    Config.normalize({ observation = { formatter = false } }, custom_observation).observation.formatter == false,
+    "functions retain identity in copied options and false explicitly restores the bundled formatter")
+for _, field in ipairs({"delay", "distance"}) do
+    local maximum = field == "delay" and 3 or 96
+    for _, boundary in ipairs({0, maximum}) do
+        check(Config.normalize({ observation = { [field] = boundary } }).observation[field] == boundary,
+            "observation." .. field .. " accepts both effective boundaries")
+    end
+    for _, invalid in ipairs({-0.001, maximum + 0.001, 0 / 0, math.huge, -math.huge, "1", false, {}}) do
+        local accepted, diagnostic = Config.normalize({ observation = { [field] = invalid } }, custom_observation)
+        check(not accepted and diagnostic:find("observation." .. field, 1, true),
+            "invalid observation numeric settings identify their exact configuration path")
+        check(custom_observation.observation.formatter == formatter,
+            "invalid observation updates leave accepted callback ownership untouched")
+    end
+end
+for _, invalid in ipairs({true, 1, "default", {}, coroutine.create(function() end)}) do
+    local accepted, diagnostic = Config.normalize({ observation = { formatter = invalid } })
+    check(not accepted and diagnostic:find("observation.formatter", 1, true),
+        "only a Lua function or false can select an observation formatter")
+end
+for _, invalid in ipairs({0, "true", {}, function() end}) do
+    check(not Config.normalize({ observation = { enabled = invalid } }),
+        "observation enablement remains a strict boolean")
+end
+check(not Config.normalize({ observation = { typo = true } }) and
+    not Config.normalize({ observation = false }), "observation rejects unknown fields and a non-table patch")
+
+local function bounded_card(context)
+    local lines = Observation.format(context)
+    check(type(lines) == "table" and #lines <= 8, "default observation cards are bounded dense arrays")
+    local count = 0
+    for index, line in pairs(lines) do
+        count = count + 1
+        check(type(index) == "number" and index >= 1 and index <= #lines and
+            type(line) == "string" and #line <= 52 and not line:find("[^ -~]"),
+            "each default observation line is short printable ASCII")
+    end
+    check(count == #lines, "default observation cards never contain hidden or sparse keys")
+    return lines
+end
+local card = bounded_card({ id = 123, source_id = 123, origin = "org.wezfurlong.wezterm", kind = "WINDOW",
+    age_seconds = 184.9, nova_event = 0, wormhole_transits = 3, title = "PRIVATE SECRET" })
+check(card[1] == "NAME: WINDOW #123" and card[2] == "ORIGIN: ORG.WEZFURLONG.WEZTERM" and
+    card[3] == "TYPE: WINDOW" and card[4] == "SUPERNOVA: NONE" and
+    card[5] == "WORMHOLE TRANSITS: 3" and card[6] == "AGE: 184s" and #card == 6,
+    "ordinary cards display actual application class, exact source identity, portal history and floored age")
+check(not table.concat(card, " "):find("PRIVATE", 1, true),
+    "the bundled formatter never displays application titles or guesses an application category")
+local shard_card = bounded_card({ id = -3, source_id = 123, origin = "kitty", kind = "FRAGMENT",
+    fragment_grid = 4, fragment_row = 0, fragment_column = 3, nova_event = 12,
+    wormhole_transits = 4, age_seconds = 8.8, rewinding = true })
+check(shard_card[1] == "NAME: SHARD 1,4 OF #123" and shard_card[3] == "TYPE: FRAGMENT 1,4 / 4x4" and
+    shard_card[4] == "SUPERNOVA: #12" and shard_card[7] == "TIMELINE: REWIND",
+    "fragment cards translate zero-based texture coordinates into one-based provenance and mark rewind")
+local transit_card = bounded_card({ source_id = 123, kind = "TRANSIT", fragment_grid = 2,
+    fragment_row = 1, fragment_column = 0, wormhole_transits = 5 })
+check(transit_card[3] == "TYPE: FRAGMENT 2,1 / 2x2 / TRANSIT",
+    "fragment cards retain their original tile identity while in transit")
+check(bounded_card({ source_id = 123, kind = "REMNANT" })[1] == "NAME: REMNANT #123",
+    "a selectable supernova remnant has its own label without duplicating an ordinary window")
+local sanitized = bounded_card({ source_id = 0x7FFFFFFFFFFFFFFF, origin = "\n evil\0\t日本\27[31m " .. string.rep("x", 5000),
+    kind = "INVALID", age_seconds = math.huge, nova_event = 0 / 0, wormhole_transits = -10 })
+check(sanitized[1] == "NAME: WINDOW #9223372036854775807" and #sanitized[2] == 52 and
+    sanitized[3] == "TYPE: WINDOW" and sanitized[4] == "SUPERNOVA: NONE" and
+    sanitized[5] == "WORMHOLE TRANSITS: 0" and sanitized[6] == "AGE: 0s",
+    "class control bytes and long text are bounded while sixty-four-bit IDs remain exact")
+for _, malformed in ipairs({false, 42, "text", {}, { origin = false, fragment_grid = 8 },
+    { id = math.huge, age_seconds = -1, fragment_grid = 4, fragment_row = 999, fragment_column = -2 }}) do
+    bounded_card(malformed)
+end
+check(bounded_card(nil)[2] == "ORIGIN: UNKNOWN", "an absent context still produces safe fallback text")
 check(default_idle.idle_timeout == 60 and Config.defaults.idle_timeout == 60,
     "the default cosmic idle activation delay is sixty seconds")
 local short_idle = assert(Config.normalize({ idle_timeout = 5 }))
@@ -239,20 +326,33 @@ local function mock(mode, user_config_source)
             if state.reader_error then return nil, state.reader_error, true end
             return state.user_config_source, nil, state.user_config_source ~= nil
         end,
-        setup = function(options)
+        setup = function(options, observation_callback)
             state.setups = state.setups + 1
             state.active = false
             if state.fail_setup then state.initialized = false; state.enabled = false; return nil, "runtime setup failure" end
             if mode == "nil-error" then return nil, "test initialization failure" end
             if mode == "throw" then error("test exception") end
             state.options = Config.copy(options)
+            state.observation_callback = observation_callback
             state.enabled = options.enabled
             state.initialized = options.enabled
             return true
         end,
-        enable = function() state.enable = state.enable + 1; state.enabled = true; state.initialized = true; return true end,
-        disable = function() state.disable = state.disable + 1; state.enabled = false; state.initialized = false; state.active = false; return true end,
-        shutdown = function() state.shutdown = state.shutdown + 1; state.enabled = false; state.initialized = false; state.active = false; return true end,
+        enable = function(observation_callback)
+            state.enable = state.enable + 1; state.enabled = true; state.initialized = true
+            state.observation_callback = observation_callback
+            return true
+        end,
+        disable = function()
+            state.disable = state.disable + 1; state.enabled = false; state.initialized = false; state.active = false
+            state.observation_callback = nil
+            return true
+        end,
+        shutdown = function()
+            state.shutdown = state.shutdown + 1; state.enabled = false; state.initialized = false; state.active = false
+            state.observation_callback = nil
+            return true
+        end,
         action = function(action)
             state.actions[#state.actions + 1] = action
             if state.fail_action then return nil, "fixture action failure" end
@@ -335,6 +435,8 @@ check(cosmic.setup({ idle_timeout = 6 }) == cosmic, "setup before plugin load re
 state.fire("config.reloaded")
 state.fire("config.reloaded")
 check(state.setups == 1 and state.options.idle_timeout == 6, "recursive plugin reload emits initialize only once")
+check(state.observation_callback == Observation.format,
+    "native initialization receives the bundled formatter as its separately owned second argument")
 check(state.live_bindings() == 8 and state.live_events() == 2, "one set of controls and event ownership")
 check(cosmic.setup({ effects = { wormholes = false }, controls = { supernova = false } }) == cosmic, "setup updates native options")
 check(state.live_bindings() == 7 and state.setups == 2, "setup replaces bindings without duplication")
@@ -350,15 +452,39 @@ local status = cosmic.status()
 status.config.effects.orbit = false
 check(cosmic.status().config.effects.orbit, "status returns independent configuration data")
 check(cosmic.disable() and not cosmic.status().initialized and cosmic.status().module_initialized and state.live_bindings() == 0, "disable releases native watchers and consuming controls")
+check(state.observation_callback == nil, "disable releases native observation callback ownership")
 check(cosmic.enable() and cosmic.status().initialized and state.live_bindings() == 7, "enable restores one set of watchers and controls")
+check(state.observation_callback == Observation.format, "enable re-registers the formatter after native shutdown released it")
 check(cosmic.action("black_hole") and state.actions[1] == "black_hole", "dedicated actions reach native API")
 check(not cosmic.action("invalid"), "unknown actions are rejected")
 check(cosmic.shutdown() and cosmic.shutdown(), "shutdown is repeatable")
 check(state.shutdown == 1 and state.live_bindings() == 0 and state.live_events() == 0, "shutdown releases all Lua ownership once")
+check(state.observation_callback == nil, "full shutdown releases observation callback ownership")
 check(not cosmic.enable(), "enable after full shutdown requires setup")
 check(cosmic.setup({ enabled = false }) == cosmic and state.setups == 4 and state.live_bindings() == 0, "setup restarts ownership after shutdown without enabling consuming controls")
 state.fire("hyprland.shutdown")
 check(state.live_bindings() == 0 and state.live_events() == 0 and cosmic.status().input_watchers == 0, "compositor shutdown cleans module ownership and exposes native counters")
+
+local observed, observing = mock("success", [[
+    return { observation = { formatter = function(context) return { "LOCAL: " .. context.kind } end } }
+]])
+observing.fire("config.reloaded")
+local file_formatter = observed.status().config.observation.formatter
+check(type(file_formatter) == "function" and observing.observation_callback == file_formatter and
+    observing.observation_callback({ kind = "WINDOW" })[1] == "LOCAL: WINDOW",
+    "a real function loaded from dedicated settings is registered without serialization or eager execution")
+check(observed.setup({ observation = { formatter = formatter, distance = 48 } }) == observed and
+    observing.observation_callback == formatter and observing.options.observation.distance == 48,
+    "runtime setup atomically replaces the separately registered observation callback")
+check(observed.setup({ idle_timeout = 99 }) == observed and observing.observation_callback == formatter,
+    "unrelated partial setup retains the active custom formatter")
+check(observed.disable() and not observing.observation_callback and observed.enable() and
+    observing.observation_callback == formatter,
+    "disable and enable preserve configured custom code while releasing and restoring native references")
+check(observed.setup({ observation = { formatter = false, enabled = false } }) == observed and
+    observing.observation_callback == Observation.format and not observing.options.observation.enabled,
+    "false restores the bundled formatter and disabling only cards leaves Cosmic controls available")
+observed.shutdown()
 
 local stellar_module, stellar_state = mock("success")
 stellar_state.fire("config.reloaded")
@@ -492,6 +618,21 @@ check(deferred_file.setups == 1 and deferred_file.notifications == 0 and
     not delayed_file.status().initialization_pending,
     "deferred settings initialization registers one native setup without warnings or stale probes")
 delayed_file.shutdown()
+
+local delayed_observation, deferred_observation = mock("delayed", [[
+    return { observation = { delay = 0.8,
+        formatter = function() return { "FILE OBSERVATORY" } end } }
+]])
+check(delayed_observation.setup({ observation = { formatter = formatter } }) == delayed_observation,
+    "an explicit formatter can be recorded before the safe native user-file reader is available")
+deferred_observation.fire("config.reloaded")
+deferred_observation.publish_native()
+deferred_observation.fire_timers()
+check(deferred_observation.observation_callback == formatter and
+    deferred_observation.options.observation.formatter == formatter and
+    deferred_observation.options.observation.delay == 0.8,
+    "deferred startup preserves callback identity and gives explicit setup priority over a file formatter")
+delayed_observation.shutdown()
 
 local delayed_disabled, deferred_disabled = mock("delayed", "return {enabled=true, idle_timeout=91}")
 check(delayed_disabled.disable(), "disable before native availability records the requested state")
