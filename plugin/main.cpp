@@ -17,6 +17,7 @@
 #include <hyprland/src/managers/fullscreen/FullscreenController.hpp>
 #include <hyprland/src/managers/eventLoop/EventLoopManager.hpp>
 #include <hyprland/src/render/Renderer.hpp>
+#include <hyprland/src/config/lua/ConfigManager.hpp>
 #include <lua.hpp>
 #include <linux/input-event-codes.h>
 #include <algorithm>
@@ -60,6 +61,8 @@ struct Options {
     double idleTimeout = 60, fps = 60, snapshotHz = 4;
     bool enabled = true, excludeFullscreen = true, excludeInhibit = true, excludeShare = true;
     bool hideDesktopUI = true;
+    bool observationEnabled = true;
+    double observationDelay = .35, observationDistance = 24;
     std::size_t snapshotBudget = 128 * 1024 * 1024;
     std::vector<std::regex> excluded;
     std::vector<Control> controls;
@@ -101,6 +104,205 @@ Clock::time_point lastInput = Clock::now(), lastTick = lastInput, lastCapture = 
     std::size_t refreshIndex = 0, snapshotBytes = 0;
     uint64_t physicsSteps = 0;
     double lastBootTime = bootTime();
+    lua_State* observationLua = nullptr;
+    Config::Lua::CConfigManager* observationManager = nullptr;
+    int observationFormatter = LUA_NOREF;
+    uint64_t observationCandidate = 0, observationId = 0;
+    uint64_t observationGeneration = 0, observationCalls = 0;
+    Clock::time_point observationSince{}, observationProbe{}, observationUpdated{}, observationFormatted{};
+    std::vector<std::string> observationLines;
+    uint64_t observationEvent = 0, observationTransits = 0;
+    int observationRegion = 0;
+    std::string observationState;
+    std::string observationError;
+    bool observationFormatting = false;
+
+    void clearObservation(bool resetError = false) {
+        ++observationGeneration;
+        observationCandidate = observationId = 0;
+        observationSince = observationProbe = observationUpdated = Clock::time_point{};
+        observationLines.clear();
+        observationState.clear();
+        renderer.clearObservationCard();
+        if (resetError) { observationError.clear(); observationFormatted = Clock::time_point{}; }
+    }
+    void releaseObservationFormatter() {
+        if (observationLua && observationFormatter != LUA_NOREF)
+            luaL_unref(observationLua, LUA_REGISTRYINDEX, observationFormatter);
+        observationFormatter = LUA_NOREF;
+        observationLua = nullptr;
+        observationManager = nullptr;
+    }
+    void setObservationFormatter(lua_State* L, int argument) {
+        if (!lua_isfunction(L, argument)) return;
+        clearObservation(true);
+        releaseObservationFormatter();
+        observationManager = Config::Lua::CConfigManager::fromLuaState(L);
+        lua_rawgeti(L, LUA_REGISTRYINDEX, LUA_RIDX_MAINTHREAD);
+        observationLua = lua_tothread(L, -1);
+        lua_pop(L, 1);
+        if (!observationManager || !observationLua) {
+            observationLua = nullptr;
+            observationManager = nullptr;
+            return;
+        }
+        lua_pushvalue(L, argument);
+        observationFormatter = luaL_ref(L, LUA_REGISTRYINDEX);
+    }
+
+    static const char* observationKind(const Body& body) {
+        if (body.nova_age >= body.nova_charge_seconds) return "REMNANT";
+        if (body.nova_age >= 0) return "CHARGING";
+        if (body.sink_progress > 0) return "SINKING";
+        if (body.portal_progress > 0) return "TRANSIT";
+        return body.fragment_grid > 0 ? "FRAGMENT" : "WINDOW";
+    }
+    void validateObservation() {
+        if (!observationId) return;
+        const auto body = std::ranges::find_if(universe.bodies(), [&](const Body& b) { return b.id == observationId; });
+        if (body == universe.bodies().end() || body->nova_event != observationEvent ||
+            body->wormhole_transits != observationTransits || observationKind(*body) != observationState ||
+            body->region != observationRegion ||
+            ((body->stored || body->scale < .0001) && observationState != "REMNANT")) {
+            // A rewind can remove a future shard between proximity probes.
+            // Never display its obsolete event/count while awaiting the next
+            // bounded Lua update; hide it immediately on the simulation tick.
+            observationId = 0;
+            observationLines.clear();
+            observationUpdated = Clock::time_point{};
+            renderer.clearObservationCard();
+        }
+    }
+    std::string observationOrigin(uint64_t source) const {
+        const auto shot = std::ranges::find_if(snapshots, [=](const Snapshot& s) { return s.id == source; });
+        if (shot == snapshots.end()) return "UNKNOWN";
+        const auto window = shot->window.lock();
+        if (!window) return "UNKNOWN";
+        // Never expose page titles, command lines or a window's textual content.
+        // The ASCII-only, bounded identity is supplied by the application.
+        std::string result;
+        for (const unsigned char c : window->m_initialClass.empty() ? window->m_class : window->m_initialClass) {
+            if (result.size() >= 96) break;
+            result.push_back(c >= 32 && c <= 126 ? char(c) : '?');
+        }
+        return result.empty() ? "UNKNOWN" : result;
+    }
+    static void pushObservationContext(lua_State* L, const Body& body, const std::string& origin, bool rewind) {
+        lua_newtable(L);
+        const auto integer = [&](const char* name, uint64_t value) {
+            lua_pushinteger(L, static_cast<lua_Integer>(value)); lua_setfield(L, -2, name);
+        };
+        integer("id", body.id); integer("source_id", body.source_id);
+        integer("nova_event", body.nova_event); integer("wormhole_transits", body.wormhole_transits);
+        integer("fragment_grid", body.fragment_grid);
+        integer("fragment_row", body.fragment_row); integer("fragment_column", body.fragment_column);
+        lua_pushnumber(L, body.age_seconds); lua_setfield(L, -2, "age_seconds");
+        lua_pushinteger(L, body.region); lua_setfield(L, -2, "region");
+        lua_pushboolean(L, rewind); lua_setfield(L, -2, "rewinding");
+        lua_pushstring(L, observationKind(body)); lua_setfield(L, -2, "kind");
+        lua_pushlstring(L, origin.data(), origin.size()); lua_setfield(L, -2, "origin");
+    }
+    void updateObservation(Clock::time_point now) {
+        if (!active || !options.observationEnabled || !observationError.empty() ||
+            !observationLua || !observationManager || observationFormatter == LUA_NOREF || observationFormatting) return;
+        // Geometry is tested at most twenty times per second, independently of
+        // output count; Lua/text updates run at most twice per second.
+        if (observationProbe != Clock::time_point{} && now - observationProbe < std::chrono::milliseconds(50)) return;
+        observationProbe = now;
+        const auto location = actionLocation();
+        double margin = options.observationDistance;
+        const auto point = cursor();
+        if (const auto inset = peerViewLayout(universe, viewedRegion()); inset && inset->containsContent(point))
+            margin /= inset->scale;
+        const uint64_t target = location ? universe.observationTarget(location->first, location->second, margin) : 0;
+        if (!target || target != observationCandidate) {
+            observationCandidate = target;
+            observationSince = now;
+            observationId = 0;
+            observationUpdated = Clock::time_point{};
+            observationLines.clear();
+            renderer.clearObservationCard();
+        }
+        if (!target || std::chrono::duration<double>(now - observationSince).count() < options.observationDelay) return;
+        if (observationId == target && now - observationUpdated < std::chrono::milliseconds(500)) {
+            renderer.setObservationCard({observationId, point, observationLines});
+            return;
+        }
+        const auto found = std::ranges::find_if(universe.bodies(), [=](const Body& b) { return b.id == target; });
+        if (found == universe.bodies().end()) return;
+        if (observationFormatted != Clock::time_point{} && now - observationFormatted < std::chrono::milliseconds(500)) return;
+        // Copy all context before calling user Lua: a callback can request a
+        // normal shutdown/setup, which invalidates universe actor references.
+        const Body body = *found;
+        const std::string origin = observationOrigin(body.source_id);
+        const uint64_t generation = observationGeneration;
+        lua_State* L = observationLua;
+        const int stackTop = lua_gettop(L);
+        lua_rawgeti(L, LUA_REGISTRYINDEX, observationFormatter);
+        pushObservationContext(L, body, origin, universe.rewinding());
+        observationFormatting = true;
+        observationFormatted = now;
+        ++observationCalls;
+        const int result = observationManager->guardedPCall(1, 1, 0, 10, "Cosmic observation formatter");
+        observationFormatting = false;
+        if (generation != observationGeneration || !active) { lua_settop(L, stackTop); return; }
+        std::string error;
+        std::vector<std::string> lines;
+        if (result != LUA_OK) {
+            error = "formatter failed";
+            if (lua_type(L, -1) == LUA_TSTRING) {
+                std::size_t bytes = 0;
+                const char* message = lua_tolstring(L, -1, &bytes);
+                error += ": ";
+                for (std::size_t i = 0; i < std::min<std::size_t>(bytes, 180); ++i) {
+                    const unsigned char c = message[i];
+                    error.push_back(c >= 32 && c <= 126 ? char(c) : '?');
+                }
+            }
+        } else if (!lua_istable(L, -1) || lua_rawlen(L, -1) > 8) {
+            error = "formatter must return an array of at most 8 ASCII lines";
+        } else {
+            const int table = lua_gettop(L);
+            const std::size_t length = lua_rawlen(L, table);
+            std::size_t entries = 0;
+            lua_pushnil(L);
+            while (lua_next(L, table) != 0) {
+                ++entries;
+                if (entries > 8 || !lua_isinteger(L, -2) || lua_tointeger(L, -2) < 1 ||
+                    static_cast<std::size_t>(lua_tointeger(L, -2)) > length || lua_type(L, -1) != LUA_TSTRING) {
+                    error = "formatter must return a dense array of strings";
+                    lua_pop(L, 2);
+                    break;
+                }
+                lua_pop(L, 1);
+            }
+            if (entries != length) error = "formatter must return a dense array of strings";
+            for (std::size_t i = 1; error.empty() && i <= length; ++i) {
+                lua_rawgeti(L, table, i);
+                std::size_t bytes = 0;
+                const char* value = lua_tolstring(L, -1, &bytes);
+                if (!value || bytes > 52 || std::any_of(value, value + bytes, [](unsigned char c) { return c < 32 || c > 126; }))
+                    error = "formatter lines must contain at most 52 printable ASCII characters";
+                else lines.emplace_back(value, bytes);
+                lua_pop(L, 1);
+            }
+        }
+        lua_settop(L, stackTop);
+        if (!error.empty()) {
+            observationError = std::move(error);
+            observationLines.clear(); observationId = 0;
+            renderer.clearObservationCard();
+            return;
+        }
+        observationId = target;
+        observationEvent = body.nova_event;
+        observationTransits = body.wormhole_transits;
+        observationRegion = body.region;
+        observationState = observationKind(body);
+        observationUpdated = now;
+        observationLines = std::move(lines);
+        renderer.setObservationCard({target, point, observationLines});
+    }
 
     static double bootTime() {
         timespec time{};
@@ -250,6 +452,7 @@ Clock::time_point lastInput = Clock::now(), lastTick = lastInput, lastCapture = 
     void stop(const std::string& why, bool refreshPointer = false, bool shareKnownActive = false) {
         const bool wasActive = active;
         active = false; // BEFORE any input hit testing or seat delivery.
+        clearObservation();
         manualPreview = false;
         reason = why;
         lastInput = lastTick = Clock::now();
@@ -269,6 +472,9 @@ Clock::time_point lastInput = Clock::now(), lastTick = lastInput, lastCapture = 
     }
     void shutdown() {
         stop("shutdown");
+        // preReload is emitted before Hyprland destroys its Lua state. Drop
+        // references here, not from a later timer or retained render pass.
+        releaseObservationFormatter();
         initialized = false;
         listeners.clear();
         if (timer) {
@@ -376,6 +582,7 @@ Clock::time_point lastInput = Clock::now(), lastTick = lastInput, lastCapture = 
         auto focused = Desktop::focusState()->window();
         universe.reset(std::move(bodies), std::move(regions), cursor(), focused ? focused->m_stableID : 0);
         renderer.beginScene();
+        clearObservation(true);
         active = true;
         manualPreview = preview;
         alternateRegion = false;
@@ -420,6 +627,8 @@ Clock::time_point lastInput = Clock::now(), lastTick = lastInput, lastCapture = 
                 it = snapshots.erase(it);
             } else ++it;
         }
+        if (observationCandidate && !std::ranges::any_of(universe.bodies(), [&](const Body& b) { return b.id == observationCandidate; }))
+            clearObservation();
         for (const auto& window : Desktop::windowState()->windows()) {
             if (snapshots.size() >= options.physics.max_bodies) break;
             if (!window->m_isMapped || window->isHidden() || !g_pHyprRenderer->shouldRenderWindow(window)) continue;
@@ -454,13 +663,17 @@ Clock::time_point lastInput = Clock::now(), lastTick = lastInput, lastCapture = 
         } else {
             if (!renderer.error().empty()) { fail(renderer.error()); return; }
             universe.step(elapsed, cursor());
+            validateObservation();
             ++physicsSteps;
             if (std::chrono::duration<double>(now - lastCapture).count() >= 1.0 / options.snapshotHz) {
                 lastCapture = now;
                 synchronizeWindows();
                 if (active) refresh();
             }
-            if (active) damage();
+            if (active) {
+                updateObservation(now);
+                if (active) damage();
+            }
         }
     }
     void initialize() {
@@ -562,8 +775,14 @@ Clock::time_point lastInput = Clock::now(), lastTick = lastInput, lastCapture = 
         else if (name == "black_hole") {
             if (const auto location = actionLocation()) universe.startBlackHole(location->first, location->second);
         }
-        else if (name == "rewind") universe.setRewinding(!universe.rewinding());
-        else if (name == "region") alternateRegion = !alternateRegion;
+        else if (name == "rewind") {
+            universe.setRewinding(!universe.rewinding());
+            clearObservation();
+        }
+        else if (name == "region") {
+            alternateRegion = !alternateRegion;
+            clearObservation();
+        }
         else if (name == "supernova") {
             if (const auto location = actionLocation())
                 universe.supernova(universe.screenToWorld(location->first, location->second), location->second);
@@ -672,6 +891,13 @@ int setup(lua_State* L) {
             next.hideDesktopUI = boolean(L, -1, "hide_desktop_ui", true);
         }
         lua_pop(L, 1);
+        lua_getfield(L, 1, "observation");
+        if (lua_istable(L, -1)) {
+            next.observationEnabled = boolean(L, -1, "enabled", true);
+            next.observationDelay = number(L, -1, "delay", .35, 0, 3);
+            next.observationDistance = number(L, -1, "distance", 24, 0, 96);
+        }
+        lua_pop(L, 1);
         lua_getfield(L, 1, "exclusions");
         if (lua_istable(L, -1)) {
             const int t = lua_gettop(L);
@@ -717,6 +943,7 @@ int setup(lua_State* L) {
         lua_pop(L, 1);
         instance->shutdown();
         instance->options = std::move(next);
+        instance->setObservationFormatter(L, 2);
         instance->universe.configure(instance->options.physics);
         instance->renderer.configure(stars, background);
         if (instance->options.enabled) instance->initialize();
@@ -731,7 +958,12 @@ int setup(lua_State* L) {
     }
 }
 int enable(lua_State* L) {
-    try { instance->options.enabled = true; instance->initialize(); lua_pushboolean(L, true); }
+    try {
+        instance->setObservationFormatter(L, 1);
+        instance->options.enabled = true;
+        instance->initialize();
+        lua_pushboolean(L, true);
+    }
     catch (const std::exception& error) { instance->shutdown(); instance->fail(error.what(), false); lua_pushboolean(L, false); lua_pushstring(L, error.what()); return 2; }
     return 1;
 }
@@ -770,6 +1002,25 @@ int status(lua_State* L) {
     const auto location = instance->active ? instance->actionLocation() : std::nullopt;
     const uint64_t hovered = location ? instance->universe.hitTest(location->first, location->second) : 0;
     lua_pushinteger(L, static_cast<lua_Integer>(hovered)); lua_setfield(L, -2, "hovered_id");
+    lua_newtable(L);
+    lua_pushboolean(L, instance->options.observationEnabled); lua_setfield(L, -2, "enabled");
+    lua_pushboolean(L, instance->active && instance->observationId != 0 && !instance->observationLines.empty()); lua_setfield(L, -2, "visible");
+    lua_pushinteger(L, static_cast<lua_Integer>(instance->observationId)); lua_setfield(L, -2, "id");
+    lua_pushinteger(L, static_cast<lua_Integer>(instance->observationCandidate)); lua_setfield(L, -2, "target_id");
+    lua_pushinteger(L, static_cast<lua_Integer>(instance->observationCalls)); lua_setfield(L, -2, "formatter_calls");
+    lua_pushinteger(L, static_cast<lua_Integer>(instance->renderer.observationTextureBytes())); lua_setfield(L, -2, "texture_bytes");
+    lua_pushinteger(L, static_cast<lua_Integer>(instance->renderer.observationTextureBuilds())); lua_setfield(L, -2, "texture_builds");
+    lua_pushboolean(L, instance->observationFormatter != LUA_NOREF); lua_setfield(L, -2, "formatter_registered");
+    if (instance->observationError.empty()) lua_pushnil(L);
+    else lua_pushlstring(L, instance->observationError.data(), instance->observationError.size());
+    lua_setfield(L, -2, "error");
+    lua_newtable(L);
+    for (std::size_t i = 0; i < instance->observationLines.size(); ++i) {
+        const auto& line = instance->observationLines[i];
+        lua_pushlstring(L, line.data(), line.size()); lua_rawseti(L, -2, i + 1);
+    }
+    lua_setfield(L, -2, "lines");
+    lua_setfield(L, -2, "observation");
     n("history_frames", instance->universe.historyFrames()); n("history_limit", instance->universe.historyLimit()); n("input_watchers", instance->listeners.size()); n("physics_steps", instance->physicsSteps);
     n("stored", std::ranges::count_if(instance->universe.bodies(), [](const auto& body) { return body.stored; }));
     n("particles", instance->universe.particles().size()); n("waves", instance->universe.waves().size());
@@ -805,6 +1056,12 @@ int status(lua_State* L) {
         value("fragment_grid", body.fragment_grid);
         value("fragment_column", body.fragment_column); value("fragment_row", body.fragment_row);
         value("fragment_age", body.fragment_age);
+        value("age_seconds", body.age_seconds);
+        lua_pushinteger(L, static_cast<lua_Integer>(body.nova_event)); lua_setfield(L, -2, "nova_event");
+        lua_pushinteger(L, static_cast<lua_Integer>(body.wormhole_transits)); lua_setfield(L, -2, "wormhole_transits");
+        lua_pushstring(L, Cosmic::observationKind(body)); lua_setfield(L, -2, "kind");
+        const auto origin = instance->observationOrigin(body.source_id);
+        lua_pushlstring(L, origin.data(), origin.size()); lua_setfield(L, -2, "origin");
         lua_pushboolean(L, body.fragment_grid > 0); lua_setfield(L, -2, "fragment");
         value("angle", body.angle); value("scale", body.scale); value("stretch", body.stretch);
         value("twist", body.twist); value("region", body.region); value("sink_progress", body.sink_progress);
