@@ -82,6 +82,23 @@ return { max_windows = 32, max_objects = 96,
         "the dedicated configuration file can tune cinematic explosions and its manual control independently")
     check(stellar.max_windows == 32 and stellar.max_objects == 96,
         "a real user configuration can independently tune capture and persistent-object limits")
+    local observation, observation_error, observation_found = UserConfig.load(fixture([[
+local prefix = "MY OBSERVATORY: "
+return { observation = {
+    delay = 0, distance = 96,
+    formatter = function(context) return { prefix .. context.kind } end,
+} }
+]]))
+    check(observation and not observation_error and observation_found and observation.observation.enabled and
+        observation.observation.delay == 0 and observation.observation.distance == 96 and
+        type(observation.observation.formatter) == "function",
+        "dedicated observation configuration accepts a captured Lua function and boundary values")
+    check(observation.observation.formatter({ kind = "FRAGMENT" })[1] == "MY OBSERVATORY: FRAGMENT",
+        "a real user formatter retains its lexical closure after configuration normalization")
+    local no_cards = UserConfig.load(fixture("return { observation = { enabled = false, formatter = false } }"))
+    check(no_cards and not no_cards.observation.enabled and no_cards.observation.formatter == false and
+        no_cards.observation.delay == 0.35 and no_cards.idle_timeout == 60,
+        "observation can be disabled independently without changing activation defaults")
     for _, count in ipairs({16, 128}) do
         local limits, limits_error, limits_found = UserConfig.load(fixture(
             "return { max_objects = " .. count .. " }"))
@@ -108,6 +125,15 @@ return { max_windows = 32, max_objects = 96,
         "return { stellar = { interval_min = 140, interval_max = 130 } }",
         "return { stellar = { charge_seconds = 0.49 } }",
         "return { stellar = { automatic = 'false' } }",
+        "return { observation = { formatter = true } }",
+        "return { observation = { formatter = 'default' } }",
+        "return { observation = { formatter = {} } }",
+        "return { observation = { enabled = 1 } }",
+        "return { observation = { delay = -0.1 } }",
+        "return { observation = { delay = 3.1 } }",
+        "return { observation = { distance = 97 } }",
+        "return { observation = { distance = math.huge } }",
+        "return { observation = { hidden_option = true } }",
         "return { controls = { preview = 'SUPER+ALT+C', emergency = 'ALT+SUPER+C' } }",
         "return { exclusions = { classes = {[2] = 'game'} } }",
     }) do rejected(fixture(source), "invalid configuration") end
