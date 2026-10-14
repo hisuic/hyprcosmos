@@ -1,6 +1,7 @@
 #pragma once
 
 #include "physics.hpp"
+#include "observation.hpp"
 #include <hyprland/src/desktop/DesktopTypes.hpp>
 #include <hyprland/src/render/Framebuffer.hpp>
 #include <hyprland/src/render/pass/PassElement.hpp>
@@ -51,6 +52,10 @@ class CosmicRenderer {
     // detection is waiting in the normal desktop.
     void beginScene();
     void configure(std::size_t stars, double background);
+    // Presentation only: text is supplied outside the draw pass and cached on
+    // the next frame. These calls never create a window or capture pointer input.
+    void setObservationCard(ObservationCard card);
+    void clearObservationCard();
     // Enqueues a custom pass; OpenGL drawing occurs when Hyprland executes it.
     void draw(PHLMONITOR monitor, const Universe& universe,
               const std::vector<Snapshot>& snapshots, bool alternateRegion = false);
@@ -63,6 +68,8 @@ class CosmicRenderer {
     void release();
     const std::string& error() const;
     uint64_t frameCount() const;
+    std::size_t observationTextureBytes() const;
+    uint64_t observationTextureBuilds() const;
 
   private:
     struct Impl;
