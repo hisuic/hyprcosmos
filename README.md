@@ -143,6 +143,32 @@ F5はCosmic中だけ消費し、通常時には押下・解放ともアプリへ
 ブラウザの更新を邪魔せず、対象がないCosmic中には何もしません。
 現在の実環境ではF5のHyprland側の既存割り当てもないことを確認しました。
 
+### 来歴カード
+
+Cosmic中にカーソルを天体へ近づけ、同じ対象を初期設定で0.35秒観測すると、
+特殊な絵文字フォントを必要としないASCIIの来歴カードが表示されます。クリック・新しい操作キーは
+不要で、通常入力による即復帰やカーソル重力の操作は変わりません。
+カードはアプリの実際のclass、元ウィンドウの識別子、欠片の分割位置、
+超新星の番号、ワームホール通過回数、天体の年齢を表示します。例:
+
+```text
+NAME: SHARD 1,4 OF #123
+ORIGIN: ORG.WEZFURLONG.WEZTERM
+TYPE: FRAGMENT 1,4 / 4x4
+SUPERNOVA: #12
+WORMHOLE TRANSITS: 3
+AGE: 184s
+```
+
+classは「ブラウザ」「ターミナル」へ自動分類せず、そのアプリが持つ実際の値を
+使います。カード用にはページ名・ファイル名などを含むウィンドウタイトルを
+取得・表示しません。
+来歴は今回のCosmic内のものです。通常天体の年齢は取り込みから、欠片は誕生から
+数え、欠片は分裂前のワームホール通過履歴と超新星番号を引き継ぎます。
+F8では来歴も物理状態と一緒に戻り、逆再生中は `TIMELINE: REWIND` を追加します。
+元アプリを閉じると、対応する欠片とそのカードも取り除きます。
+欠片の再爆発禁止、天体数の上限、安全な開始・終了条件は変わりません。
+
 これらのキーは有効な Cosmic の専用キーになります。`disable()` と
 `shutdown()` ではキーの登録も外れます。F5以外は有効期間中の専用キーです。既存の設定には F5〜F12 の登録が
 ないことを確認しました。必要なら `controls` で変更・個別無効化できます。
@@ -193,6 +219,7 @@ return {
     },
     rendering = { particles = 96, stars = 240, background = 1,
                   snapshot_mb = 128, hide_desktop_ui = true },
+    observation = { enabled = true, delay = 0.35, distance = 24, formatter = false },
 }
 ```
 
@@ -254,6 +281,46 @@ layer-shell UIとは異なり、ほかのアプリと同じく宇宙内の映像
 速度上限を守るため、この時間より長くなる場合があります。
 履歴は `history_seconds`、`history_hz`、`history_mb` で制限します。
 物理更新の `fps` は 10〜120、初期値 60 です。
+
+### Luaで来歴カードを変更する
+
+`observation.enabled = false` はカードだけを無効化します。`delay` は表示までの
+秒数（0〜3）、`distance` は天体の表示形状からの余裕（論理px、0〜96）です。
+`formatter = false` は既定の整形を使います。自分の関数を指定する場合も、
+`hyprland.lua` は `require("cosmic")` のままで、専用設定を編集します。例:
+
+```lua
+return {
+    observation = {
+        formatter = function(context)
+            return {
+                "MY OBSERVATORY",
+                "KIND: " .. context.kind,
+                "AGE: " .. math.floor(context.age_seconds) .. "s",
+                "PORTALS: " .. context.wormhole_transits,
+            }
+        end,
+    },
+}
+```
+
+関数には `id`・`source_id`・`origin`（実アプリのclass）・`kind`・`age_seconds`・
+`nova_event`（未爆発は0）・`wormhole_transits`・`fragment_grid`（通常は0、欠片は2/4）・
+`fragment_row`・`fragment_column`（0始まり）・`rewinding`・`region` を渡します。
+`kind` は `WINDOW`・`FRAGMENT`・`REMNANT`・`CHARGING`・`TRANSIT`・`SINKING` です。
+来歴の記録と逆再生はC++が管理し、Luaは表示文字列だけを組み立てます。
+既定の整形は [lua/cosmic/observation.lua](lua/cosmic/observation.lua) にあります。
+
+戻り値は最大8行の密な配列で、各行は最大52文字の印字可能なASCII
+（半角スペース〜 `~`）です。空配列 `{}` はその対象のカードを非表示にします。
+`origin` はネイティブ側で最大96文字のASCIIへ整形済みです。独自の文字列を
+追加するときも、関数側でASCIIへ整形してください。
+表示中だけ最大毎秒2回呼び、Lua命令の実行期限を10ミリ秒に制限します。
+エラー・期限超過・不正な戻り値では、そのCosmic中のカードを止め、宇宙本体は維持します。
+理由は `require("cosmic").status().observation.error` で確認でき、次回のCosmicか
+`setup()` で再試行します。通常のLua権限を持つ信頼済み関数なので、ファイルI/O・
+外部コマンド・待機処理を行わないでください。命令監視はブロッキングI/Oを中断できません。
+Luaの描画ループや常駐プロセスは追加しません。
 
 `rendering.background` は宇宙背景の不透明度（0〜1）で、初期値1は壁紙を
 完全に覆います。透かしたい場合だけ小さくしてください。`rendering.stars`
@@ -338,6 +405,9 @@ F5の実入力配送、赤化・膨張・4／16分割・残留穴・逆再生・
 64個の欠片の永続表示・再爆発禁止・上限・欠片のF7収納とF8復元・元アプリ終了時の
 削除も確認し、描画パスの実行回数からFPSと子コンポジターのCPU使用率を記録します。
 爆発関連だけを確認する場合は `--stellar-only` を指定できます。
+来歴カードだけの実検証は `--observation-only` で、既定・独自のLua文面、
+近接待機・非表示・更新頻度・テクスチャ容量、整形エラーとLuaタイムアウトの封じ込め、
+欠片の来歴・逆再生・2倍スケール・別宇宙の小窓・完了した転送の履歴を確認します。
 親セッションの設定や有効状態は変更しません。既存の宇宙現象・入力・共有回帰は
 `scripts/nested-test.sh` で確認できます。
 専用設定の実検証は `scripts/user-config-test.sh` で、独立した子セッションだけの

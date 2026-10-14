@@ -48,6 +48,10 @@ M.defaults = {
         particles = 96, stars = 240, background = 1, snapshot_mb = 128,
         hide_desktop_ui = true,
     },
+    -- Observation is passive: cursor proximity reveals an ASCII card without
+    -- clicking or consuming input. False selects the bundled Lua formatter;
+    -- a trusted function can replace its text without changing the engine.
+    observation = { enabled = true, delay = 0.35, distance = 24, formatter = false },
     -- Dedicated keys avoid modifier preambles: ordinary modifier presses must
     -- restore immediately, including modifiers used by input methods.
     controls = {
@@ -79,6 +83,7 @@ local ranges = {
     ["rendering.particles"] = { 0, 384, true },
     ["rendering.stars"] = { 0, 1024, true }, ["rendering.background"] = { 0, 1 },
     ["rendering.snapshot_mb"] = { 16, 512 },
+    ["observation.delay"] = { 0, 3 }, ["observation.distance"] = { 0, 96 },
 }
 
 function M.copy(value)
@@ -116,6 +121,10 @@ local function canonical_chord(chord, path)
 end
 
 local function validate(value, expected, path)
+    if path == "observation.formatter" then
+        if value ~= false and type(value) ~= "function" then fail(path, "must be a function or false") end
+        return
+    end
     if path:match("^controls%.") then
         if value ~= false and (type(value) ~= "string" or not value:find("%S") or value:find("\0", 1, true)) then
             fail(path, "must be a key chord or false")

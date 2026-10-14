@@ -7,6 +7,7 @@ output=""
 nested_window=false
 unload_only=false
 stellar_only=false
+observation_only=false
 unload_rounds=12
 while (($#)); do
     case "$1" in
@@ -15,12 +16,17 @@ while (($#)); do
         --nested-window) nested_window=true; shift ;;
         --unload-only) unload_only=true; shift ;;
         --stellar-only) stellar_only=true; shift ;;
+        --observation-only) observation_only=true; shift ;;
         --unload-rounds) unload_rounds=${2:?}; shift 2 ;;
-        -h|--help) printf '%s\n' 'Usage: scripts/fullscreen-test.sh [--plugin FILE] [--output DIR] [--nested-window] [--unload-rounds N] [--unload-only | --stellar-only]'; exit 0 ;;
+        -h|--help) printf '%s\n' 'Usage: scripts/fullscreen-test.sh [--plugin FILE] [--output DIR] [--nested-window] [--unload-rounds N] [--unload-only | --stellar-only | --observation-only]'; exit 0 ;;
         *) printf 'Unknown argument: %s\n' "$1" >&2; exit 2 ;;
     esac
 done
-if "$unload_only" && "$stellar_only"; then printf 'Choose either unload-only or stellar-only.\n' >&2; exit 2; fi
+test_only_modes=0
+for mode in "$unload_only" "$stellar_only" "$observation_only"; do
+    if "$mode"; then test_only_modes=$((test_only_modes+1)); fi
+done
+if ((test_only_modes > 1)); then printf 'Choose only one test-only mode.\n' >&2; exit 2; fi
 [[ "$unload_rounds" =~ ^[0-9]+$ && "$unload_rounds" -ge 1 && "$unload_rounds" -le 100 ]] || { printf 'Unload rounds must be 1..100.\n' >&2; exit 2; }
 for command in Hyprland hyprctl gcc wayland-scanner pkg-config python3 rg grim timeout getconf; do
     command -v "$command" >/dev/null || { printf 'Missing dependency: %s\n' "$command" >&2; exit 1; }
@@ -286,6 +292,120 @@ geometry > "$output/geometry-restored.json"
 reserved > "$output/reserved-restored.json"
 cmp -- "$output/geometry-before.json" "$output/geometry-restored.json"
 cmp -- "$output/reserved-before.json" "$output/reserved-restored.json"
+
+# Passive observation uses only real cursor motion in the isolated child.
+# Slow initial velocity makes assertions independent of pointer/IPC latency.
+eval_lua '_observation_saved=require("cosmic").status().config; require("cosmic").setup({observation={enabled=true,delay=.35,distance=24,formatter=false},stellar={automatic=false},physics={max_speed=10,damping=10},effects={cursor_gravity=false,orbit=false,binary=false,collisions=false,wormholes=false,expansion=false}})'
+probe move 3 3 1280 720
+preview
+read -r observe_x observe_y <<< "$(ctl repl 'local o=require("cosmic").status().objects[1]; print(math.floor(o.x),math.floor(o.y))')"
+probe move "$observe_x" "$observe_y" 1280 720
+eval_lua 'local s=require("cosmic").status(); assert(s.active and not s.observation.visible)'
+wait_lua 'require("cosmic").status().observation.visible'
+eval_lua 'local s=require("cosmic").status(); local c=s.observation; assert(c.error==nil and c.formatter_registered and c.id==s.objects[1].id and #c.lines==6); assert(c.lines[2]=="ORIGIN: COSMIC-PROBE"); assert(c.lines[4]=="SUPERNOVA: NONE"); assert(c.lines[5]=="WORMHOLE TRANSITS: 0"); _observation_calls=c.formatter_calls; _observation_builds=c.texture_builds; _observation_bytes=s.snapshot_bytes'
+capture observation-window hidden
+sleep 2.1
+eval_lua 'local s=require("cosmic").status(); local c=s.observation; assert(s.active and c.visible and c.formatter_calls-_observation_calls<=5); assert(c.texture_bytes>0 and c.texture_bytes<=4*1024*1024 and c.texture_builds-_observation_builds<=4); assert(s.snapshot_bytes==_observation_bytes)'
+probe move 3 3 1280 720
+wait_lua 'not require("cosmic").status().observation.visible'
+capture observation-away hidden
+eval_lua 'require("cosmic").action("emergency"); require("cosmic").setup({observation={delay=0,formatter=function(c) return {"CUSTOM ORBITAL RECORD", "SOURCE: "..c.origin} end}})'
+preview
+read -r observe_x observe_y <<< "$(ctl repl 'local o=require("cosmic").status().objects[1]; print(math.floor(o.x),math.floor(o.y))')"
+probe move "$observe_x" "$observe_y" 1280 720
+wait_lua 'require("cosmic").status().observation.visible'
+eval_lua 'local c=require("cosmic").status().observation; assert(c.error==nil and c.lines[1]=="CUSTOM ORBITAL RECORD" and #c.lines==2)'
+capture observation-custom hidden
+
+# A card is not an input surface: the first ordinary key reaches the app once.
+before_observation_press=$(event_count '"event":"key","key":30,"state":1' "$output/window.jsonl")
+before_observation_release=$(event_count '"event":"key","key":30,"state":0' "$output/window.jsonl")
+probe key 30
+wait_lua 'not require("cosmic").status().active'
+sleep .1
+[[ $(event_count '"event":"key","key":30,"state":1' "$output/window.jsonl") -eq $((before_observation_press+1)) ]] || { printf 'Observation restoration key was lost or duplicated.\n' >&2; exit 1; }
+[[ $(event_count '"event":"key","key":30,"state":0' "$output/window.jsonl") -eq $((before_observation_release+1)) ]] || { printf 'Observation restoration release was lost or duplicated.\n' >&2; exit 1; }
+eval_lua 'local s=require("cosmic").status(); assert(not s.observation.visible); _observation_idle_calls=s.observation.formatter_calls'
+sleep .6
+eval_lua 'assert(require("cosmic").status().observation.formatter_calls==_observation_idle_calls)'
+capture observation-restored visible
+geometry > "$output/geometry-observation-restored.json"
+cmp -- "$output/geometry-before.json" "$output/geometry-observation-restored.json"
+
+# Lua callback failures (including runaway Lua) suppress only the card. Native
+# validation must also reject giant hash tables without scanning all entries.
+for formatter in 'function() error("observation fixture") end' 'function() return {"bad"..string.char(10).."line"} end' 'function() local t={}; for i=1,5000 do t["key"..i]="value" end; return t end' 'function() while true do end end'; do
+    eval_lua "require(\"cosmic\").setup({observation={formatter=$formatter}})"
+    preview
+    read -r observe_x observe_y <<< "$(ctl repl 'local o=require("cosmic").status().objects[1]; print(math.floor(o.x),math.floor(o.y))')"
+    probe move "$observe_x" "$observe_y" 1280 720
+    wait_lua 'require("cosmic").status().observation.error~=nil'
+    eval_lua 'local s=require("cosmic").status(); assert(s.active and not s.observation.visible); _failed_observation_calls=s.observation.formatter_calls'
+    sleep .6
+    eval_lua 'local s=require("cosmic").status(); assert(s.active and s.observation.formatter_calls==_failed_observation_calls); require("cosmic").action("emergency")'
+done
+eval_lua 'require("cosmic").setup({observation={formatter=function() require("cosmic").disable(); return {"STALE CARD"} end}})'
+preview
+read -r observe_x observe_y <<< "$(ctl repl 'local o=require("cosmic").status().objects[1]; print(math.floor(o.x),math.floor(o.y))')"
+probe move "$observe_x" "$observe_y" 1280 720
+wait_lua 'not require("cosmic").status().initialized'
+eval_lua 'local s=require("cosmic").status(); assert(not s.active and not s.observation.visible and not s.observation.formatter_registered); require("cosmic").setup({enabled=true,observation={enabled=false,formatter=false}})'
+preview
+read -r observe_x observe_y <<< "$(ctl repl 'local o=require("cosmic").status().objects[1]; print(math.floor(o.x),math.floor(o.y))')"
+probe move "$observe_x" "$observe_y" 1280 720
+eval_lua '_observation_disabled_calls=require("cosmic").status().observation.formatter_calls'
+sleep .6
+eval_lua 'local s=require("cosmic").status(); assert(s.active and not s.observation.visible and s.observation.formatter_calls==_observation_disabled_calls); require("cosmic").action("emergency"); require("cosmic").setup({observation={enabled=true,formatter=false},effects={black_hole=false},stellar={charge_seconds=.5,fragment_seconds=1}})'
+preview
+select_actor
+wait_lua 'require("cosmic").status().fragments==16'
+read -r observe_x observe_y observe_id <<< "$(ctl repl 'local s=require("cosmic").status(); for i=#s.objects,1,-1 do local o=s.objects[i]; if o.fragment and not o.stored then print(math.floor(o.x),math.floor(o.y),o.id); break end end')"
+probe move "$observe_x" "$observe_y" 1280 720
+wait_lua "require(\"cosmic\").status().observation.visible and require(\"cosmic\").status().observation.id==$observe_id"
+eval_lua 'local s=require("cosmic").status(); local c=s.observation; assert(c.lines[1]:find("SHARD",1,true) and c.lines[3]:find("FRAGMENT",1,true) and c.lines[4]=="SUPERNOVA: #1"); for _,o in ipairs(s.objects) do if o.fragment then assert(o.nova_event==1 and o.wormhole_transits==0 and o.age_seconds>=0) end end'
+capture observation-fragment hidden
+probe key 66
+wait_lua 'require("cosmic").status().fragments==0'
+eval_lua 'local s=require("cosmic").status(); assert(s.objects[1].nova_event==0 and (not s.observation.visible or s.observation.id==s.objects[1].id)); require("cosmic").action("emergency")'
+# Scale is changed only on the isolated headless output, then restored. This
+# checks physical text rasterization and logical cursor/card placement together.
+eval_lua 'hl.monitor({output="COSMIC-UI-TEST",mode="1280x720@60",position="0x0",scale=2})'
+sleep .25
+preview
+read -r observe_x observe_y <<< "$(ctl repl 'local o=require("cosmic").status().objects[1]; print(math.floor(o.x),math.floor(o.y))')"
+probe move "$observe_x" "$observe_y" 640 360
+wait_lua 'require("cosmic").status().observation.visible'
+capture observation-scale-two hidden
+eval_lua 'require("cosmic").action("emergency"); hl.monitor({output="COSMIC-UI-TEST",mode="1280x720@60",position="0x0",scale=1})'
+sleep .25
+eval_lua 'require("cosmic").setup({physics={max_speed=950},effects={wormholes=true}})'
+preview
+read -r observe_portal_x observe_portal_y <<< "$(ctl repl 'local s=require("cosmic").status(); for _,h in ipairs(s.wormholes) do if h.region<1000000 and s.wormholes[h.partner].region~=h.region then print(math.floor(h.x),math.floor(h.y)); break end end')"
+eval_lua 'require("cosmic").action("emergency")'
+observation_window=$(ctl -j clients | python3 -c 'import json,sys; print(next(c["address"] for c in json.load(sys.stdin) if c.get("title")=="Cosmic probe A"))')
+[[ "$observation_window" =~ ^0x[0-9a-fA-F]+$ ]] || { printf 'Invalid isolated observation window address.\n' >&2; exit 1; }
+eval_lua "hl.dispatch(hl.dsp.window.float({action='enable',window='address:$observation_window'})); hl.dispatch(hl.dsp.window.resize({x=360,y=240,window='address:$observation_window'})); hl.dispatch(hl.dsp.window.move({x=$((observe_portal_x - 180)),y=$((observe_portal_y - 120)),window='address:$observation_window'}))"
+sleep .2
+preview
+wait_lua 'require("cosmic").status().objects[1].wormhole_transits==1'
+read -r observe_x observe_y <<< "$(ctl repl 'local s=require("cosmic").status(); local o=s.objects[1]; local p=s.peer_views[1]; assert(p and o.region==p.region); print(math.floor(p.content_x+o.x*p.scale),math.floor(p.content_y+o.y*p.scale))')"
+probe move "$observe_x" "$observe_y" 1280 720
+wait_lua 'require("cosmic").status().observation.visible'
+eval_lua 'local s=require("cosmic").status(); assert(s.observation.id==s.objects[1].id and s.observation.lines[5]=="WORMHOLE TRANSITS: 1")'
+capture observation-peer-transit hidden
+probe key 66
+wait_lua 'require("cosmic").status().objects[1].wormhole_transits==0'
+eval_lua 'require("cosmic").action("emergency")'
+eval_lua "hl.dispatch(hl.dsp.window.float({action='disable',window='address:$observation_window'}))"
+sleep .2
+eval_lua 'require("cosmic").setup(_observation_saved); _observation_saved=nil'
+geometry > "$output/geometry-observation-scale-restored.json"
+cmp -- "$output/geometry-before.json" "$output/geometry-observation-scale-restored.json"
+printf '%s\n' 'PASS: passive ASCII cards, real source identity, cached bounded texture, global formatter rate, custom Lua, no inactive work, contained errors/timeouts, reentrant disable, opt-out, fragment provenance/rewind, scale-two rendering, peer-inset observation/completed transit rewind, and original geometry/input delivery.' | tee "$output/observation-result.txt"
+if "$observation_only"; then
+    printf '%s\n' 'PASS: isolated observation card regressions; parent session was never changed.'
+    exit 0
+fi
 
 # F5 is a conditional control, not a global replacement for browser refresh.
 # Exercise actual seat delivery, not just the Lua callback's return value.

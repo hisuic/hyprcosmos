@@ -26,6 +26,10 @@ class GLState {
         glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &buffer);
         glGetIntegerv(GL_UNPACK_ALIGNMENT, &unpackAlignment);
         glGetIntegerv(GL_UNPACK_ROW_LENGTH, &unpackRowLength);
+        glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &unpackBuffer);
+        glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &drawFramebuffer);
+        glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &readFramebuffer);
+        glGetIntegerv(GL_VIEWPORT, viewport.data());
         glGetIntegerv(GL_ACTIVE_TEXTURE, &activeTexture);
         glActiveTexture(GL_TEXTURE0);
         glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
@@ -47,6 +51,10 @@ class GLState {
         glBindBuffer(GL_ARRAY_BUFFER, buffer);
         glPixelStorei(GL_UNPACK_ALIGNMENT, unpackAlignment);
         glPixelStorei(GL_UNPACK_ROW_LENGTH, unpackRowLength);
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, unpackBuffer);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, drawFramebuffer);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, readFramebuffer);
+        glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, texture);
         glActiveTexture(activeTexture);
@@ -64,9 +72,11 @@ class GLState {
     }
     GLint program = 0, vao = 0, buffer = 0, activeTexture = GL_TEXTURE0, texture = 0;
     GLint unpackAlignment = 4, unpackRowLength = 0;
+    GLint unpackBuffer = 0, drawFramebuffer = 0, readFramebuffer = 0;
     GLint srcRGB = GL_ONE, dstRGB = GL_ZERO, srcAlpha = GL_ONE, dstAlpha = GL_ZERO;
     GLint equationRGB = GL_FUNC_ADD, equationAlpha = GL_FUNC_ADD;
     std::array<GLint, 4> scissor{};
+    std::array<GLint, 4> viewport{};
     GLboolean blend = false, scissorEnabled = false, cull = false, depth = false;
 };
 
@@ -175,6 +185,13 @@ struct CosmicRenderer::Impl {
     GLint skyViewport = -1, pixelScale = -1, seed = -1;
     GLint clip = -1;
     SP<Render::ITexture> peerLabel;
+    ObservationCard observation;
+    std::string observationText;
+    SP<Render::ITexture> observationTexture;
+    std::string cachedObservationText;
+    int cachedObservationFontSize = 0;
+    bool clearObservationTexture = false;
+    uint64_t observationTextureBuilds = 0;
     std::size_t starCount = 240;
     float backgroundAlpha = 1.0F;
     GLsizei gridVertices = 0;
@@ -284,11 +301,33 @@ void CosmicRenderer::draw(PHLMONITOR monitor, const Universe& universe,
 
 void CosmicRenderer::beginScene() {
     m_impl->start = std::chrono::steady_clock::now();
+    clearObservationCard();
 }
 
 void CosmicRenderer::configure(std::size_t stars, double background) {
     m_impl->starCount = std::min<std::size_t>(stars, 1024);
     m_impl->backgroundAlpha = std::clamp(background, 0.0, 1.0);
+}
+
+void CosmicRenderer::setObservationCard(ObservationCard card) {
+    card = sanitizeObservationCard(std::move(card));
+    if (card.id == 0) {
+        clearObservationCard();
+        return;
+    }
+    auto& impl = *m_impl;
+    if (card.lines != impl.observation.lines)
+        impl.observationText = frameObservationLines(card.lines);
+    impl.observation = std::move(card);
+}
+
+void CosmicRenderer::clearObservationCard() {
+    auto& impl = *m_impl;
+    impl.observation = {};
+    impl.observationText.clear();
+    // This may run from the idle timer with no GL context. Destroy the old
+    // texture at the next draw/release, rather than calling GL here.
+    impl.clearObservationTexture = true;
 }
 
 void CosmicRenderer::executeDraw(PHLMONITOR monitor, const Universe& universe,
@@ -297,6 +336,42 @@ void CosmicRenderer::executeDraw(PHLMONITOR monitor, const Universe& universe,
     ++m_impl->renderFrames;
     GLState state;
     auto& impl = *m_impl;
+    const double pixelScale = monitor->m_scale;
+    const Vec2 monitorSize{monitor->m_transformedSize.x, monitor->m_transformedSize.y};
+    const Region cardOutput{.x = monitor->m_position.x, .y = monitor->m_position.y,
+                            .width = monitorSize.x / pixelScale, .height = monitorSize.y / pixelScale};
+    if (impl.clearObservationTexture) {
+        impl.observationTexture.reset();
+        impl.cachedObservationText.clear();
+        impl.cachedObservationFontSize = 0;
+        impl.clearObservationTexture = false;
+    }
+    const bool showObservation = impl.observation.id != 0 && !impl.observationText.empty() &&
+                                 observationContainsCursor(cardOutput, impl.observation.cursor);
+    if (showObservation) {
+        const int fontSize = int(std::lround(std::clamp(12.0 * pixelScale, 8.0, 48.0)));
+        if (impl.cachedObservationText != impl.observationText || impl.cachedObservationFontSize != fontSize) {
+            impl.observationTexture.reset();
+            impl.cachedObservationText = impl.observationText;
+            impl.cachedObservationFontSize = fontSize;
+            // Cairo/font uploads can touch GL state. Generate before binding
+            // our draw program, then restore framebuffer/viewport/textures too.
+            // Failure is cached until the content/scale changes and must never
+            // disable the surrounding universe or its safe restore controls.
+            try {
+                GLState textState;
+                auto texture = g_pHyprRenderer->renderText(impl.observationText,
+                    CHyprColor{0.62, 0.88, 0.95, 1.0}, fontSize, false, "monospace", 3072, 400);
+                if (texture && texture->ok() && texture->m_size.x > 0 && texture->m_size.y > 0 &&
+                    texture->m_size.x <= 3072 && texture->m_size.y <= 1536) {
+                    impl.observationTexture = std::move(texture);
+                    ++impl.observationTextureBuilds;
+                }
+            } catch (...) {
+                impl.observationTexture.reset();
+            }
+        }
+    }
     glDisable(GL_SCISSOR_TEST);
     glDisable(GL_CULL_FACE);
     glDisable(GL_DEPTH_TEST);
@@ -314,8 +389,6 @@ void CosmicRenderer::executeDraw(PHLMONITOR monitor, const Universe& universe,
         for (int column = 0; column < 3; ++column)
             columnMajor[column * 3 + row] = projection[row * 3 + column];
     glUniformMatrix3fv(impl.projection, 1, GL_FALSE, columnMajor.data());
-    const double pixelScale = monitor->m_scale;
-    const Vec2 monitorSize{monitor->m_transformedSize.x, monitor->m_transformedSize.y};
     glUniform2f(impl.resolution, monitorSize.x, monitorSize.y);
     const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - impl.start).count();
     // An exact multiple of the meteor period avoids a broken epoch at wrapping.
@@ -588,6 +661,28 @@ void CosmicRenderer::executeDraw(PHLMONITOR monitor, const Universe& universe,
         }
         glUniform4f(impl.clip, -1, -1, monitorSize.x + 1, monitorSize.y + 1);
     }
+
+    // The card is a last, compositor-only overlay, including above the peer
+    // inset. It does not affect body hit-testing or create a layer-shell UI.
+    if (showObservation && impl.observationTexture && impl.observationTexture->ok()) {
+        const auto textureSize = impl.observationTexture->m_size;
+        if (const auto layout = observationCardLayout(cardOutput, impl.observation.cursor,
+                                                      {textureSize.x, textureSize.y}, pixelScale)) {
+            const Vec2 outputOrigin{monitor->m_position.x, monitor->m_position.y};
+            const Vec2 panelOrigin = (layout->panelOrigin - outputOrigin) * pixelScale;
+            const Vec2 panelSize = layout->panelSize * pixelScale;
+            const Vec2 textOrigin = (layout->textOrigin - outputOrigin) * pixelScale;
+            const Vec2 textSize = layout->textSize * pixelScale;
+            glUniform4f(impl.clip, -1, -1, monitorSize.x + 1, monitorSize.y + 1);
+            glUniform4f(impl.crop, 0, 0, 1, 1);
+            impl.quad(panelOrigin + panelSize * 0.5, panelSize, 4, {0.23F, 0.55F, 0.66F, 0.94F});
+            const double edge = std::min({pixelScale, panelSize.x * 0.1, panelSize.y * 0.1});
+            impl.quad(panelOrigin + panelSize * 0.5, panelSize - Vec2{edge * 2, edge * 2}, 4,
+                      {0.014F, 0.024F, 0.058F, 0.97F});
+            glBindTexture(GL_TEXTURE_2D, impl.observationTexture->m_texID);
+            impl.quad(textOrigin + textSize * 0.5, textSize, 1, {1, 1, 1, 1});
+        }
+    }
 }
 
 UP<IPassElement> CosmicRenderer::pass(PHLMONITOR monitor, const Universe& universe,
@@ -597,6 +692,11 @@ UP<IPassElement> CosmicRenderer::pass(PHLMONITOR monitor, const Universe& univer
 
 void CosmicRenderer::release() {
     auto& impl = *m_impl;
+    clearObservationCard();
+    impl.observationTexture.reset();
+    impl.cachedObservationText.clear();
+    impl.cachedObservationFontSize = 0;
+    impl.clearObservationTexture = false;
     impl.peerLabel.reset();
     if (impl.buffer) glDeleteBuffers(1, &impl.buffer);
     if (impl.vao) glDeleteVertexArrays(1, &impl.vao);
@@ -607,5 +707,11 @@ void CosmicRenderer::release() {
 
 const std::string& CosmicRenderer::error() const { return m_impl->error; }
 uint64_t CosmicRenderer::frameCount() const { return m_impl->renderFrames; }
+std::size_t CosmicRenderer::observationTextureBytes() const {
+    if (!m_impl->observationTexture) return 0;
+    const auto size = m_impl->observationTexture->m_size;
+    return static_cast<std::size_t>(size.x) * static_cast<std::size_t>(size.y) * 4;
+}
+uint64_t CosmicRenderer::observationTextureBuilds() const { return m_impl->observationTextureBuilds; }
 
 } // namespace cosmic

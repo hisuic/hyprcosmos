@@ -1,6 +1,7 @@
 #include "physics.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
 
@@ -73,6 +74,57 @@ double segmentPortalEntry(Vec2 start, Vec2 end, Vec2 center, double portal_radiu
     if (discriminant < 0.0) return std::numeric_limits<double>::infinity();
     const double entry = (-b - std::sqrt(discriminant)) / a;
     return entry >= 0.0 && entry <= 1.0 ? entry : std::numeric_limits<double>::infinity();
+}
+double segmentDistance(Vec2 point, Vec2 start, Vec2 end) {
+    const Vec2 edge = end - start;
+    const double squared = lengthSquared(edge);
+    const double fraction = squared > 1e-18 ? std::clamp(dot(point - start, edge) / squared, 0.0, 1.0) : 0.0;
+    return length(point - start - edge * fraction);
+}
+// Clip against the displayed logical viewport before measuring. This keeps
+// even an off-screen/partly clipped bent image from attracting a hover card.
+double clippedTriangleDistance(Vec2 point, Vec2 a, Vec2 b, Vec2 c, const Region& region) {
+    std::array<Vec2, 8> polygon{a, b, c}, clipped{};
+    std::size_t count = 3;
+    for (int boundary = 0; boundary < 4 && count != 0; ++boundary) {
+        const bool horizontal = boundary < 2;
+        const bool lower = boundary % 2 == 0;
+        const double limit = horizontal ? region.x + (lower ? 0.0 : region.width)
+                                        : region.y + (lower ? 0.0 : region.height);
+        const auto coordinate = [&](Vec2 vertex) { return horizontal ? vertex.x : vertex.y; };
+        const auto inside = [&](Vec2 vertex) { return lower ? coordinate(vertex) >= limit : coordinate(vertex) <= limit; };
+        std::size_t output = 0;
+        const auto append = [&](Vec2 vertex) {
+            if (output == 0 || lengthSquared(vertex - clipped[output - 1]) > 1e-20)
+                clipped[output++] = vertex;
+        };
+        for (std::size_t index = 0; index < count; ++index) {
+            const Vec2 start = polygon[index], end = polygon[(index + 1) % count];
+            const bool first_inside = inside(start), second_inside = inside(end);
+            if (first_inside) append(start);
+            if (first_inside != second_inside) {
+                const double fraction = (limit - coordinate(start)) / (coordinate(end) - coordinate(start));
+                append(start + (end - start) * fraction);
+            }
+        }
+        if (output > 1 && lengthSquared(clipped[0] - clipped[output - 1]) <= 1e-20) --output;
+        polygon = clipped;
+        count = output;
+    }
+    if (count < 3) return std::numeric_limits<double>::infinity();
+    double distance = std::numeric_limits<double>::infinity();
+    double area = 0.0;
+    bool positive = false, negative = false;
+    for (std::size_t index = 0; index < count; ++index) {
+        const Vec2 start = polygon[index], end = polygon[(index + 1) % count];
+        const double side = cross(end - start, point - start);
+        area += cross(start - polygon[0], end - polygon[0]);
+        positive = positive || side > 1e-9;
+        negative = negative || side < -1e-9;
+        distance = std::min(distance, segmentDistance(point, start, end));
+    }
+    if (std::abs(area) < 1e-12) return std::numeric_limits<double>::infinity();
+    return positive && negative ? distance : 0.0;
 }
 } // namespace
 
@@ -167,6 +219,7 @@ void Universe::reset(std::vector<Body> bodies, std::vector<Region> regions, Vec2
     m_wormholes.clear();
     m_random.seed(m_config.seed);
     m_nova_serial = 0;
+    m_nova_events = 0;
     m_next_fragment_id = UINT64_MAX;
     m_cursor = safeVector(cursor);
     m_focused_id = focused_id;
@@ -280,6 +333,8 @@ bool Universe::addBody(Body body, bool explode) {
     body.source_id = body.id;
     body.fragment_grid = body.fragment_column = body.fragment_row = 0;
     body.fragment_age = 0.0;
+    body.age_seconds = 0.0;
+    body.nova_event = body.wormhole_transits = 0;
     normalizeBody(body, true);
     m_bodies.push_back(body);
     if (explode)
@@ -393,6 +448,104 @@ uint64_t Universe::hitTestInRegion(Vec2 screen_position, const int* visible_regi
     return 0;
 }
 
+uint64_t Universe::observationTarget(Vec2 screen_position, int visible_region, double margin) const {
+    if (!std::isfinite(screen_position.x) || !std::isfinite(screen_position.y) || !std::isfinite(margin)) return 0;
+    const auto region_iterator = std::find_if(m_regions.begin(), m_regions.end(), [&](const Region& region) {
+        return region.id == visible_region;
+    });
+    if (region_iterator == m_regions.end()) return 0;
+    const Region& region = *region_iterator;
+    if (screen_position.x < region.x || screen_position.x > region.x + region.width ||
+        screen_position.y < region.y || screen_position.y > region.y + region.height) return 0;
+    margin = std::clamp(margin, 0.0, 4096.0);
+    const Camera* camera = cameraFor(visible_region);
+    const double zoom = camera ? camera->zoom : 1.0;
+    uint64_t nearest = 0;
+    double nearest_distance = margin;
+    // Reverse render order breaks ties. A true hit on any image always wins
+    // over the proximity halo of another image, even a later-rendered one.
+    for (auto iterator = m_bodies.rbegin(); iterator != m_bodies.rend(); ++iterator) {
+        const Body& body = *iterator;
+        if (body.region != visible_region) continue;
+        const Vec2 center = worldToScreen(body.position, visible_region);
+        double distance = std::numeric_limits<double>::infinity();
+        if (novaRemnant(body) && m_config.black_hole) {
+            const double progress = std::clamp((body.nova_age - body.nova_charge_seconds) / 0.25, 0.0, 1.0);
+            const double growth = progress * progress * (3.0 - 2.0 * progress);
+            const double hole_radius = 48.0 * 1.35 * zoom * growth;
+            if (hole_radius < 0.0001 || length(screen_position - center) > hole_radius + margin) continue;
+            constexpr int segments = 48;
+            for (int index = 0; index < segments; ++index) {
+                const Vec2 first = center + rotate({hole_radius, 0.0}, TAU * index / segments);
+                const Vec2 second = center + rotate({hole_radius, 0.0}, TAU * (index + 1) / segments);
+                distance = std::min(distance, clippedTriangleDistance(screen_position, center, first, second, region));
+                if (distance <= 1e-7) break;
+            }
+        } else {
+            // Stored F7 actors and the exactly invisible portal midpoint have
+            // no displayed image. A remnant with its effect disabled has none.
+            if (body.stored || body.scale < 0.0001) continue;
+            double deformation = body.sink_progress * 0.24;
+            if (body.portal_progress > 0.0) {
+                const double midpoint = body.portal_entry_duration / (body.portal_entry_duration + body.portal_exit_duration);
+                const double phase = body.portal_emerging
+                    ? 1.0 - (body.portal_progress - midpoint) / (1.0 - midpoint) : body.portal_progress / midpoint;
+                deformation = std::max(deformation, std::clamp(phase, 0.0, 1.0) * 0.16);
+            }
+            const double bend = m_config.spaghetti ? deformation : 0.0;
+            const double scale = body.scale * zoom;
+            // Twisting a normalized square never exceeds sqrt(2) in either
+            // axis. Include bend before rotation for a conservative AABB.
+            const double twist_extent = body.twist != 0.0 ? std::sqrt(2.0) : 1.0;
+            const Vec2 local_extent{body.width * scale * body.stretch * twist_extent * 0.5,
+                                    body.height * scale / body.stretch * twist_extent * 0.5 + bend * body.height * scale};
+            const double cosine = std::abs(std::cos(body.angle)), sine = std::abs(std::sin(body.angle));
+            const Vec2 extent{local_extent.x * cosine + local_extent.y * sine,
+                              local_extent.x * sine + local_extent.y * cosine};
+            if (std::abs(screen_position.x - center.x) > extent.x + margin + 1e-7 ||
+                std::abs(screen_position.y - center.y) > extent.y + margin + 1e-7 ||
+                center.x + extent.x < region.x || center.x - extent.x > region.x + region.width ||
+                center.y + extent.y < region.y || center.y - extent.y > region.y + region.height) continue;
+            const auto vertex = [&](double x, double y) {
+                const Vec2 local{x - 0.5, y - 0.5};
+                Vec2 normalized = local * 2.0;
+                normalized = rotate(normalized, body.twist * std::min(1.0, length(normalized)));
+                Vec2 offset{normalized.x * body.width * scale * body.stretch * 0.5,
+                            normalized.y * body.height * scale / body.stretch * 0.5};
+                offset.y += std::sin(local.x * TAU) * bend * body.height * scale;
+                return center + rotate(offset, body.angle);
+            };
+            const bool mesh = body.fragment_grid == 0 || deformation > 0.0 || std::abs(body.twist) > 0.001;
+            if ((body.twist == 0.0 && bend == 0.0) || !mesh) {
+                const Vec2 a = vertex(0.0, 0.0), b = vertex(0.0, 1.0), c = vertex(1.0, 0.0), d = vertex(1.0, 1.0);
+                distance = std::min(clippedTriangleDistance(screen_position, a, b, c, region),
+                                    clippedTriangleDistance(screen_position, c, b, d, region));
+            } else {
+                // Match the renderer's 24 by 16 triangle mesh, including its
+                // non-linear bend; inverse-radius hit tests miss that shape.
+                constexpr int columns = 24, rows = 16;
+                std::array<Vec2, (columns + 1) * (rows + 1)> vertices;
+                for (int y = 0; y <= rows; ++y) for (int x = 0; x <= columns; ++x)
+                    vertices[y * (columns + 1) + x] = vertex(double(x) / columns, double(y) / rows);
+                for (int y = 0; y < rows && distance > 1e-7; ++y) for (int x = 0; x < columns; ++x) {
+                    const int index = y * (columns + 1) + x;
+                    const Vec2 a = vertices[index], b = vertices[index + columns + 1],
+                               c = vertices[index + 1], d = vertices[index + columns + 2];
+                    distance = std::min({distance, clippedTriangleDistance(screen_position, a, b, c, region),
+                                        clippedTriangleDistance(screen_position, c, b, d, region)});
+                    if (distance <= 1e-7) break;
+                }
+            }
+        }
+        if (distance <= 1e-7) return body.id;
+        if (distance <= margin && (nearest == 0 || distance < nearest_distance - 1e-7)) {
+            nearest = body.id;
+            nearest_distance = distance;
+        }
+    }
+    return nearest;
+}
+
 bool Universe::startBlackHole(Vec2 screen_cursor) {
     return startBlackHoleById(screen_cursor, hitTest(screen_cursor));
 }
@@ -501,6 +654,8 @@ void Universe::advanceNova(Body& body, double dt) {
         body.angle = std::remainder(body.angle + body.angular_velocity * dt * (1.0 - ease), TAU);
     } else if (old_age < body.nova_charge_seconds) {
         body.nova_age = std::max(body.nova_age, body.nova_charge_seconds);
+        if (m_nova_events < UINT64_MAX) ++m_nova_events;
+        body.nova_event = m_nova_events;
         body.stored = true;
         body.scale = 0.0;
         body.stretch = 1.0;
@@ -547,6 +702,8 @@ void Universe::createNovaFragments(const Body& parent, std::vector<Body>& fragme
         child.fragment_grid = grid;
         child.fragment_column = column;
         child.fragment_row = row;
+        child.nova_event = parent.nova_event;
+        child.wormhole_transits = parent.wormhole_transits;
         child.position = parent.position + offset;
         child.velocity = rotate({speed, 0.0}, direction);
         child.width = parent.width / grid;
@@ -706,6 +863,7 @@ void Universe::advancePortal(Body& body, double dt) {
     }
     body.velocity = limited((body.position - previous) / dt, m_config.max_speed);
     if (body.portal_progress >= 1.0 - 1e-12) {
+        if (body.wormhole_transits < UINT64_MAX) ++body.wormhole_transits;
         body.portal_progress = 0.0;
         body.portal_emerging = false;
         body.scale = body.portal_start_scale;
@@ -773,6 +931,10 @@ void Universe::setBinaryPreset() {
 }
 
 void Universe::integrate(double dt) {
+    // Age continues through storage and cinematic states. Increment before
+    // spawning so newborn tiles have exactly zero age on their birth frame.
+    for (auto& body : m_bodies)
+        body.age_seconds = std::min(1.0e9, body.age_seconds + dt);
     m_next_nova = std::max(0.0, m_next_nova - dt);
     if (m_config.supernova && m_config.stellar_automatic && m_next_nova <= 1e-12) {
         if (!novaBusy()) {
@@ -1095,7 +1257,7 @@ void Universe::recordFrame() {
         return;
     if (m_history.size() >= m_history_limit)
         m_history.pop_front();
-    m_history.push_back({m_bodies, m_time, m_next_nova, m_nova_serial, m_next_fragment_id, m_random});
+    m_history.push_back({m_bodies, m_time, m_next_nova, m_nova_serial, m_nova_events, m_next_fragment_id, m_random});
 }
 
 void Universe::restoreFrame(const Frame& frame) {
@@ -1110,10 +1272,17 @@ void Universe::restoreFrame(const Frame& frame) {
         });
         if (previous != frame.bodies.end())
             body = *previous;
-        else if (body.nova_age >= 0.0)
-            // Its app still exists, but its later stellar event must not
-            // overlap the historical event being restored on another body.
-            cancelNova(body);
+        else {
+            // A later live app remains present, but none of its later
+            // simulation history existed at this historical point.
+            body.age_seconds = 0.0;
+            body.nova_event = body.wormhole_transits = 0;
+            if (body.nova_age >= 0.0) {
+                // Its app still exists, but its later stellar event must not
+                // overlap the historical event restored on another body.
+                cancelNova(body);
+            }
+        }
         if (!m_config.wormholes && body.portal_progress > 0.0)
             cancelPortal(body);
         if (!m_config.supernova && body.nova_age >= 0.0)
@@ -1149,6 +1318,7 @@ void Universe::restoreFrame(const Frame& frame) {
     m_time = frame.time;
     m_next_nova = frame.next_nova;
     m_nova_serial = frame.nova_serial;
+    m_nova_events = frame.nova_events;
     m_next_fragment_id = frame.next_fragment_id;
     m_random = frame.random;
     updateCameras(0.0);
