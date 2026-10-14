@@ -63,6 +63,8 @@ void checkFinite(const Universe& universe) {
               std::isfinite(current.nova_fragment_seconds) && std::isfinite(current.nova_initial_scale) &&
               std::isfinite(current.nova_growth) && std::isfinite(current.nova_camera_zoom),
               "stellar nova seeds and phase remain finite");
+        check(std::isfinite(current.age_seconds) && current.age_seconds >= 0.0 && current.age_seconds <= 1.0e9,
+              "observation age remains finite and bounded");
         const auto fragments = universe.novaFragments(current);
         check(fragments.size() <= 16, "one stellar source never generates more than 16 fragments");
         for (const auto& fragment : fragments)
@@ -105,6 +107,306 @@ void fixedStepAndDeterminism() {
     first.step(std::numeric_limits<double>::quiet_NaN(), {});
     first.step(-10.0, {});
     check(close(after.x, first.bodies()[0].position.x), "invalid and backwards deltas ignored");
+}
+
+void observationFactsAndHistory() {
+    auto config = inert();
+    config.black_hole = false;
+    config.history_hz = 60.0;
+    config.history_seconds = 20.0;
+    config.stellar_fragments = 4;
+    config.stellar_charge_seconds = 0.5;
+    config.stellar_fragment_seconds = 1.0;
+    Body seeded = body(1, {500.0, 400.0}, {10.0, 0.0});
+    seeded.age_seconds = std::numeric_limits<double>::infinity();
+    seeded.nova_event = 77;
+    seeded.wormhole_transits = 88;
+    Universe universe(config);
+    universe.reset({seeded, body(2, {1200.0, 700.0}, {10.0, 0.0})}, {Region{}}, {});
+    check(findBody(universe, 1).age_seconds == 0.0 && findBody(universe, 1).nova_event == 0 &&
+          findBody(universe, 1).wormhole_transits == 0, "new source resets all caller-supplied observation facts");
+    advance(universe, 1.0);
+    check(close(findBody(universe, 1).age_seconds, 1.0), "actor age uses fixed simulation time");
+    universe.setRewinding(true);
+    advance(universe, 0.5);
+    universe.setRewinding(false);
+    const double rewound_age = findBody(universe, 1).age_seconds;
+    check(rewound_age > 0.45 && rewound_age < 0.55 &&
+          close(rewound_age, (findBody(universe, 1).position.x - 500.0) / 10.0),
+          "actor age rewinds with the sampled physical timeline");
+    advance(universe, 0.5);
+    check(close(findBody(universe, 1).age_seconds, rewound_age + 0.5), "resumed age follows deterministic simulation time");
+    check(universe.addBody(body(3, {1400.0, 400.0}, {10.0, 0.0}), false), "new live source joins observation timeline");
+    check(findBody(universe, 3).age_seconds == 0.0, "later source starts at zero, not global universe age");
+    universe.setRewinding(true);
+    advance(universe, 0.25);
+    universe.setRewinding(false);
+    check(findBody(universe, 3).age_seconds == 0.0, "new source absent from old frames keeps its own fresh age");
+    universe.removeBody(3);
+    universe.supernova({500.0, 400.0});
+    check(findBody(universe, 1).nova_event == 0, "ordinary F9 impulse is not a stellar lineage event");
+    check(universe.startStellarNova(1), "first observation event enters charging");
+    advance(universe, 0.25);
+    check(findBody(universe, 1).nova_event == 0, "charging does not prematurely allocate an actual burst number");
+    auto disabled = config;
+    disabled.supernova = false;
+    universe.configure(disabled);
+    check(findBody(universe, 1).nova_event == 0 && findBody(universe, 1).nova_age < 0.0,
+          "cancelled charge does not claim an actual burst");
+    universe.configure(config);
+    check(universe.startStellarNova(1), "charge can restart after a cancellation");
+    advance(universe, 0.5);
+    const Body parent = findBody(universe, 1);
+    check(parent.nova_event == 1 && parent.stored, "first completed stellar burst is event one despite cancelled charge");
+    uint64_t first_piece = 0;
+    for (const auto& piece : universe.bodies()) if (piece.fragment_grid != 0) {
+        first_piece = piece.id;
+        check(piece.nova_event == 1 && piece.age_seconds == 0.0 && piece.wormhole_transits == 0,
+              "newborn fragment has a fresh age and actual parent lineage");
+    }
+    check(first_piece != 0, "burst creates observable child identities");
+    const double parent_age = parent.age_seconds;
+    advance(universe, 0.25);
+    check(close(findBody(universe, 1).age_seconds, parent_age + 0.25) &&
+          close(findBody(universe, first_piece).age_seconds, 0.25), "stored remnant and drifting piece both continue aging");
+    universe.setRewinding(true);
+    advance(universe, 0.5);
+    universe.setRewinding(false);
+    check(findBody(universe, 1).nova_event == 0 && findBody(universe, 1).nova_age < 0.5,
+          "rewinding before burst removes the future actual event fact");
+    check(std::none_of(universe.bodies().begin(), universe.bodies().end(), [](const Body& current) {
+        return current.fragment_grid != 0;
+    }), "rewind removes future child lineage actors");
+    advance(universe, 0.25);
+    check(findBody(universe, 1).nova_event == 1 && findBody(universe, first_piece).nova_event == 1,
+          "replaying burst restores deterministic event number and fragment identity");
+    advance(universe, 1.0);
+    check(universe.startStellarNova(2), "second living star begins the next event");
+    advance(universe, 0.5);
+    check(findBody(universe, 2).nova_event == 2, "only actual successive stellar bursts increment observation serial");
+    universe.removeBody(1);
+    universe.setRewinding(true);
+    advance(universe, 1.0);
+    universe.setRewinding(false);
+    check(std::none_of(universe.bodies().begin(), universe.bodies().end(), [](const Body& current) {
+        return current.id == 1 || current.source_id == 1;
+    }), "closed source never resurrects its observation lineage during rewind");
+    universe.reset({body(1, {500.0, 400.0}, {10.0, 0.0})}, {Region{}}, {});
+    check(universe.startStellarNova(1), "reset allows a fresh stellar history");
+    advance(universe, 0.5);
+    check(findBody(universe, 1).nova_event == 1, "new universe restarts actual burst serial");
+    config.max_objects = 16;
+    config.stellar_fragments = 16;
+    config.stellar_automatic = true;
+    config.stellar_interval_min = config.stellar_interval_max = 5.0;
+    universe.configure(config);
+    universe.reset({body(1, {500.0, 400.0}, {10.0, 0.0}), body(2, {1200.0, 700.0}, {10.0, 0.0})}, {Region{}}, {});
+    advance(universe, 5.1);
+    check(!universe.startStellarNova(1) && findBody(universe, 1).nova_event == 0 && findBody(universe, 2).nova_event == 0,
+          "denied automatic and manual charges allocate no observed stellar event");
+    universe.removeBody(2);
+    check(universe.startStellarNova(1), "released capacity allows the first actual event after denied schedules");
+    advance(universe, 0.5);
+    check(findBody(universe, 1).nova_event == 1,
+          "automatic scheduling retries do not create gaps in actual burst numbering");
+}
+
+void observationPortalLineage() {
+    auto config = inert();
+    config.wormholes = true;
+    config.black_hole = false;
+    config.stellar_fragments = 4;
+    config.stellar_charge_seconds = 0.5;
+    config.history_seconds = 20.0;
+    config.history_hz = 60.0;
+    const Region source{42, 0.0, 0.0, 1920.0, 1080.0}, destination{1000042, 0.0, 0.0, 1920.0, 1080.0};
+    Universe universe(config);
+    universe.reset({}, {source, destination}, {});
+    Body traveler = body(1, universe.wormholes().front().position, {120.0, 20.0});
+    traveler.region = source.id;
+    const auto reset = [&] { universe.configure(config); universe.reset({traveler}, {source, destination}, {}); };
+    reset();
+    universe.step(config.fixed_step, {});
+    while (findBody(universe, 1).portal_progress > 0.0) {
+        check(findBody(universe, 1).wormhole_transits == 0, "incomplete ingress and emergence do not count as a crossing");
+        universe.step(config.fixed_step, {});
+    }
+    check(findBody(universe, 1).wormhole_transits == 1, "successful emergence records exactly one completed crossing");
+    advance(universe, 0.2);
+    check(findBody(universe, 1).wormhole_transits == 1, "ordinary post-transit frames do not count again");
+    universe.setRewinding(true);
+    advance(universe, 0.5);
+    universe.setRewinding(false);
+    check(findBody(universe, 1).portal_progress > 0.0 && findBody(universe, 1).wormhole_transits == 0,
+          "rewind to emergence removes future completed-transit fact");
+    while (findBody(universe, 1).portal_progress > 0.0) universe.step(config.fixed_step, {});
+    check(findBody(universe, 1).wormhole_transits == 1, "replayed emergence completes once, not twice");
+    auto no_portals = config;
+    no_portals.wormholes = false;
+    universe.configure(no_portals);
+    check(universe.startStellarNova(1), "portal traveler may later become a stellar source");
+    advance(universe, 0.5);
+    for (const auto& piece : universe.bodies()) if (piece.fragment_grid != 0)
+        check(piece.wormhole_transits == 1 && piece.nova_event == 1,
+              "fragment inherits completed source transit lineage at birth");
+    for (const bool cancel_emerging : {false, true}) {
+        reset();
+        universe.step(config.fixed_step, {});
+        if (cancel_emerging)
+            while (!findBody(universe, 1).portal_emerging) universe.step(config.fixed_step, {});
+        else advance(universe, 0.25);
+        universe.configure(no_portals);
+        check(findBody(universe, 1).portal_progress == 0.0 && findBody(universe, 1).wormhole_transits == 0,
+              "cancelling either transit leg never creates a phantom crossing");
+        advance(universe, 0.5);
+        check(findBody(universe, 1).wormhole_transits == 0, "cancelled transit stays uncounted afterward");
+    }
+}
+
+void observationSelection() {
+    constexpr double pi = 3.14159265358979323846;
+    auto config = inert();
+    Universe universe(config);
+    const Region main{42, 0.0, 0.0, 1920.0, 1080.0}, alternate{1000042, 0.0, 0.0, 1920.0, 1080.0};
+    Body first = body(1, {500.0, 400.0}, {10.0, 0.0});
+    first.region = main.id;
+    Body second = body(2, {580.0, 400.0}, {10.0, 0.0});
+    second.region = main.id;
+    universe.reset({first, second}, {main, alternate}, {});
+    check(universe.observationTarget({525.0, 400.0}, main.id, 24.0) == 1,
+          "exact displayed texture takes priority over another actor's proximity halo");
+    check(universe.observationTarget({539.0, 400.0}, main.id, 24.0) == 1,
+          "near-edge selection measures image edges, not center distance");
+    check(universe.observationTarget({540.0, 400.0}, main.id, 6.0) == 0,
+          "proximity outside configured screen-pixel margin is rejected");
+    check(universe.observationTarget({546.4, 400.0}, main.id, 0.0) == 2,
+          "image border is a selectable exact hit with zero proximity margin");
+    second.position = first.position;
+    universe.reset({first, second}, {main, alternate}, {});
+    check(universe.observationTarget(first.position, main.id, 0.0) == 2,
+          "overlapping exact shapes follow reverse displayed actor order");
+    second.region = alternate.id;
+    universe.reset({first, second}, {main, alternate}, {});
+    check(universe.observationTarget(first.position, main.id, 0.0) == 1 &&
+          universe.observationTarget(first.position, alternate.id, 0.0) == 2,
+          "observation selection respects arbitrary main and peer logical region IDs");
+    check(universe.observationTarget(first.position, 0, 24.0) == 0,
+          "unknown region cannot fall back to a different displayed region");
+    check(universe.observationTarget({-1.0, 400.0}, main.id, 100.0) == 0 &&
+          universe.observationTarget({1921.0, 400.0}, main.id, 100.0) == 0,
+          "cursor outside viewport never observes even a nearby image");
+    check(universe.observationTarget({std::numeric_limits<double>::quiet_NaN(), 400.0}, main.id) == 0 &&
+          universe.observationTarget(first.position, main.id, std::numeric_limits<double>::infinity()) == 0,
+          "non-finite cursor or margin cannot select an actor");
+
+    first.angle = pi * 0.5;
+    first.stretch = 2.0;
+    universe.reset({first}, {main}, {});
+    check(universe.observationTarget({500.0, 460.0}, main.id, 0.0) == 1 &&
+          universe.observationTarget({512.0, 400.0}, main.id, 0.0) == 0,
+          "read-only selection follows rotated anisotropic displayed shape");
+    check(universe.observationTarget({520.0, 400.0}, main.id, 9.6) == 1 &&
+          universe.observationTarget({520.0, 400.0}, main.id, 9.4) == 0,
+          "near-edge distance is measured after rotation and stretch in screen pixels");
+    first.angle = 0.0;
+    first.stretch = 1.0;
+    first.position = {-20.0, 400.0};
+    first.sink_progress = 0.1;
+    first.sink_camera_center = main.center();
+    first.sink_camera_zoom = 1.0;
+    universe.reset({first}, {main}, {});
+    check(universe.observationTarget({5.0, 400.0}, main.id, 0.0) == 1,
+          "partly clipped texture remains observable inside viewport");
+    first.position = {-40.0, 400.0};
+    universe.reset({first}, {main}, {});
+    check(universe.observationTarget({0.0, 400.0}, main.id, 100.0) == 0,
+          "completely clipped image does not attract a proximity card");
+
+    first.position = {500.0, 400.0};
+    first.angle = 0.63;
+    first.stretch = 2.2;
+    first.twist = 1.8;
+    first.sink_progress = 0.4;
+    universe.reset({first}, {main}, {});
+    const Body bent = findBody(universe, 1);
+    const auto displayed_vertex = [&](const Body& target, double x, double y) {
+        Vec2 normalized{x * 2.0 - 1.0, y * 2.0 - 1.0};
+        const double winding = target.twist * std::min(1.0, magnitude(normalized));
+        const Vec2 turned{normalized.x * std::cos(winding) - normalized.y * std::sin(winding),
+                          normalized.x * std::sin(winding) + normalized.y * std::cos(winding)};
+        Vec2 offset{turned.x * target.width * target.scale * target.stretch * 0.5,
+                    turned.y * target.height * target.scale / target.stretch * 0.5};
+        offset.y += std::sin((x - 0.5) * 2.0 * pi) * target.sink_progress * 0.24 * target.height * target.scale;
+        return universe.worldToScreen(target.position + Vec2{offset.x * std::cos(target.angle) - offset.y * std::sin(target.angle),
+                                                            offset.x * std::sin(target.angle) + offset.y * std::cos(target.angle)}, target.region);
+    };
+    check(universe.observationTarget(displayed_vertex(bent, 6.0 / 24.0, 12.0 / 16.0), main.id, 0.0) == 1,
+          "observation follows exact renderer tessellation under simultaneous twist bend stretch and rotation");
+    check(universe.hitTest(universe.worldToScreen(bent.position, main.id), main.id) == 0 &&
+          universe.observationTarget(universe.worldToScreen(bent.position, main.id), main.id, 0.0) == 1,
+          "sinking actor remains observable without becoming eligible for conflicting actions");
+    first.stored = true;
+    universe.reset({first}, {main}, {});
+    check(universe.observationTarget(first.position, main.id, 100.0) == 0,
+          "fully stored ordinary actor is not observable");
+
+    config.expansion = true;
+    universe.configure(config);
+    first = body(1, {5000.0, 400.0}, {10.0, 0.0});
+    first.region = main.id;
+    universe.reset({first}, {main}, {});
+    const Vec2 center = universe.worldToScreen(first.position, main.id);
+    const double half_width = findBody(universe, 1).width * findBody(universe, 1).scale * universe.cameras()[0].zoom * 0.5;
+    check(universe.cameras()[0].zoom < 1.0, "selection camera test uses an actually zoomed-out scene");
+    check(universe.observationTarget(center - Vec2{half_width + 20.0, 0.0}, main.id, 20.1) == 1 &&
+          universe.observationTarget(center - Vec2{half_width + 20.0, 0.0}, main.id, 19.9) == 0,
+          "observation margin remains logical screen pixels under camera zoom");
+
+    config = inert();
+    config.stellar_charge_seconds = 0.5;
+    config.stellar_fragments = 4;
+    config.stellar_fragment_seconds = 1.0;
+    universe.configure(config);
+    first = body(1, {960.0, 540.0}, {10.0, 0.0});
+    universe.reset({first}, {Region{}}, {});
+    check(universe.startStellarNova(1), "observation charge fixture starts nova");
+    advance(universe, 0.25);
+    check(universe.observationTarget(universe.worldToScreen(findBody(universe, 1).position, 0), 0, 0.0) == 1 &&
+          universe.hitTest(universe.worldToScreen(findBody(universe, 1).position, 0), 0) == 0,
+          "charging star stays observable but not action-selectable");
+    advance(universe, 1.25);
+    check(universe.observationTarget(universe.worldToScreen(findBody(universe, 1).position, 0), 0, 0.0) == 1,
+          "visible nova black-hole remnant keeps its source observation identity");
+    for (const auto& piece : universe.bodies()) if (piece.fragment_grid != 0 && !piece.stored) {
+        check(universe.observationTarget(universe.worldToScreen(piece.position, piece.region), piece.region, 0.0) != 0,
+              "persistent fragment can be observed at its current image center");
+        break;
+    }
+    config.black_hole = false;
+    universe.configure(config);
+    check(universe.observationTarget(universe.worldToScreen(findBody(universe, 1).position, 0), 0, 0.0) == 0,
+          "disabled black-hole remnant has no invisible observation target");
+
+    config.wormholes = true;
+    universe.configure(config);
+    universe.reset({}, {main, alternate}, {});
+    first = body(1, universe.wormholes().front().position, {120.0, 20.0});
+    first.region = main.id;
+    universe.reset({first}, {main, alternate}, {});
+    universe.step(config.fixed_step, {});
+    advance(universe, 0.25);
+    const Body ingress = findBody(universe, 1);
+    check(universe.observationTarget(universe.worldToScreen(ingress.position, ingress.region), ingress.region, 0.0) == 1,
+          "visible portal ingress remains observable");
+    while (!findBody(universe, 1).portal_emerging) universe.step(config.fixed_step, {});
+    const Body midpoint = findBody(universe, 1);
+    check(midpoint.scale == 0.0 && universe.observationTarget(universe.worldToScreen(midpoint.position, midpoint.region), midpoint.region) == 0,
+          "exactly invisible portal midpoint is not an observation target");
+    advance(universe, 0.25);
+    const Body emergence = findBody(universe, 1);
+    check(universe.observationTarget(universe.worldToScreen(emergence.position, emergence.region), emergence.region, 0.0) == 1 &&
+          universe.observationTarget(universe.worldToScreen(emergence.position, emergence.region), main.id, 0.0) == 0,
+          "visible portal emergence is observable only in its new region");
 }
 
 void orbitsAndBinary() {
@@ -730,7 +1032,7 @@ void cinematicStellarNova() {
         check(!universe.startStellarNova(uint64_t{2}), "a second stellar event cannot overlap flying fragments");
         check(!universe.startStellarNova(uint64_t{1}), "an exploded source cannot explode again");
         const auto fragments = universe.novaFragments(burst);
-        const std::size_t grid = count == 4 ? 2 : 4;
+        const int grid = count == 4 ? 2 : 4;
         check(fragments.size() == count && burst.nova_grid == grid, "configured 4 or 16 split yields the expected square tile grid");
         bool seen[4][4]{};
         for (const auto& fragment : fragments) {
@@ -1255,6 +1557,8 @@ void persistentFragmentPortals() {
           findBody(canceled, traveler).fragment_column == entered.fragment_column &&
           findBody(canceled, traveler).fragment_row == entered.fragment_row,
           "disabling wormholes restores the same piece and crop rather than a full-size source image");
+    check(entered.wormhole_transits == 0 && findBody(canceled, traveler).wormhole_transits == 0,
+          "cancelling a fragment crossing keeps its inherited transit lineage unchanged");
     for (int frame = 0; frame < 12000 && findBody(universe, traveler).portal_progress > 0.0; ++frame)
         universe.step(1.0 / 120.0, {});
     const Body transferred = findBody(universe, traveler);
@@ -1263,6 +1567,8 @@ void persistentFragmentPortals() {
           transferred.fragment_grid == 4 && transferred.fragment_column == entered.fragment_column &&
           transferred.fragment_row == entered.fragment_row,
           "wormhole emergence preserves a piece's source texture crop, physical identity and small size in the other universe");
+    check(transferred.wormhole_transits == 1 && findBody(universe, source.id).wormhole_transits == 0,
+          "fragment records its own completed crossing without changing stored source provenance");
     check(!universe.startStellarNova(traveler), "a wormhole-transferred piece still cannot become a stellar source");
     checkFinite(universe);
 }
@@ -1512,6 +1818,9 @@ int main(int argc, char** argv) {
         return 0;
     }
     fixedStepAndDeterminism();
+    observationFactsAndHistory();
+    observationPortalLineage();
+    observationSelection();
     orbitsAndBinary();
     collisionAndBoundary();
     wormholesAndRegions();
