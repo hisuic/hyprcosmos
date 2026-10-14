@@ -9,6 +9,13 @@ return {
         hide_desktop_ui = true,
         stars = 240,
     },
+    -- カーソルを天体へ近づけると、クリックせずに ASCII の来歴カードを表示。
+    observation = {
+        enabled = true,
+        delay = 0.35,             -- 同じ天体を観測する待ち時間（秒、0〜3）
+        distance = 24,            -- 表示形状の周囲にも反応する距離（論理 px、0〜96）
+        formatter = false,        -- false は既定の Lua 整形。関数で表示内容を変更可能
+    },
     -- F5: Cosmic 中のカーソル下のウィンドウを選択して超新星爆発。
     -- 通常時の F5 はアプリに届きます。F9 の即時衝撃波はそのままです。
     stellar = {
