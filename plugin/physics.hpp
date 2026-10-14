@@ -39,6 +39,11 @@ struct Body {
     int fragment_column = 0;
     int fragment_row = 0;
     double fragment_age = 0.0;      // Initial blast settling only; never a lifetime.
+    // Observation facts are simulation-owned and travel with bounded history.
+    // A tile starts a new age but inherits its source's completed transit count.
+    double age_seconds = 0.0;
+    uint64_t nova_event = 0;        // Actual stellar burst number; 0 means none.
+    uint64_t wormhole_transits = 0; // Completed crossings in this actor's lineage.
     Vec2 position;
     Vec2 velocity;
     double width = 640.0;
@@ -227,6 +232,9 @@ class Universe {
     std::size_t reservedObjectCount() const;
     uint64_t hitTest(Vec2 screen_position) const;
     uint64_t hitTest(Vec2 screen_position, int visible_region) const;
+    // Read-only observation, unlike action selection, includes visible actors
+    // already charging/sinking/transiting and optionally their visible remnant.
+    uint64_t observationTarget(Vec2 screen_position, int visible_region, double margin = 24.0) const;
     Vec2 worldToScreen(Vec2 position, int region) const;
     Vec2 screenToWorld(Vec2 position, int region) const;
 
@@ -235,6 +243,7 @@ class Universe {
         std::vector<Body> bodies;
         double time = 0.0, next_nova = 0.0;
         uint64_t nova_serial = 0;
+        uint64_t nova_events = 0;
         uint64_t next_fragment_id = UINT64_MAX;
         std::mt19937_64 random;
     };
@@ -256,6 +265,7 @@ class Universe {
     double m_time = 0.0;
     double m_next_nova = 0.0;
     uint64_t m_nova_serial = 0;
+    uint64_t m_nova_events = 0;
     uint64_t m_next_fragment_id = UINT64_MAX;
     bool m_rewinding = false;
     GravityMode m_gravity_mode = GravityMode::Cursor;
